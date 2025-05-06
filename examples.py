@@ -29,7 +29,7 @@ async def run_examples():
             issue_url=issue_url,
             prompt_type="explain",
             model="gpt-4o-mini",
-            context={"framework": "llama-index", "version": "0.11.7"}
+            context={}  # Context should be derived from the issue
         )
         explain_response = await prompt_generator.generate_prompt(
             explain_request,
@@ -57,11 +57,7 @@ async def run_examples():
             issue_url=issue_url,
             prompt_type="fix",
             model="gpt-4",
-            context={
-                "framework": "llama-index",
-                "version": "0.11.7",
-                "code_context": "The issue is related to SchemaLLMPathExtractor class"
-            }
+            context={}  # Context should be derived from the issue
         )
         fix_response = await prompt_generator.generate_prompt(
             fix_request,
@@ -89,11 +85,7 @@ async def run_examples():
             issue_url=issue_url,
             prompt_type="test",
             model="gpt-4o-mini",
-            context={
-                "framework": "llama-index",
-                "version": "0.11.7",
-                "test_framework": "pytest"
-            }
+            context={}  # Context should be derived from the issue
         )
         test_response = await prompt_generator.generate_prompt(
             test_request,
@@ -121,11 +113,7 @@ async def run_examples():
             issue_url=issue_url,
             prompt_type="summarize",
             model="gpt-4",
-            context={
-                "framework": "llama-index",
-                "version": "0.11.7",
-                "include_status": True
-            }
+            context={}  # Context should be derived from the issue
         )
         summarize_response = await prompt_generator.generate_prompt(
             summarize_request,

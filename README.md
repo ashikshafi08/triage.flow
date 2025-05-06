@@ -13,6 +13,7 @@ Transform GitHub issues into structured LLM prompts with context-aware intellige
 - REST API interface
 - Configurable caching and rate limiting
 - Support for multiple LLM models (GPT-4, GPT-4o-mini, etc.)
+- Automatic context extraction from GitHub issues
 
 ## Installation
 
@@ -71,11 +72,7 @@ curl -X POST "http://localhost:8000/generate-prompt" \
      -d '{
            "issue_url": "https://github.com/owner/repo/issues/123",
            "prompt_type": "explain",
-           "model": "gpt-4",
-           "context": {
-             "framework": "llama-index",
-             "version": "0.11.7"
-           }
+           "model": "gpt-4o-mini"
          }'
 ```
 
