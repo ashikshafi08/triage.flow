@@ -1,13 +1,7 @@
-<!-- LOGO PLACEHOLDER -->
-<p align="center">
-  <img src="docs/logo.png" alt="Project Logo" width="120" height="120"/>
-</p>
-
-<h1 align="center">IssueInsightRAG</h1>
+# GH Issue Prompt
 
 <p align="center">
   <b>AI-powered GitHub Issue Context & Prompt Generator with RAG</b><br>
-  <a href="https://github.com/yourusername/gh-issue-prompt/actions"><img src="https://img.shields.io/github/actions/workflow/status/yourusername/gh-issue-prompt/ci.yml?branch=main" alt="CI Status"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License"></a>
   <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.8%2B-blue.svg" alt="Python"></a>
 </p>
@@ -48,15 +42,29 @@
 
 ## How it Works
 
-```mermaid
-flowchart TD
-    A[GitHub Issue URL] --> B[Extract Issue & Comments]
-    B --> C[Clone Repo Locally]
-    C --> D[Analyze Code & Docs (Multi-Language)]
-    D --> E[Build Vector Index (FAISS + OpenAI)]
-    E --> F[Retrieve Relevant Context]
-    F --> G[Generate LLM Prompt]
-    G --> H[LLM Response]
+```
+GitHub Issue URL
+      |
+      v
+Extract Issue & Comments
+      |
+      v
+Clone Repo Locally
+      |
+      v
+Analyze Code & Docs (Multi-Language)
+      |
+      v
+Build Vector Index (FAISS + OpenAI)
+      |
+      v
+Retrieve Relevant Context
+      |
+      v
+Generate LLM Prompt
+      |
+      v
+LLM Response
 ```
 
 ---
