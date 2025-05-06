@@ -1,24 +1,21 @@
-# GH Issue Prompt
+# GitHub Issue Prompt Generator with RAG
 
-Transform GitHub issues into structured LLM prompts with context-aware intelligence.
+A powerful tool that uses Retrieval-Augmented Generation (RAG) to analyze GitHub issues and generate detailed prompts for understanding and solving them. The system combines local repository analysis with advanced language models to provide comprehensive context and insights.
 
 ## Features
 
-- Extract GitHub issues with caching and retry logic
-- Generate different types of prompts:
-  - Explain issues
-  - Generate fixes
-  - Create test cases
-  - Summarize discussions
-- REST API interface
-- Configurable caching and rate limiting
-- Support for multiple LLM models (GPT-4, GPT-4o-mini, etc.)
-- Automatic context extraction from GitHub issues
-- Local RAG (Retrieval-Augmented Generation) for intelligent context retrieval
-  - Automatic repository cloning and analysis
-  - Semantic search across codebase
-  - Relevant code and documentation extraction
-  - FAISS-based vector storage for efficient retrieval
+- **Local Repository Analysis**: Clones and analyzes repositories locally for faster processing
+- **FAISS Vector Store**: Uses FAISS for efficient similarity search and vector storage
+- **OpenAI Integration**: Leverages OpenAI's embedding models for better text understanding
+- **Contextual Prompt Generation**: Creates detailed prompts based on issue context and repository code
+- **Multiple Example Scripts**: Various examples showing different use cases and configurations
+
+## Prerequisites
+
+- Python 3.8+
+- Git
+- OpenAI API key
+- GitHub token (optional, for private repositories)
 
 ## Installation
 
@@ -39,83 +36,80 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-4. Create a `.env` file with your credentials:
-```
-GITHUB_TOKEN=your_github_token_here
-OPENAI_API_KEY=your_openai_api_key_here
+4. Set up environment variables:
+```bash
+# Create a .env file with:
+OPENAI_API_KEY=your_openai_api_key
+GITHUB_TOKEN=your_github_token  # Optional
 ```
 
 ## Usage
 
-### Running Examples
+The project provides several example scripts in the `examples/` directory:
 
-The repository includes example usage in `examples.py`:
-
+1. **Basic Example** (`examples.py`):
 ```bash
-python examples.py
+python examples/examples.py
 ```
 
-This will demonstrate:
-- Explaining a GitHub issue
-- Generating a fix
-- Creating test cases
-- Summarizing the issue
-
-### API Server
-
-1. Start the API server:
+2. **Complete RAG Example** (`examples_complete_rag.py`):
 ```bash
-python -m src.main
+python examples/examples_complete_rag.py
 ```
 
-2. The API will be available at `http://localhost:8000`
-
-3. Generate a prompt:
+3. **Local RAG Example** (`examples_local_rag.py`):
 ```bash
-curl -X POST "http://localhost:8000/generate-prompt" \
-     -H "Content-Type: application/json" \
-     -d '{
-           "issue_url": "https://github.com/owner/repo/issues/123",
-           "prompt_type": "explain",
-           "model": "gpt-4o-mini"
-         }'
+python examples/examples_local_rag.py
 ```
 
-### Available Prompt Types
-
-- `explain`: Get a detailed explanation of the issue
-- `fix`: Generate a solution for the issue
-- `test`: Create test cases for the issue
-- `summarize`: Get a concise summary of the issue
-
-### Available Models
-
-- `gpt-4`: OpenAI's GPT-4 model
-- `gpt-4o-mini`: OpenAI's GPT-4o-mini model
-
-## API Documentation
-
-Visit `http://localhost:8000/docs` for interactive API documentation.
+4. **Environment-based Example** (`example_with_env.py`):
+```bash
+python examples/example_with_env.py
+```
 
 ## Project Structure
 
 ```
 gh-issue-prompt/
-├── src/
-│   ├── github_client.py    # GitHub API integration
-│   ├── llm_client.py       # LLM integration
-│   ├── prompt_generator.py # Prompt generation logic
-│   ├── models.py          # Data models
-│   ├── config.py          # Configuration management
-│   ├── main.py            # FastAPI application
-│   ├── local_rag.py       # Local RAG implementation
-│   └── local_repo_loader.py # Repository cloning and loading
-├── examples.py            # Example usage
-├── examples_complete_rag.py # Complete RAG example
-├── requirements.txt       # Project dependencies
-└── README.md             # This file
+├── examples/                 # Example scripts
+├── src/                      # Source code
+│   ├── config.py            # Configuration settings
+│   ├── github_client.py     # GitHub API client
+│   ├── local_rag.py         # Local RAG implementation
+│   ├── local_repo_loader.py # Repository cloning utilities
+│   ├── llm_client.py        # LLM client interface
+│   ├── main.py              # Main application logic
+│   ├── models.py            # Data models
+│   ├── prompt_generator.py  # Prompt generation logic
+│   └── repo_context.py      # Repository context extraction
+├── .env                      # Environment variables
+├── .gitignore               # Git ignore rules
+├── LICENSE                  # License file
+├── README.md                # This file
+└── requirements.txt         # Python dependencies
 ```
+
+## How It Works
+
+1. **Repository Analysis**:
+   - Clones the target repository locally
+   - Processes code and documentation files
+   - Creates a FAISS vector index for efficient search
+
+2. **Issue Analysis**:
+   - Extracts relevant context from the repository
+   - Identifies related code and documentation
+   - Generates a comprehensive prompt
+
+3. **Prompt Generation**:
+   - Combines issue details with repository context
+   - Creates structured prompts for different use cases
+   - Provides detailed analysis and potential solutions
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-MIT License - see LICENSE file for details 
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. 
