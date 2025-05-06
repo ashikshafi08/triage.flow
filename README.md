@@ -12,6 +12,7 @@ Transform GitHub issues into structured LLM prompts with context-aware intellige
   - Summarize discussions
 - REST API interface
 - Configurable caching and rate limiting
+- Support for multiple LLM models (GPT-4, GPT-4o-mini, etc.)
 
 ## Installation
 
@@ -32,18 +33,29 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-4. Create a `.env` file:
-```bash
-cp .env.example .env
-```
-
-5. Edit `.env` with your credentials:
+4. Create a `.env` file with your credentials:
 ```
 GITHUB_TOKEN=your_github_token_here
 OPENAI_API_KEY=your_openai_api_key_here
 ```
 
 ## Usage
+
+### Running Examples
+
+The repository includes example usage in `examples.py`:
+
+```bash
+python examples.py
+```
+
+This will demonstrate:
+- Explaining a GitHub issue
+- Generating a fix
+- Creating test cases
+- Summarizing the issue
+
+### API Server
 
 1. Start the API server:
 ```bash
@@ -60,24 +72,43 @@ curl -X POST "http://localhost:8000/generate-prompt" \
            "issue_url": "https://github.com/owner/repo/issues/123",
            "prompt_type": "explain",
            "model": "gpt-4",
-           "context": {}
+           "context": {
+             "framework": "llama-index",
+             "version": "0.11.7"
+           }
          }'
 ```
+
+### Available Prompt Types
+
+- `explain`: Get a detailed explanation of the issue
+- `fix`: Generate a solution for the issue
+- `test`: Create test cases for the issue
+- `summarize`: Get a concise summary of the issue
+
+### Available Models
+
+- `gpt-4`: OpenAI's GPT-4 model
+- `gpt-4o-mini`: OpenAI's GPT-4o-mini model
 
 ## API Documentation
 
 Visit `http://localhost:8000/docs` for interactive API documentation.
 
-## Development
+## Project Structure
 
-1. Install development dependencies:
-```bash
-pip install -r requirements-dev.txt
 ```
-
-2. Run tests:
-```bash
-pytest
+gh-issue-prompt/
+├── src/
+│   ├── github_client.py    # GitHub API integration
+│   ├── llm_client.py       # LLM integration
+│   ├── prompt_generator.py # Prompt generation logic
+│   ├── models.py          # Data models
+│   ├── config.py          # Configuration management
+│   └── main.py            # FastAPI application
+├── examples.py            # Example usage
+├── requirements.txt       # Project dependencies
+└── README.md             # This file
 ```
 
 ## License
