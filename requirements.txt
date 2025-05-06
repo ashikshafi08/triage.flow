@@ -1,8 +1,10 @@
 llama-index
+llama-index-readers-github
 python-dotenv
 aiohttp
 pydantic
 pydantic-settings
 fastapi
 uvicorn
-python-multipart 
+python-multipart
+nest-asyncio 

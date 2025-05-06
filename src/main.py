@@ -1,8 +1,13 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from .models import PromptRequest, PromptResponse
 from .github_client import GitHubIssueClient
-from .prompt_generator import PromptGenerator
 from .llm_client import LLMClient
-from .models import PromptRequest, PromptResponse, IssueResponse
+from .prompt_generator import PromptGenerator
+import nest_asyncio
+
+# Enable nested event loops for Jupyter notebooks
+nest_asyncio.apply()
 
 app = FastAPI(
     title="GH Issue Prompt",
@@ -10,9 +15,19 @@ app = FastAPI(
     version="0.1.0"
 )
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize clients
 github_client = GitHubIssueClient()
-prompt_generator = PromptGenerator()
 llm_client = LLMClient()
+prompt_generator = PromptGenerator()
 
 @app.get("/")
 async def root():
@@ -20,41 +35,33 @@ async def root():
 
 @app.post("/generate-prompt", response_model=PromptResponse)
 async def generate_prompt(request: PromptRequest) -> PromptResponse:
-    # First, fetch the issue
-    issue_response = await github_client.get_issue(request.issue_url)
-    if issue_response.status != "success":
-        raise HTTPException(
-            status_code=404,
-            detail=f"Failed to fetch issue: {issue_response.error}"
+    try:
+        # Fetch GitHub issue
+        issue = await github_client.get_issue(request.issue_url)
+        if not issue:
+            raise HTTPException(status_code=404, detail="Issue not found")
+
+        # Generate prompt with repository context
+        prompt_response = await prompt_generator.generate_prompt(request, issue)
+        if prompt_response.status == "error":
+            raise HTTPException(status_code=400, detail=prompt_response.error)
+
+        # Process prompt with LLM
+        llm_response = await llm_client.process_prompt(
+            prompt_response.prompt,
+            model=request.model
         )
 
-    # Generate the prompt
-    prompt_response = await prompt_generator.generate_prompt(
-        request,
-        issue_response.data
-    )
-
-    if prompt_response.status != "success":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to generate prompt: {prompt_response.error}"
+        return PromptResponse(
+            status="success",
+            prompt=prompt_response.prompt,
+            response=llm_response
         )
 
-    # Process the prompt with LLM
-    llm_response = await llm_client.process_prompt(
-        prompt=prompt_response.prompt,
-        prompt_type=request.prompt_type,
-        context=request.context,
-        model=request.model
-    )
-
-    if llm_response.status != "success":
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to process prompt with LLM: {llm_response.error}"
-        )
-
-    return llm_response
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
