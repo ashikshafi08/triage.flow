@@ -14,6 +14,11 @@ Transform GitHub issues into structured LLM prompts with context-aware intellige
 - Configurable caching and rate limiting
 - Support for multiple LLM models (GPT-4, GPT-4o-mini, etc.)
 - Automatic context extraction from GitHub issues
+- Local RAG (Retrieval-Augmented Generation) for intelligent context retrieval
+  - Automatic repository cloning and analysis
+  - Semantic search across codebase
+  - Relevant code and documentation extraction
+  - FAISS-based vector storage for efficient retrieval
 
 ## Installation
 
@@ -102,8 +107,11 @@ gh-issue-prompt/
 │   ├── prompt_generator.py # Prompt generation logic
 │   ├── models.py          # Data models
 │   ├── config.py          # Configuration management
-│   └── main.py            # FastAPI application
+│   ├── main.py            # FastAPI application
+│   ├── local_rag.py       # Local RAG implementation
+│   └── local_repo_loader.py # Repository cloning and loading
 ├── examples.py            # Example usage
+├── examples_complete_rag.py # Complete RAG example
 ├── requirements.txt       # Project dependencies
 └── README.md             # This file
 ```
