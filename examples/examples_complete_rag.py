@@ -106,7 +106,7 @@ async def run_example(issue_url: str, prompt_type: str, model: str = "gpt-4o-min
 async def main():
     # Example GitHub issue
     issue = {
-        "url": "https://github.com/huggingface/trl/issues/3368",
+        "url": "https://github.com/huggingface/smolagents/issues/1219",
         "prompt_type": "explain",  # Options: explain, fix, test, summarize
         "model": "gpt-4o-mini"
     }

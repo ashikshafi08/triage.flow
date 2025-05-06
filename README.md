@@ -4,6 +4,16 @@ A powerful tool that uses Retrieval-Augmented Generation (RAG) to analyze GitHub
 
 ## Features
 
+- **Multi-Language Support**: Comprehensive support for 20+ programming languages including:
+  - Python, JavaScript/TypeScript, Java, C/C++
+  - Go, Rust, Ruby, PHP, Swift, Kotlin
+  - Scala, Dart, Haskell, Elixir, Clojure
+  - Erlang, Lua, Perl, and more
+- **Language-Specific Processing**:
+  - Automatic language detection
+  - Language-specific documentation extraction
+  - Import/require pattern recognition
+  - Structured code analysis
 - **Local Repository Analysis**: Clones and analyzes repositories locally for faster processing
 - **FAISS Vector Store**: Uses FAISS for efficient similarity search and vector storage
 - **OpenAI Integration**: Leverages OpenAI's embedding models for better text understanding
@@ -75,6 +85,7 @@ gh-issue-prompt/
 ├── src/                      # Source code
 │   ├── config.py            # Configuration settings
 │   ├── github_client.py     # GitHub API client
+│   ├── language_config.py   # Language-specific configurations
 │   ├── local_rag.py         # Local RAG implementation
 │   ├── local_repo_loader.py # Repository cloning utilities
 │   ├── llm_client.py        # LLM client interface
@@ -93,16 +104,27 @@ gh-issue-prompt/
 
 1. **Repository Analysis**:
    - Clones the target repository locally
-   - Processes code and documentation files
+   - Automatically detects programming languages
+   - Processes code and documentation files with language-specific patterns
+   - Extracts imports, dependencies, and documentation
    - Creates a FAISS vector index for efficient search
 
-2. **Issue Analysis**:
+2. **Language-Specific Processing**:
+   - Identifies file types and programming languages
+   - Extracts language-specific documentation (e.g., JSDoc, Python docstrings)
+   - Recognizes import/require patterns
+   - Structures content with language context
+   - Maintains language metadata throughout processing
+
+3. **Issue Analysis**:
    - Extracts relevant context from the repository
    - Identifies related code and documentation
-   - Generates a comprehensive prompt
+   - Considers language-specific patterns in search
+   - Generates a comprehensive prompt with language context
 
-3. **Prompt Generation**:
+4. **Prompt Generation**:
    - Combines issue details with repository context
+   - Includes language-specific insights
    - Creates structured prompts for different use cases
    - Provides detailed analysis and potential solutions
 
