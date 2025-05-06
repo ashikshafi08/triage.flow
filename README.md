@@ -128,6 +128,75 @@ gh-issue-prompt/
    - Creates structured prompts for different use cases
    - Provides detailed analysis and potential solutions
 
+---
+
+## Example 1: Generate an Explanation for a GitHub Issue
+
+This example demonstrates how to generate a detailed explanation for a GitHub issue using the complete RAG pipeline.
+
+```bash
+python examples/examples_complete_rag.py
+```
+
+- The script will prompt you for a GitHub issue URL, or you can edit the script to set your own.
+- The tool will:
+  1. Fetch the issue (title, body, comments, etc.)
+  2. Clone the repository and analyze the codebase
+  3. Retrieve relevant code and documentation
+  4. Generate a comprehensive prompt for the LLM
+  5. Output the explanation and LLM response
+
+---
+
+## Example 2: Use the Tool in Your Own Python Script
+
+You can use the core components in your own Python code:
+
+```python
+from src.github_client import GitHubIssueClient
+from src.local_rag import LocalRepoContextExtractor
+from src.prompt_generator import PromptGenerator
+import asyncio
+
+async def main():
+    issue_url = "https://github.com/huggingface/smolagents/issues/1292"
+    github_client = GitHubIssueClient()
+    issue_response = await github_client.get_issue(issue_url)
+    if issue_response.status != "success":
+        print("Failed to fetch issue")
+        return
+    repo_extractor = LocalRepoContextExtractor()
+    await repo_extractor.load_repository("https://github.com/huggingface/smolagents.git")
+    context = await repo_extractor.get_issue_context(issue_response.data.title, issue_response.data.body)
+    prompt_generator = PromptGenerator()
+    prompt = await prompt_generator.generate_prompt(
+        request=None,  # Fill in as needed
+        issue=issue_response.data
+    )
+    print(prompt)
+
+asyncio.run(main())
+```
+
+---
+
+## Example 3: Customizing Prompt Types
+
+You can generate different types of prompts (explain, fix, test, summarize) by changing the `prompt_type` in your script or API call. For example:
+
+```python
+request = PromptRequest(
+    issue_url=issue_url,
+    prompt_type="fix",  # Options: explain, fix, test, summarize
+    model="gpt-4o-mini",
+    context={"repo_context": context}
+)
+```
+
+This will generate a prompt asking the LLM to propose a fix for the issue, using all the context from the repository and the issue discussion.
+
+---
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
