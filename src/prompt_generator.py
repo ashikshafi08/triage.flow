@@ -1,7 +1,6 @@
 from typing import Dict, Optional
 from .models import Issue, PromptRequest, PromptResponse
 from .config import settings
-from .repo_context import RepoContextExtractor
 
 class PromptGenerator:
     def __init__(self):
@@ -11,49 +10,41 @@ class PromptGenerator:
             "test": self._generate_test_prompt,
             "summarize": self._generate_summarize_prompt
         }
-        self.repo_context = RepoContextExtractor()
 
     def _format_context(self, context: Dict) -> str:
         if not context:
             return "No additional context provided."
-        return "\n".join(f"{key}: {value}" for key, value in context.items())
+        
+        # Filter out repo_context which is handled separately
+        filtered_context = {k: v for k, v in context.items() if k != "repo_context"}
+        if not filtered_context:
+            return "No additional context provided."
+            
+        return "\n".join(f"{key}: {value}" for key, value in filtered_context.items())
 
     def _format_repo_context(self, repo_context: Dict) -> str:
-        if not repo_context:
+        if not repo_context or not repo_context.get('sources'):
             return "No repository context available."
         
+        # Collect unique file names
+        files = {source['file'] for source in repo_context['sources']}
+        file_list = "\n".join(f"- {file}" for file in files)
+        
         sources = "\n".join([
-            f"File: {source['file']}\nContent: {source['content']}\n"
+            f"File: {source['file']}\nContent: {source['content'][:500]}...\n"
             for source in repo_context.get('sources', [])
         ])
         
         return f"""
+Relevant Files:
+{file_list}
+
 Repository Context:
 {repo_context.get('response', 'No response')}
 
 Relevant Code and Documentation:
 {sources}
 """
-
-    async def _get_repo_context(self, issue: Issue) -> Dict:
-        """Get relevant context from the repository for the issue."""
-        try:
-            # Extract owner and repo from issue URL
-            url_parts = issue.url.split('/')
-            owner = url_parts[3]
-            repo = url_parts[4]
-            
-            # Load repository data
-            await self.repo_context.load_repository(owner, repo)
-            
-            # Get issue-specific context
-            context = await self.repo_context.get_issue_context(issue.title, issue.body)
-            if not context:
-                print("Warning: No repository context found for the issue")
-            return context
-        except Exception as e:
-            print(f"Warning: Failed to get repository context: {str(e)}")
-            return {}
 
     def _generate_explain_prompt(self, issue: Issue, context: Dict, repo_context: Dict) -> str:
         return f"""Please explain the following GitHub issue:
@@ -135,8 +126,8 @@ Please provide:
                     error=f"Invalid prompt type: {request.prompt_type}"
                 )
 
-            # Get repository context
-            repo_context = await self._get_repo_context(issue)
+            # Get repository context from the request if provided
+            repo_context = request.context.get("repo_context", {})
             
             # Generate prompt with repository context
             prompt = self.templates[request.prompt_type](issue, request.context, repo_context)

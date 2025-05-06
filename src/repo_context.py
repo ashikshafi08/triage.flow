@@ -6,6 +6,12 @@ from llama_index.core.schema import Document
 from .config import settings
 import asyncio
 import nest_asyncio
+from llama_index.vector_stores.faiss import FaissVectorStore
+from llama_index.core import StorageContext, Settings
+from llama_index.embeddings.openai import OpenAIEmbedding
+import faiss
+import os
+import sys
 
 # Enable nested event loops
 nest_asyncio.apply()
@@ -14,6 +20,9 @@ class RepoContextExtractor:
     def __init__(self):
         if not settings.github_token:
             raise ValueError("GitHub token is required. Please set GITHUB_TOKEN in your .env file.")
+        
+        if not settings.openai_api_key:
+            raise ValueError("OpenAI API key is required. Please set OPENAI_API_KEY in your .env file.")
         
         self.github_client = GithubClient(
             github_token=settings.github_token,
@@ -26,23 +35,27 @@ class RepoContextExtractor:
         self.repo_info = None
 
     async def load_repository(self, owner: str, repo: str, branch: str = "main") -> None:
-        """Load repository data and create vector index."""
+        """Load repository data and create vector index with FAISS and OpenAI Embeddings."""
         try:
-            # Configure repository reader
+            # Set OpenAI embedding model
+            embed_model = OpenAIEmbedding(
+                model="text-embedding-3-small",  # or "text-embedding-3-large"
+                api_key=settings.openai_api_key
+            )
+            Settings.embed_model = embed_model
+            d = 1536  # 3072 for "text-embedding-3-large"
+
+            # Configure repository reader (no directory filter, only file extension filter)
             reader = GithubRepositoryReader(
                 github_client=self.github_client,
                 owner=owner,
                 repo=repo,
                 use_parser=False,
                 verbose=True,
-                filter_directories=(
-                    ["src", "docs", "tests"],  # Focus on source code and documentation
-                    GithubRepositoryReader.FilterType.INCLUDE,
-                ),
                 filter_file_extensions=(
                     [
                         ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
-                        ".json", ".ipynb"  # Exclude non-code files, but INCLUDE .md and .txt for context
+                        ".json", ".ipynb"
                     ],
                     GithubRepositoryReader.FilterType.EXCLUDE,
                 ),
@@ -71,10 +84,18 @@ class RepoContextExtractor:
                     "branch": branch
                 })
 
-            # Create vector index
-            self.index = VectorStoreIndex(nodes)
+            # Setup FAISS vector store
+            persist_dir = f".faiss_index_{owner}_{repo}_{branch}"
+            os.makedirs(persist_dir, exist_ok=True)
+            faiss_index = faiss.IndexFlatL2(d)
+            vector_store = FaissVectorStore(faiss_index=faiss_index)
+            storage_context = StorageContext.from_defaults(vector_store=vector_store, persist_dir=persist_dir)
+
+            # Create vector index with FAISS
+            self.index = VectorStoreIndex(nodes, storage_context=storage_context)
+            self.index.storage_context.persist()
             self.query_engine = self.index.as_query_engine(
-                similarity_top_k=5,  # Get top 5 most relevant chunks
+                similarity_top_k=10,  # Retrieve more chunks for broader context
                 verbose=True
             )
 
@@ -85,6 +106,7 @@ class RepoContextExtractor:
             }
 
         except Exception as e:
+            print(f"Error loading repository: {e}")
             raise Exception(f"Failed to load repository: {str(e)}")
 
     async def get_relevant_context(self, query: str) -> Dict[str, Any]:

@@ -18,7 +18,7 @@ github_client = GitHubIssueClient()
 llm_client = LLMClient()
 prompt_generator = PromptGenerator()
 
-async def run_example(issue_url: str, prompt_type: str, model: str = "gpt-4-turbo-preview"):
+async def run_example(issue_url: str, prompt_type: str, model: str = "gpt-4o-mini"):
     """Run a single example with the given parameters."""
     print(f"\nRunning example for {prompt_type} prompt type...")
     print(f"Issue URL: {issue_url}")
@@ -63,7 +63,7 @@ async def run_example(issue_url: str, prompt_type: str, model: str = "gpt-4-turb
 async def main():
     # Example GitHub issue from llama-index repository
     issue = {
-        "url": "https://github.com/run-llama/llama_index/issues/18632",
+        "url": "https://github.com/huggingface/trl/issues/3368",
         "prompt_type": "explain",
         "model": "gpt-4o-mini"
     }
