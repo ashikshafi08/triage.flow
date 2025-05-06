@@ -1,5 +1,5 @@
 from typing import Dict, Optional
-from .models import Issue, PromptRequest, PromptResponse
+from .models import Issue, PromptRequest, PromptResponse, IssueComment
 from .config import settings
 
 class PromptGenerator:
@@ -21,6 +21,18 @@ class PromptGenerator:
             return "No additional context provided."
             
         return "\n".join(f"{key}: {value}" for key, value in filtered_context.items())
+
+    def _format_comments(self, comments: list) -> str:
+        if not comments:
+            return "No comments."
+        formatted = []
+        for c in comments:
+            # c may be IssueComment or dict
+            user = getattr(c, 'user', c.get('user', ''))
+            created_at = getattr(c, 'created_at', c.get('created_at', ''))
+            body = getattr(c, 'body', c.get('body', ''))
+            formatted.append(f"- [{user} at {created_at}]: {body}")
+        return "\n".join(formatted)
 
     def _format_repo_context(self, repo_context: Dict) -> str:
         if not repo_context or not repo_context.get('sources'):
@@ -52,6 +64,9 @@ Relevant Code and Documentation:
 Title: {issue.title}
 Description: {issue.body}
 
+Comments:
+{self._format_comments(issue.comments)}
+
 Repository Context:
 {self._format_repo_context(repo_context)}
 
@@ -69,6 +84,9 @@ Please provide:
 
 Title: {issue.title}
 Description: {issue.body}
+
+Comments:
+{self._format_comments(issue.comments)}
 
 Repository Context:
 {self._format_repo_context(repo_context)}
@@ -88,6 +106,9 @@ Please provide:
 Title: {issue.title}
 Description: {issue.body}
 
+Comments:
+{self._format_comments(issue.comments)}
+
 Repository Context:
 {self._format_repo_context(repo_context)}
 
@@ -105,6 +126,9 @@ Please provide:
 
 Title: {issue.title}
 Description: {issue.body}
+
+Comments:
+{self._format_comments(issue.comments)}
 
 Repository Context:
 {self._format_repo_context(repo_context)}

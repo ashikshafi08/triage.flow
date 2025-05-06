@@ -2,6 +2,11 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
 
+class IssueComment(BaseModel):
+    body: str
+    user: str
+    created_at: datetime
+
 class Issue(BaseModel):
     number: int
     title: str
@@ -11,7 +16,7 @@ class Issue(BaseModel):
     url: str
     labels: List[str] = Field(default_factory=list)
     assignees: List[str] = Field(default_factory=list)
-    comments: List[str] = Field(default_factory=list)
+    comments: List[IssueComment] = Field(default_factory=list)
 
 class IssueResponse(BaseModel):
     status: str

@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timedelta
 from llama_index.readers.github import GitHubIssuesClient
 from .config import settings
-from .models import Issue, IssueResponse
+from .models import Issue, IssueResponse, IssueComment
 
 class GitHubIssueClient:
     def __init__(self):
@@ -39,6 +39,15 @@ class GitHubIssueClient:
             'timestamp': datetime.now()
         }
 
+    async def _fetch_issue_comments(self, owner: str, repo: str, issue_number: int) -> list:
+        """Fetch comments for a specific issue."""
+        try:
+            comments = await self.client.get_issue_comments(owner=owner, repo=repo, issue_number=issue_number)
+            return comments
+        except Exception as e:
+            print(f"Error fetching comments: {e}")
+            return []
+
     async def get_issue(self, issue_url: str) -> IssueResponse:
         """
         Fetch a GitHub issue with retry logic and caching.
@@ -72,7 +81,18 @@ class GitHubIssueClient:
                         status="error",
                         error=f"Issue #{issue_number} not found"
                     )
-                    
+                
+                # Fetch comments for the issue
+                comments_raw = await self._fetch_issue_comments(owner, repo, issue_number)
+                comments = [
+                    {
+                        "body": c["body"],
+                        "user": c["user"]["login"] if "user" in c and c["user"] else "",
+                        "created_at": c["created_at"]
+                    }
+                    for c in comments_raw
+                ]
+                
                 result = {
                     "number": issue_number,
                     "title": specific_issue['title'],
@@ -82,7 +102,7 @@ class GitHubIssueClient:
                     "url": issue_url,
                     "labels": [label['name'] for label in specific_issue.get('labels', [])],
                     "assignees": [assignee['login'] for assignee in specific_issue.get('assignees', [])],
-                    "comments": []  # Would need additional API call to get comments
+                    "comments": comments
                 }
                 
                 # Cache the successful result
