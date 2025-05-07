@@ -106,7 +106,7 @@ Please provide:
         return text
 
     async def generate_prompt(self, request: PromptRequest, issue: Issue) -> PromptResponse:
-        """Generate a prompt based on the request type and issue."""
+        """Generate a prompt based on the request type and issue, including comments, labels, and assignees."""
         try:
             # Get the appropriate template
             template = self.prompt_templates.get(request.prompt_type)
@@ -118,7 +118,21 @@ Please provide:
 
             # Clean up the issue description
             clean_description = self._clean_markdown(issue.body)
-            
+
+            # Add labels and assignees metadata
+            labels_text = f"Labels: {', '.join(issue.labels)}" if issue.labels else "Labels: None"
+            assignees_text = f"Assignees: {', '.join(issue.assignees)}" if issue.assignees else "Assignees: None"
+
+            # Add discussion/comments section (show up to 3 most recent comments)
+            discussion_text = ""
+            if issue.comments:
+                discussion_text = "\nDiscussion (recent comments):\n"
+                for comment in issue.comments[-3:]:
+                    user = getattr(comment, 'user', '')
+                    body = getattr(comment, 'body', '')
+                    created = getattr(comment, 'created_at', '')
+                    discussion_text += f"- {user} ({created}): {body.strip()}\n"
+
             # Format the context
             context = request.context.get("repo_context", {})
             context_text = ""
@@ -132,18 +146,26 @@ Please provide:
                 if context.get("response"):
                     context_text += f"Repository Context:\n{context['response']}\n"
 
-            # Generate the prompt
-            prompt = template.format(
-                title=issue.title,
-                description=clean_description,
-                context=context_text
-            )
+            # Compose the full prompt
+            prompt = f"""
+{labels_text}
+{assignees_text}
+
+{template.format(
+    title=issue.title,
+    description=clean_description,
+    context=context_text
+)}
+{discussion_text}
+"""
 
             # Format suggestions if present
             prompt = self._format_suggestions(prompt)
-            
             # Add test references
             prompt = self._add_test_references(prompt, context)
+
+            # Debug print to verify inclusion of metadata
+            print(f"[DEBUG] Labels: {issue.labels}, Assignees: {issue.assignees}, Comments: {len(issue.comments) if issue.comments else 0}")
 
             return PromptResponse(
                 status="success",
