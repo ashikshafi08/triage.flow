@@ -156,7 +156,6 @@ Code:
                 }
         
         except Exception as e:
-            print(f"Error loading repository: {e}")
             raise Exception(f"Failed to load repository: {str(e)}")
     
     async def get_relevant_context(self, query: str) -> Dict[str, Any]:
@@ -167,13 +166,26 @@ Code:
         try:
             # Get response from query engine
             response = self.query_engine.query(query)
-            
-            # Extract relevant information with language context and full file paths
+
+            # Determine the repo root (temp directory)
+            repo_root = None
+            if self.index and hasattr(self.index, 'storage_context') and hasattr(self.index.storage_context, 'persist_dir'):
+                repo_root = self.index.storage_context.persist_dir
+            elif self.repo_info and 'url' in self.repo_info:
+                # Fallback: try to extract from repo_info if available
+                repo_root = self.repo_info.get('repo_root')
+
+            def relpath(path):
+                if repo_root and path.startswith(repo_root):
+                    return os.path.relpath(path, repo_root)
+                return path
+
+            # Extract relevant information with language context and repo-relative file paths
             context = {
                 "response": str(response),
                 "sources": [
                     {
-                        "file": os.path.abspath(node.metadata.get("file_name", "unknown")),
+                        "file": relpath(node.metadata.get("file_name", "unknown")),
                         "language": node.metadata.get("display_name", "unknown"),
                         "description": node.metadata.get("description", "No description available"),
                         "content": node.text
@@ -185,7 +197,6 @@ Code:
             return context
             
         except Exception as e:
-            print(f"Error during query: {e}")
             raise Exception(f"Failed to get context: {str(e)}")
 
     async def get_issue_context(self, issue_title: str, issue_body: str) -> Dict[str, Any]:
@@ -209,5 +220,4 @@ Code:
             return await self.get_relevant_context(query)
             
         except Exception as e:
-            print(f"Error getting issue context: {e}")
             raise Exception(f"Failed to get issue context: {str(e)}") 

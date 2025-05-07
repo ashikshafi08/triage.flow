@@ -60,10 +60,8 @@ class GitHubIssueClient:
                             for c in comments
                         ]
                     else:
-                        print(f"Error fetching comments: {response.status}")
                         return []
         except Exception as e:
-            print(f"Error fetching comments: {str(e)}")
             return []
 
     async def get_issue(self, issue_url: str) -> IssueResponse:
@@ -122,7 +120,6 @@ class GitHubIssueClient:
                         return IssueResponse(status="success", data=Issue(**result))
                 
             except Exception as e:
-                print(f"Error fetching issue: {str(e)}")
                 if attempt == settings.max_retries - 1:
                     return IssueResponse(
                         status="error",

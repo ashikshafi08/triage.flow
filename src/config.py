@@ -44,7 +44,11 @@ class Settings(BaseSettings):
         "mistral-large": {
             "max_tokens": 4000,
             "temperature": 0.7,
-        }
+        },
+        "openai/o4-mini-high": {
+            "max_tokens": 8000,
+            "temperature": 0.7,
+        },
     }
     
     class Config:
