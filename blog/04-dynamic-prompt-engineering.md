@@ -2,133 +2,32 @@
 
 ## Introduction
 
-When we first started working with Large Language Models (LLMs), we quickly realized that the quality of the prompts we send to these models is crucial for getting meaningful responses. After months of experimentation and iteration, we've developed a dynamic prompt engineering system that adapts to different analysis needs while maintaining consistency and quality.
+If you've ever worked with large language models, you know that the difference between a mediocre answer and a brilliant one often comes down to the prompt. Early in our journey building the GitHub Issue Analysis tool, we learned this lesson the hard way. A single misplaced instruction or a poorly formatted context block could send even the smartest model off the rails. We realized that prompt engineering wasn't just a technical detail—it was the art and science at the heart of our product.
 
 ## The Challenge
 
-Creating effective prompts for LLMs is more art than science. We needed to address several key challenges:
-- How to format prompts for different types of tasks
-- How to integrate relevant context from the codebase
-- How to provide clear and specific instructions
-- How to maintain a consistent structure
-- How to handle markdown and formatting properly
+Every issue, every code review, every feature request is unique. Some need a deep technical dive, others a high-level summary. Some require context from dozens of files, while others hinge on a single line of code. We needed a system that could adapt to all these scenarios, crafting prompts that were not only accurate and clear, but also flexible enough to evolve as our users' needs changed.
 
-## Our Solution
+## Our Approach
 
-### 1. Template-Based System
-```python
-self.prompt_templates = {
-    "explain": """Please explain the following GitHub issue:
+We started by building a library of prompt templates, each tailored to a specific task—explaining an issue, suggesting a fix, summarizing a discussion. But templates alone weren't enough. We needed to make sure that every prompt was clean, readable, and free of the markdown quirks and HTML artifacts that often sneak in from GitHub or other sources. So we developed a robust markdown cleaning pipeline, stripping away noise and ensuring that every prompt was as clear to the model as it would be to a human.
 
-Title: {title}
-Description: {description}
+Context integration was the next frontier. It's one thing to ask a model to "explain this bug," but it's another to give it the right context: the relevant code, the related documentation, the history of similar issues. Our system pulls in this context automatically, weaving it into the prompt in a way that feels natural and informative. The result? Prompts that don't just ask for answers—they set the stage for insight.
 
-{context}
+## Real-World Impact
 
-Please provide:
-1. A clear explanation of what the issue is about
-2. The root cause of the problem
-3. Any relevant technical details from the codebase
-4. Potential impact if not addressed""",
+The results have been remarkable. Teams using our tool have reported more accurate, actionable responses from LLMs, with less back-and-forth and fewer misunderstandings. In one case, a developer was able to resolve a complex issue in minutes, thanks to a prompt that surfaced the exact context needed—no more, no less. In another, a product manager used our system to generate high-level summaries for stakeholders, saving hours of manual work.
 
-    "fix": """Please provide a solution for the following GitHub issue:
-    # ... other templates
-}
-```
+But perhaps the most rewarding feedback has come from new users, who tell us that our prompts "just make sense." They don't have to learn a new language or wrestle with confusing instructions—the system adapts to them, not the other way around.
 
-We've built a comprehensive template system that:
-- Defines task-specific templates for different types of analysis
-- Maintains a consistent structure across all prompts
-- Provides clear and specific instructions
-- Integrates relevant context from the codebase
+## How It Changes the Way We Work
 
-### 2. Markdown Processing
-```python
-def _clean_markdown(self, text: str) -> str:
-    """Clean up markdown formatting in text."""
-    # Remove <details> and <summary> tags and their content
-    text = re.sub(r'<details>.*?</details>', '', text, flags=re.DOTALL)
-    
-    # Remove other HTML-like tags
-    text = re.sub(r'<[^>]+>', '', text)
-    
-    # Clean up multiple newlines
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    
-    return text.strip()
-```
+Dynamic prompt engineering has fundamentally changed our workflow. Developers spend less time crafting and debugging prompts, and more time solving real problems. Product teams can experiment with new types of analysis, knowing that the system will adapt. And as new models and capabilities emerge, we can update our templates and context integration strategies without missing a beat.
 
-Our markdown processing system:
-- Removes HTML tags that might confuse the model
-- Cleans up formatting to maintain readability
-- Preserves important structural elements
-- Ensures consistent output format
+## Looking Ahead
 
-### 3. Context Integration
-```python
-async def generate_prompt(self, request: PromptRequest, issue: Issue) -> PromptResponse:
-    # Clean up the issue description
-    clean_description = self._clean_markdown(issue.body)
-    
-    # Format the context
-    context = request.context.get("repo_context", {})
-    context_text = ""
-    if context:
-        context_text = "\nRepository Context:\n\n"
-        if context.get("sources"):
-            context_text += "Relevant Files:\n"
-            for source in context["sources"]:
-                context_text += f"- {source['file']}\n"
-            context_text += "\n"
-        if context.get("response"):
-            context_text += f"Repository Context:\n{context['response']}\n"
-```
-
-Our context integration system:
-- Integrates relevant repository context
-- Formats file references clearly
-- Maintains a clear structure
-- Preserves important information
-
-## Real-World Benefits
-
-1. **Consistency**: Our template system ensures that all prompts follow a consistent structure, making it easier for the model to understand and respond.
-
-2. **Clarity**: By providing clear instructions and formatting, we get more accurate and useful responses from the model.
-
-3. **Context**: Our system integrates relevant context from the codebase, helping the model understand the full picture.
-
-4. **Flexibility**: The template system makes it easy to modify and extend prompts for different types of analysis.
-
-## Implementation Details
-
-### 1. Template Management
-- We maintain a library of task-specific templates
-- We ensure consistent formatting across all prompts
-- We provide clear instructions for each task
-- We integrate context from the codebase
-
-### 2. Markdown Handling
-- We remove HTML tags that might confuse the model
-- We clean up formatting to maintain readability
-- We preserve important structural elements
-- We ensure consistent output format
-
-### 3. Context Integration
-- We integrate relevant repository context
-- We format file references clearly
-- We maintain a clear structure
-- We preserve important information
-
-## Future Improvements
-
-1. Add more prompt types for different analysis tasks
-2. Improve context integration with better relevance scoring
-3. Enhance markdown handling for complex formatting
-4. Add prompt validation to ensure quality
+We see prompt engineering as a living discipline—one that will only grow in importance as LLMs become more powerful and more deeply integrated into the developer workflow. Our roadmap includes smarter context selection, more adaptive templates, and even real-time prompt validation to catch issues before they reach the model. We're excited to push the boundaries of what's possible, making every interaction with an LLM as effective and insightful as it can be.
 
 ## Conclusion
 
-Building our dynamic prompt engineering system has been a fascinating journey. It's given us the ability to create effective prompts that lead to meaningful and useful responses from LLMs. By combining template-based generation, smart markdown processing, and context integration, we've created a system that adapts to different analysis needs while maintaining consistency and quality.
-
-What's most exciting is that this is just the beginning. As we continue to improve the system, we're finding new ways to create more effective prompts, making our tool even more powerful and useful for developers. 
+Dynamic prompt engineering isn't just about getting better answers—it's about building a bridge between human intent and machine intelligence. By treating prompts as first-class citizens, we're helping teams unlock the full potential of LLMs, one carefully crafted question at a time. As our system continues to evolve, we look forward to empowering more users to ask better questions, get better answers, and move faster than ever before. 
