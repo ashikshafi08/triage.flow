@@ -1,4 +1,8 @@
-# GH Issue Prompt
+<p align="center">
+  <img src="triage_flow_logo.png" alt="triage.flow logo" width="180" height="180"/>
+</p>
+
+# triage.flow
 
 <p align="center">
   <b>AI-powered GitHub Issue Context & Prompt Generator with RAG and Multi-Model LLM Support</b><br>
@@ -8,7 +12,7 @@
 
 ---
 
-## Why Use This?
+## Why Use triage.flow?
 
 - **Instantly understand and triage GitHub issues** with deep, code-aware context
 - **Automate prompt generation** for LLMs using real repo code, docs, and discussions
@@ -34,7 +38,7 @@
 
 ---
 
-## Who is this for?
+## Who is triage.flow for?
 - **Open source maintainers**: triage and understand issues faster
 - **Contributors**: get up to speed on unfamiliar codebases
 - **AI agents & bots**: generate actionable, context-rich prompts
@@ -42,7 +46,7 @@
 
 ---
 
-## How it Works
+## How triage.flow Works
 
 ```
 GitHub Issue URL
@@ -76,8 +80,8 @@ LLM Response
 See [docs/quickstart.md](docs/quickstart.md) for full details.
 
 ```bash
-git clone https://github.com/yourusername/gh-issue-prompt.git
-cd gh-issue-prompt
+git clone https://github.com/yourusername/triage.flow.git
+cd triage.flow
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
