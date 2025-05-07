@@ -10,9 +10,51 @@ Every issue, every code review, every feature request is unique. Some need a dee
 
 ## Our Approach
 
-We started by building a library of prompt templates, each tailored to a specific task—explaining an issue, suggesting a fix, summarizing a discussion. But templates alone weren't enough. We needed to make sure that every prompt was clean, readable, and free of the markdown quirks and HTML artifacts that often sneak in from GitHub or other sources. So we developed a robust markdown cleaning pipeline, stripping away noise and ensuring that every prompt was as clear to the model as it would be to a human.
+We started by building a library of prompt templates, each tailored to a specific task—explaining an issue, suggesting a fix, summarizing a discussion. Here's an example of how we define and use these templates:
 
-Context integration was the next frontier. It's one thing to ask a model to "explain this bug," but it's another to give it the right context: the relevant code, the related documentation, the history of similar issues. Our system pulls in this context automatically, weaving it into the prompt in a way that feels natural and informative. The result? Prompts that don't just ask for answers—they set the stage for insight.
+```python
+# Template management for prompt engineering
+self.prompt_templates = {
+    "explain": """Please explain the following GitHub issue:\n\nTitle: {title}\nDescription: {description}\n\n{context}\n\nPlease provide:\n1. A clear explanation of what the issue is about\n2. The root cause of the problem\n3. Any relevant technical details from the codebase\n4. Potential impact if not addressed""",
+    "fix": """Please provide a solution for the following GitHub issue:\n..."""
+    # ... other templates
+}
+```
+
+But templates alone weren't enough. We needed to make sure that every prompt was clean, readable, and free of the markdown quirks and HTML artifacts that often sneak in from GitHub or other sources. To do this, we developed a robust markdown cleaning pipeline:
+
+```python
+# Markdown cleaning for prompt clarity
+def _clean_markdown(self, text: str) -> str:
+    """Clean up markdown formatting in text."""
+    # Remove <details> and <summary> tags and their content
+    text = re.sub(r'<details>.*?</details>', '', text, flags=re.DOTALL)
+    # Remove other HTML-like tags
+    text = re.sub(r'<[^>]+>', '', text)
+    # Clean up multiple newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+```
+
+Context integration was the next frontier. It's one thing to ask a model to "explain this bug," but it's another to give it the right context: the relevant code, the related documentation, the history of similar issues. Our system pulls in this context automatically, weaving it into the prompt in a way that feels natural and informative:
+
+```python
+# Context integration for prompt generation
+def generate_prompt(self, request, issue):
+    clean_description = self._clean_markdown(issue.body)
+    context = request.context.get("repo_context", {})
+    context_text = ""
+    if context:
+        context_text = "\nRepository Context:\n\n"
+        if context.get("sources"):
+            context_text += "Relevant Files:\n"
+            for source in context["sources"]:
+                context_text += f"- {source['file']}\n"
+            context_text += "\n"
+        if context.get("response"):
+            context_text += f"Repository Context:\n{context['response']}\n"
+    # ... assemble the final prompt using the template and context_text
+```
 
 ## Real-World Impact
 

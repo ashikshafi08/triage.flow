@@ -12,7 +12,19 @@ Our answer was to build a multi-model orchestration system—a kind of AI contro
 
 We started by designing a provider-agnostic architecture. Instead of hard-coding logic for a single API, we built a unified interface that could talk to OpenAI, OpenRouter, and any other provider we might add in the future. This meant that switching models was as simple as changing a configuration—no rewrites, no headaches. Our system handled the messy details: prompt formatting, parameter tuning, error handling, and even tracking token usage across providers.
 
-But we didn't stop there. We knew that every model has its own sweet spot for things like temperature, max tokens, and system prompts. So we built a dynamic configuration layer, letting us fine-tune each model for specific tasks. Need more creativity for brainstorming? Dial up the temperature. Want deterministic answers for code generation? Lower it. This flexibility let us optimize for both quality and cost, adapting on the fly as our needs changed.
+```python
+# Provider switching and error handling
+async def process_prompt(self, prompt, model):
+    try:
+        config = self._get_model_config(model)
+        response = await self._call_provider(prompt, model, config)
+        return response
+    except ProviderError as e:
+        # Fallback to default model if the chosen provider fails
+        fallback_model = self.default_model
+        fallback_config = self._get_model_config(fallback_model)
+        return await self._call_provider(prompt, fallback_model, fallback_config)
+```
 
 One of the most rewarding aspects of this journey has been seeing how our orchestration system empowers real users. Teams can now choose the most cost-effective model for routine tasks, then switch to a more powerful (and expensive) model for complex analysis—all without changing their workflow. When a provider has an outage, our system automatically falls back to another, ensuring uninterrupted service. And as new models hit the market, we can integrate them in days, not weeks.
 

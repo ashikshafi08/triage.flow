@@ -10,13 +10,25 @@ Every developer knows that a GitHub issue rarely exists in isolation. A bug repo
 
 ## Our Approach
 
-Rather than relying on traditional code search, we envisioned a system that would act more like a seasoned team lead: someone who knows the codebase inside and out, remembers past bugs, understands how features interact, and can point you to the right documentation or test with a knowing nod. Our context extraction engine was designed to:
+To make this possible, we built a context extraction engine that acts like a seasoned team lead—someone who knows the codebase inside and out, remembers past bugs, and can point you to the right documentation or test with a knowing nod. At the heart of this system is a function that pulls together all the relevant context for a given issue:
 
-- Map out the intricate web of code dependencies, so you can see not just what broke, but what else might be affected.
-- Surface relevant documentation and comments, giving you the "why" behind the "what."
-- Highlight related tests, so you know what's already covered and where the gaps might be.
-- Track architectural decisions and patterns, helping you understand how a change fits into the broader system.
-- Recall the history of similar issues, so you can learn from the past instead of repeating it.
+```python
+# Context extraction for a GitHub issue
+async def extract_issue_context(issue_id, repo):
+    """Gather code, docs, and test context for a given issue."""
+    code_refs = find_code_references(issue_id, repo)
+    docs = find_related_docs(code_refs, repo)
+    tests = find_related_tests(code_refs, repo)
+    history = get_issue_history(issue_id, repo)
+    return {
+        "code": code_refs,
+        "docs": docs,
+        "tests": tests,
+        "history": history
+    }
+```
+
+This approach means that when a developer opens an issue, they're not just looking at a title and description—they're presented with a curated map of the most relevant code, documentation, and tests. It's a leap beyond keyword search, surfacing the relationships and context that matter most.
 
 ## Real-World Impact
 
