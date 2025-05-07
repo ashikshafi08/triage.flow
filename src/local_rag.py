@@ -168,12 +168,12 @@ Code:
             # Get response from query engine
             response = self.query_engine.query(query)
             
-            # Extract relevant information with language context
+            # Extract relevant information with language context and full file paths
             context = {
                 "response": str(response),
                 "sources": [
                     {
-                        "file": node.metadata.get("file_name", "unknown"),
+                        "file": os.path.abspath(node.metadata.get("file_name", "unknown")),
                         "language": node.metadata.get("display_name", "unknown"),
                         "description": node.metadata.get("description", "No description available"),
                         "content": node.text

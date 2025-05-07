@@ -1,160 +1,157 @@
-from typing import Dict, Optional
+from typing import Dict, Any, Optional
+import re
 from .models import Issue, PromptRequest, PromptResponse, IssueComment
 from .config import settings
+from .language_config import get_language_metadata
 
 class PromptGenerator:
     def __init__(self):
-        self.templates = {
-            "explain": self._generate_explain_prompt,
-            "fix": self._generate_fix_prompt,
-            "test": self._generate_test_prompt,
-            "summarize": self._generate_summarize_prompt
-        }
+        self.prompt_templates = {
+            "explain": """Please explain the following GitHub issue:
 
-    def _format_context(self, context: Dict) -> str:
-        if not context:
-            return "No additional context provided."
-        
-        # Filter out repo_context which is handled separately
-        filtered_context = {k: v for k, v in context.items() if k != "repo_context"}
-        if not filtered_context:
-            return "No additional context provided."
-            
-        return "\n".join(f"{key}: {value}" for key, value in filtered_context.items())
+Title: {title}
+Description: {description}
 
-    def _format_comments(self, comments: list) -> str:
-        if not comments:
-            return "No comments."
-        formatted = []
-        for c in comments:
-            # c may be IssueComment or dict
-            user = getattr(c, 'user', c.get('user', ''))
-            created_at = getattr(c, 'created_at', c.get('created_at', ''))
-            body = getattr(c, 'body', c.get('body', ''))
-            formatted.append(f"- [{user} at {created_at}]: {body}")
-        return "\n".join(formatted)
-
-    def _format_repo_context(self, repo_context: Dict) -> str:
-        if not repo_context or not repo_context.get('sources'):
-            return "No repository context available."
-        
-        # Collect unique file names
-        files = {source['file'] for source in repo_context['sources']}
-        file_list = "\n".join(f"- {file}" for file in files)
-        
-        sources = "\n".join([
-            f"File: {source['file']}\nContent: {source['content'][:500]}...\n"
-            for source in repo_context.get('sources', [])
-        ])
-        
-        return f"""
-Relevant Files:
-{file_list}
-
-Repository Context:
-{repo_context.get('response', 'No response')}
-
-Relevant Code and Documentation:
-{sources}
-"""
-
-    def _generate_explain_prompt(self, issue: Issue, context: Dict, repo_context: Dict) -> str:
-        return f"""Please explain the following GitHub issue:
-
-Title: {issue.title}
-Description: {issue.body}
-
-Comments:
-{self._format_comments(issue.comments)}
-
-Repository Context:
-{self._format_repo_context(repo_context)}
-
-Additional Context:
-{self._format_context(context)}
+{context}
 
 Please provide:
 1. A clear explanation of what the issue is about
 2. The root cause of the problem
 3. Any relevant technical details from the codebase
-4. Potential impact if not addressed"""
+4. Potential impact if not addressed""",
 
-    def _generate_fix_prompt(self, issue: Issue, context: Dict, repo_context: Dict) -> str:
-        return f"""Please help fix the following GitHub issue:
+            "fix": """Please provide a solution for the following GitHub issue:
 
-Title: {issue.title}
-Description: {issue.body}
+Title: {title}
+Description: {description}
 
-Comments:
-{self._format_comments(issue.comments)}
-
-Repository Context:
-{self._format_repo_context(repo_context)}
-
-Additional Context:
-{self._format_context(context)}
+{context}
 
 Please provide:
-1. A detailed solution to the problem
-2. Code changes needed, referencing relevant files
-3. Any necessary tests
-4. Potential edge cases to consider"""
+1. A detailed explanation of the proposed fix
+2. Code changes needed (with file paths and line numbers)
+3. Test cases to verify the fix
+4. Any potential side effects or considerations""",
 
-    def _generate_test_prompt(self, issue: Issue, context: Dict, repo_context: Dict) -> str:
-        return f"""Please create test cases for the following GitHub issue:
+            "test": """Please create test cases for the following GitHub issue:
 
-Title: {issue.title}
-Description: {issue.body}
+Title: {title}
+Description: {description}
 
-Comments:
-{self._format_comments(issue.comments)}
-
-Repository Context:
-{self._format_repo_context(repo_context)}
-
-Additional Context:
-{self._format_context(context)}
+{context}
 
 Please provide:
-1. Test scenarios that verify the issue
-2. Test cases that validate the fix
-3. Edge cases to consider
-4. Test implementation in the appropriate language"""
+1. Test scenarios that cover the issue
+2. Test code with file paths and line numbers
+3. Expected results for each test
+4. Any edge cases to consider""",
 
-    def _generate_summarize_prompt(self, issue: Issue, context: Dict, repo_context: Dict) -> str:
-        return f"""Please summarize the following GitHub issue:
+            "summarize": """Please summarize the following GitHub issue:
 
-Title: {issue.title}
-Description: {issue.body}
+Title: {title}
+Description: {description}
 
-Comments:
-{self._format_comments(issue.comments)}
-
-Repository Context:
-{self._format_repo_context(repo_context)}
-
-Additional Context:
-{self._format_context(context)}
+{context}
 
 Please provide:
 1. A concise summary of the issue
-2. Key points from the discussion
-3. Current status and next steps
-4. Any blockers or dependencies"""
+2. Key technical details
+3. Current status
+4. Next steps or recommendations"""
+        }
+
+    def _clean_markdown(self, text: str) -> str:
+        """Clean up markdown formatting in text."""
+        # Remove <details> and <summary> tags and their content
+        text = re.sub(r'<details>.*?</details>', '', text, flags=re.DOTALL)
+        
+        # Remove other HTML-like tags
+        text = re.sub(r'<[^>]+>', '', text)
+        
+        # Clean up multiple newlines
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        return text.strip()
+
+    def _format_suggestions(self, text: str) -> str:
+        """Format suggestions with proper markdown."""
+        # Convert "Suggested next steps" to a proper section
+        text = re.sub(
+            r'Suggested next steps.*?$',
+            '\nSuggested Next Steps:\n',
+            text,
+            flags=re.DOTALL | re.MULTILINE
+        )
+        
+        # Convert suggestions to checkboxes
+        text = re.sub(
+            r'•\s*(.*?)(?=\n•|\n\n|$)',
+            r'- [ ] \1',
+            text,
+            flags=re.MULTILINE
+        )
+        
+        return text
+
+    def _add_test_references(self, text: str, context: Dict[str, Any]) -> str:
+        """Add references to relevant test files."""
+        test_files = []
+        for source in context.get("sources", []):
+            if "test" in source.get("file", "").lower():
+                test_files.append(f"- {source['file']}")
+        
+        if test_files:
+            text += "\n\nRelated Test Files:\n" + "\n".join(test_files)
+        
+        return text
 
     async def generate_prompt(self, request: PromptRequest, issue: Issue) -> PromptResponse:
+        """Generate a prompt based on the request type and issue."""
         try:
-            if request.prompt_type not in self.templates:
+            # Get the appropriate template
+            template = self.prompt_templates.get(request.prompt_type)
+            if not template:
                 return PromptResponse(
                     status="error",
-                    error=f"Invalid prompt type: {request.prompt_type}"
+                    error=f"Unsupported prompt type: {request.prompt_type}"
                 )
 
-            # Get repository context from the request if provided
-            repo_context = request.context.get("repo_context", {})
+            # Clean up the issue description
+            clean_description = self._clean_markdown(issue.body)
             
-            # Generate prompt with repository context
-            prompt = self.templates[request.prompt_type](issue, request.context, repo_context)
-            return PromptResponse(status="success", prompt=prompt)
+            # Format the context
+            context = request.context.get("repo_context", {})
+            context_text = ""
+            if context:
+                context_text = "\nRepository Context:\n\n"
+                if context.get("sources"):
+                    context_text += "Relevant Files:\n"
+                    for source in context["sources"]:
+                        context_text += f"- {source['file']}\n"
+                    context_text += "\n"
+                if context.get("response"):
+                    context_text += f"Repository Context:\n{context['response']}\n"
+
+            # Generate the prompt
+            prompt = template.format(
+                title=issue.title,
+                description=clean_description,
+                context=context_text
+            )
+
+            # Format suggestions if present
+            prompt = self._format_suggestions(prompt)
+            
+            # Add test references
+            prompt = self._add_test_references(prompt, context)
+
+            return PromptResponse(
+                status="success",
+                prompt=prompt
+            )
+
         except Exception as e:
-            return PromptResponse(status="error", error=str(e)) 
+            return PromptResponse(
+                status="error",
+                error=f"Failed to generate prompt: {str(e)}"
+            ) 

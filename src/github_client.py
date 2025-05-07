@@ -2,7 +2,7 @@ from typing import Optional, Dict, Any, Tuple
 import re
 import asyncio
 from datetime import datetime, timedelta
-from llama_index.readers.github import GitHubIssuesClient
+import aiohttp
 from .config import settings
 from .models import Issue, IssueResponse, IssueComment
 
@@ -10,9 +10,13 @@ class GitHubIssueClient:
     def __init__(self):
         if not settings.github_token:
             raise ValueError("GitHub token is required. Please set GITHUB_TOKEN in your .env file.")
-        self.client = GitHubIssuesClient(github_token=settings.github_token)
+        self.token = settings.github_token
         self.cache: Dict[str, Dict[str, Any]] = {}
         self.cache_duration = timedelta(minutes=settings.cache_duration_minutes)
+        self.headers = {
+            "Authorization": f"token {self.token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
 
     def _extract_issue_info(self, url: str) -> Optional[Tuple[str, str, int]]:
         """Extract owner, repo, and issue number from URL with validation."""
@@ -40,12 +44,26 @@ class GitHubIssueClient:
         }
 
     async def _fetch_issue_comments(self, owner: str, repo: str, issue_number: int) -> list:
-        """Fetch comments for a specific issue."""
+        """Fetch comments for a specific issue using GitHub API."""
         try:
-            comments = await self.client.get_issue_comments(owner=owner, repo=repo, issue_number=issue_number)
-            return comments
+            async with aiohttp.ClientSession() as session:
+                url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
+                async with session.get(url, headers=self.headers) as response:
+                    if response.status == 200:
+                        comments = await response.json()
+                        return [
+                            {
+                                "body": c["body"],
+                                "user": c["user"]["login"] if "user" in c and c["user"] else "",
+                                "created_at": c["created_at"]
+                            }
+                            for c in comments
+                        ]
+                    else:
+                        print(f"Error fetching comments: {response.status}")
+                        return []
         except Exception as e:
-            print(f"Error fetching comments: {e}")
+            print(f"Error fetching comments: {str(e)}")
             return []
 
     async def get_issue(self, issue_url: str) -> IssueResponse:
@@ -72,45 +90,39 @@ class GitHubIssueClient:
         
         for attempt in range(settings.max_retries):
             try:
-                # Get all issues and filter for the specific one
-                issues = await self.client.get_issues(owner=owner, repo=repo)
-                specific_issue = next((issue for issue in issues if issue["number"] == issue_number), None)
-                
-                if not specific_issue:
-                    return IssueResponse(
-                        status="error",
-                        error=f"Issue #{issue_number} not found"
-                    )
-                
-                # Fetch comments for the issue
-                comments_raw = await self._fetch_issue_comments(owner, repo, issue_number)
-                comments = [
-                    {
-                        "body": c["body"],
-                        "user": c["user"]["login"] if "user" in c and c["user"] else "",
-                        "created_at": c["created_at"]
-                    }
-                    for c in comments_raw
-                ]
-                
-                result = {
-                    "number": issue_number,
-                    "title": specific_issue['title'],
-                    "body": specific_issue['body'],
-                    "state": specific_issue['state'],
-                    "created_at": specific_issue['created_at'],
-                    "url": issue_url,
-                    "labels": [label['name'] for label in specific_issue.get('labels', [])],
-                    "assignees": [assignee['login'] for assignee in specific_issue.get('assignees', [])],
-                    "comments": comments
-                }
-                
-                # Cache the successful result
-                self._cache_issue(issue_url, result)
-                return IssueResponse(status="success", data=Issue(**result))
+                async with aiohttp.ClientSession() as session:
+                    # Get issue details
+                    url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}"
+                    async with session.get(url, headers=self.headers) as response:
+                        if response.status == 404:
+                            return IssueResponse(
+                                status="error",
+                                error=f"Issue #{issue_number} not found"
+                            )
+                        response.raise_for_status()
+                        issue_data = await response.json()
+                        
+                        # Fetch comments
+                        comments = await self._fetch_issue_comments(owner, repo, issue_number)
+                        
+                        result = {
+                            "number": issue_number,
+                            "title": issue_data['title'],
+                            "body": issue_data['body'],
+                            "state": issue_data['state'],
+                            "created_at": issue_data['created_at'],
+                            "url": issue_url,
+                            "labels": [label['name'] for label in issue_data.get('labels', [])],
+                            "assignees": [assignee['login'] for assignee in issue_data.get('assignees', [])],
+                            "comments": comments
+                        }
+                        
+                        # Cache the successful result
+                        self._cache_issue(issue_url, result)
+                        return IssueResponse(status="success", data=Issue(**result))
                 
             except Exception as e:
-                print(f"Error fetching issue: {str(e)}")  # Add debug print
+                print(f"Error fetching issue: {str(e)}")
                 if attempt == settings.max_retries - 1:
                     return IssueResponse(
                         status="error",

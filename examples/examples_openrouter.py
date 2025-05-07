@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-Complete example demonstrating GitHub Issue Prompt with Local RAG capabilities
+Complete example demonstrating GitHub Issue Prompt with OpenRouter and Claude 3 Sonnet
 Make sure to set environment variables before running:
 
-export OPENAI_API_KEY=your_openai_api_key_here
+export OPENROUTER_API_KEY=your_openrouter_api_key_here
 export GITHUB_TOKEN=your_github_token_here
+export LLM_PROVIDER=openrouter
 """
 
 import asyncio
 import os
 import sys
 from dotenv import load_dotenv
-from src.models import PromptRequest, IssueResponse
+from src.models import PromptRequest, IssueResponse, LLMConfig
 from src.github_client import GitHubIssueClient
 from src.llm_client import LLMClient
 from src.prompt_generator import PromptGenerator
-from src.local_rag import LocalRepoContextExtractor  # Use local RAG instead
+from src.local_rag import LocalRepoContextExtractor
 import nest_asyncio
 
 # Enable nested event loops
@@ -26,8 +27,9 @@ load_dotenv()
 
 # Check for required environment variables
 required_vars = {
-    "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY"),
-    "GITHUB_TOKEN": os.environ.get("GITHUB_TOKEN")
+    "OPENROUTER_API_KEY": os.environ.get("OPENROUTER_API_KEY"),
+    "GITHUB_TOKEN": os.environ.get("GITHUB_TOKEN"),
+    "LLM_PROVIDER": os.environ.get("LLM_PROVIDER", "openrouter")
 }
 
 missing_vars = [var for var, value in required_vars.items() if not value]
@@ -41,11 +43,21 @@ github_client = GitHubIssueClient()
 llm_client = LLMClient()
 prompt_generator = PromptGenerator()
 
-async def run_example(issue_url: str, prompt_type: str, model: str = "gpt-4o-mini"):
-    """Run a comprehensive example with local RAG context and prompt generation."""
-    print(f"\nRunning example for {prompt_type} prompt type with Local RAG...")
+async def run_example(issue_url: str, prompt_type: str):
+    """Run a comprehensive example with OpenRouter and Claude 3 Sonnet."""
+    print(f"\nRunning example for {prompt_type} prompt type with OpenRouter...")
     print(f"Issue URL: {issue_url}")
-    print(f"Model: {model}")
+    
+    # Configure model settings
+    llm_config = LLMConfig(
+        provider="openrouter",
+        name="openai/o4-mini-high",
+        additional_params={
+            "top_p": 0.9,
+            "frequency_penalty": 0.1,
+            "presence_penalty": 0.1
+        }
+    )
     
     # Get GitHub issue
     issue_response = await github_client.get_issue(issue_url)
@@ -54,7 +66,6 @@ async def run_example(issue_url: str, prompt_type: str, model: str = "gpt-4o-min
         return
     
     # Parse owner and repo from URL for repo URL
-    # Format: https://github.com/owner/repo/issues/number
     url_parts = issue_url.split('/')
     owner = url_parts[3]
     repo = url_parts[4]
@@ -77,7 +88,7 @@ async def run_example(issue_url: str, prompt_type: str, model: str = "gpt-4o-min
     request = PromptRequest(
         issue_url=issue_url,
         prompt_type=prompt_type,
-        model=model,
+        llm_config=llm_config,
         context={"repo_context": context}
     )
     
@@ -96,22 +107,30 @@ async def run_example(issue_url: str, prompt_type: str, model: str = "gpt-4o-min
     llm_response = await llm_client.process_prompt(
         prompt=prompt_response.prompt,
         prompt_type=prompt_type,
-        model=model
+        model=llm_config.name
     )
-    print("\nLLM Response:")
+    
+    if llm_response.status == "error":
+        print(f"\nError from LLM: {llm_response.error}")
+        return
+    
+    print("\nO4 Mini High Response:")
     print("=" * 80)
-    print(llm_response)
+    print(llm_response.prompt)
     print("=" * 80)
+    
+    if llm_response.tokens_used:
+        print(f"\nTokens used: {llm_response.tokens_used}")
 
 async def main():
     # Example GitHub issue
     issue = {
-        "url": "https://github.com/huggingface/smolagents/issues/1295",
+        "url": "https://github.com/vllm-project/vllm/issues/17747",  # This is a known working issue
         "prompt_type": "explain",  # Options: explain, fix, test, summarize
-        "model": "o4-mini"
+        "model": "openai/o4-mini-high"
     }
     
-    await run_example(issue["url"], issue["prompt_type"], issue["model"])
+    await run_example(issue["url"], issue["prompt_type"])
 
 if __name__ == "__main__":
     asyncio.run(main()) 

@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 class IssueComment(BaseModel):
@@ -14,22 +14,32 @@ class Issue(BaseModel):
     state: str
     created_at: datetime
     url: str
-    labels: List[str] = Field(default_factory=list)
-    assignees: List[str] = Field(default_factory=list)
-    comments: List[IssueComment] = Field(default_factory=list)
+    labels: List[str] = []
+    assignees: List[str] = []
+    comments: List[IssueComment] = []
 
 class IssueResponse(BaseModel):
     status: str
     data: Optional[Issue] = None
     error: Optional[str] = None
 
+class LLMConfig(BaseModel):
+    provider: str
+    name: str
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    additional_params: Dict[str, Any] = {}
+
 class PromptRequest(BaseModel):
     issue_url: str
-    prompt_type: str = Field(..., description="Type of prompt to generate (explain, fix, test, summarize)")
-    model: str = Field(..., description="LLM model to use (gpt-4, claude, etc.)")
-    context: Optional[dict] = Field(default_factory=dict)
+    prompt_type: str
+    llm_config: LLMConfig
+    context: Dict[str, Any] = {}
 
 class PromptResponse(BaseModel):
     status: str
     prompt: Optional[str] = None
-    error: Optional[str] = None 
+    response: Optional[str] = None
+    error: Optional[str] = None
+    model_used: Optional[str] = None
+    tokens_used: Optional[int] = None 

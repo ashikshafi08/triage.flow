@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from .models import PromptRequest, PromptResponse
+from .models import PromptRequest, PromptResponse, ModelConfig
 from .github_client import GitHubIssueClient
 from .llm_client import LLMClient
 from .prompt_generator import PromptGenerator
@@ -49,13 +49,17 @@ async def generate_prompt(request: PromptRequest) -> PromptResponse:
         # Process prompt with LLM
         llm_response = await llm_client.process_prompt(
             prompt_response.prompt,
-            model=request.model
+            prompt_type=request.prompt_type,
+            model=request.model_config.name,
+            context=request.context
         )
 
         return PromptResponse(
             status="success",
             prompt=prompt_response.prompt,
-            response=llm_response
+            response=llm_response.prompt,
+            model_used=request.model_config.name,
+            tokens_used=llm_response.tokens_used if hasattr(llm_response, 'tokens_used') else None
         )
 
     except HTTPException:
