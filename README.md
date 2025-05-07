@@ -1,7 +1,7 @@
 # GH Issue Prompt
 
 <p align="center">
-  <b>AI-powered GitHub Issue Context & Prompt Generator with RAG</b><br>
+  <b>AI-powered GitHub Issue Context & Prompt Generator with RAG and Multi-Model LLM Support</b><br>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License"></a>
   <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.8%2B-blue.svg" alt="Python"></a>
 </p>
@@ -13,6 +13,7 @@
 - **Instantly understand and triage GitHub issues** with deep, code-aware context
 - **Automate prompt generation** for LLMs using real repo code, docs, and discussions
 - **Works with 20+ programming languages** and any public or private repo
+- **Supports OpenAI, OpenRouter, Claude, Mistral, and more**
 - **Save time for maintainers, contributors, and AI agents**
 
 ---
@@ -24,7 +25,8 @@
 | Multi-Language Support        | 20+ languages, auto-detected                                     |
 | Local Repo Analysis           | Fast, privacy-friendly, no API rate limits                       |
 | FAISS Vector Store            | Efficient, scalable code/document search                         |
-| OpenAI Embeddings             | High-quality semantic understanding                              |
+| OpenAI & OpenRouter Embeddings| High-quality semantic understanding                              |
+| Multi-Provider LLM Support    | OpenAI, OpenRouter, Claude, Mistral, and more                    |
 | Issue + Comments Extraction   | Full context from GitHub issues and discussions                  |
 | Contextual Prompt Generation  | Explain, fix, test, summarize, or customize                     |
 | CLI & Python API              | Use from terminal or integrate in your own apps                  |
@@ -55,13 +57,13 @@ Clone Repo Locally
 Analyze Code & Docs (Multi-Language)
       |
       v
-Build Vector Index (FAISS + OpenAI)
+Build Vector Index (FAISS + OpenAI/OpenRouter)
       |
       v
 Retrieve Relevant Context
       |
       v
-Generate LLM Prompt
+Generate LLM Prompt (Explain, Fix, Test, Summarize, ...)
       |
       v
 LLM Response
@@ -79,46 +81,78 @@ cd gh-issue-prompt
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-# Add your .env file with OPENAI_API_KEY and GITHUB_TOKEN
-python examples/examples_complete_rag.py
+# Add your .env file with OPENAI_API_KEY, OPENROUTER_API_KEY, and GITHUB_TOKEN
+python examples/examples_openrouter.py
 ```
+
+---
+
+## Environment Variables
+
+| Variable              | Description                                 |
+|----------------------|---------------------------------------------|
+| `OPENAI_API_KEY`     | Your OpenAI API key (for OpenAI models)     |
+| `OPENROUTER_API_KEY` | Your OpenRouter API key (for OpenRouter)    |
+| `GITHUB_TOKEN`       | GitHub personal access token                |
+| `LLM_PROVIDER`       | `openai`, `openrouter`, etc.                |
+| `DEFAULT_MODEL`      | Default model name (e.g., `gpt-3.5-turbo`)  |
 
 ---
 
 ## Example Usage
 
 ```python
+from src.models import PromptRequest, LLMConfig
 from src.github_client import GitHubIssueClient
 from src.local_rag import LocalRepoContextExtractor
 from src.prompt_generator import PromptGenerator
 import asyncio
 
-def get_repo_url_from_issue_url(issue_url: str) -> str:
-    parts = issue_url.rstrip('/').split('/')
-    if len(parts) >= 5:
-        return f"https://github.com/{parts[3]}/{parts[4]}.git"
-    raise ValueError("Invalid GitHub issue URL")
-
 async def main():
-    issue_url = "https://github.com/huggingface/smolagents/issues/1292"
+    issue_url = "https://github.com/vllm-project/vllm/issues/17747"
     github_client = GitHubIssueClient()
     issue_response = await github_client.get_issue(issue_url)
     if issue_response.status != "success":
         print("Failed to fetch issue")
         return
     repo_extractor = LocalRepoContextExtractor()
-    repo_url = get_repo_url_from_issue_url(issue_url)
+    repo_url = "https://github.com/vllm-project/vllm.git"
     await repo_extractor.load_repository(repo_url)
     context = await repo_extractor.get_issue_context(issue_response.data.title, issue_response.data.body)
     prompt_generator = PromptGenerator()
-    prompt = await prompt_generator.generate_prompt(
-        request=None,  # Fill in as needed
-        issue=issue_response.data
+    llm_config = LLMConfig(
+        provider="openrouter",
+        name="openai/o4-mini-high",
+        additional_params={"max_tokens": 8000}
     )
-    print(prompt)
+    request = PromptRequest(
+        issue_url=issue_url,
+        prompt_type="explain",
+        llm_config=llm_config,
+        context={"repo_context": context}
+    )
+    prompt_response = await prompt_generator.generate_prompt(request, issue_response.data)
+    print(prompt_response.prompt)
 
 asyncio.run(main())
 ```
+
+---
+
+## Available Prompt Types
+- `explain`: Explain the issue in detail
+- `fix`: Suggest a fix for the issue
+- `test`: Generate test cases for the issue
+- `summarize`: Summarize the issue
+- *(Extensible: add your own!)*
+
+---
+
+## Roadmap / Coming Soon
+- **MCP Server:** Expose repo context, vector index, and prompt/LLM APIs for agentic workflows and interactive codebase exploration
+- **Custom Prompt Types:** Easily add new prompt types or LLM actions
+- **Code Actions:** Suggest, review, or apply code changes via API
+- **Session/Workspace Management:** Multi-user and agent support
 
 ---
 
