@@ -89,6 +89,13 @@ pip install -r requirements.txt
 python examples/examples_openrouter.py
 ```
 
+or Use uv to install dependencies (Recommended)
+
+```bash
+uv pip sync requirements.txt
+python examples/examples_openrouter.py
+```
+
 ---
 
 ## Environment Variables
