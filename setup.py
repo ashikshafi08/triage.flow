@@ -19,6 +19,11 @@ setup(
         "pydantic-settings",
         "fastapi",
         "uvicorn",
-        "python-multipart"
+        "python-multipart",
+        "python-dotenv",
+        "pydantic",
+        
+        
+        
     ],
 ) 
