@@ -1,5 +1,6 @@
 llama-index-core
 llama-index-vector-stores-faiss
+llama-index 
 openai
 python-dotenv
 faiss-cpu

@@ -125,9 +125,9 @@ async def run_example(issue_url: str, prompt_type: str):
 async def main():
     # Example GitHub issue
     issue = {
-        "url": "https://github.com/huggingface/smolagents/issues/1219",  # This is a known working issue
+        "url": "https://github.com/SWE-agent/SWE-agent/issues/1166",  # This is a known working issue
         "prompt_type": "explain",  # Options: explain, fix, test, summarize
-        "model": "openai/o4-mini-high"
+        "model": "google/gemini-2.5-flash-preview-05-20"
     }
     
     await run_example(issue["url"], issue["prompt_type"])
