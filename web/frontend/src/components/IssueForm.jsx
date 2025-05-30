@@ -43,17 +43,19 @@ export default function IssueForm({ onJobSubmit }) {
       
       <div className="form-group">
         <label htmlFor="prompt-type">Prompt Type</label>
-        <select 
-          id="prompt-type"
-          value={promptType} 
-          onChange={(e) => setPromptType(e.target.value)}
-          className="form-select"
-        >
-          <option value="explain">Explain Issue</option>
-          <option value="fix">Suggest Fix</option>
-          <option value="test">Generate Tests</option>
-          <option value="summarize">Summarize</option>
-        </select>
+        <div className="select-wrapper">
+          <select 
+            id="prompt-type"
+            value={promptType} 
+            onChange={(e) => setPromptType(e.target.value)}
+            className="form-select"
+          >
+            <option value="explain">Explain Issue</option>
+            <option value="fix">Suggest Fix</option>
+            <option value="test">Generate Tests</option>
+            <option value="summarise">Summarise</option>
+          </select>
+        </div>
       </div>
       
       <button 

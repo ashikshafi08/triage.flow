@@ -34,7 +34,7 @@ async def handle_issue(request: IssueRequest, background_tasks: BackgroundTasks)
     job_id = f"job_{uuid.uuid4().hex}"
     
     # Store initial job status
-    jobs[job_id] = {"status": "processing", "result": None, "error": None}
+    jobs[job_id] = {"status": "processing", "result": None, "error": None, "progress_log": []}
     
     # Add background task
     background_tasks.add_task(process_issue, job_id, request.issue_url, request.prompt_type)

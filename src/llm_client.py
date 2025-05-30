@@ -73,14 +73,18 @@ class LLMClient:
                     "text": data["choices"][0]["message"]["content"],
                     "tokens_used": data.get("usage", {}).get("total_tokens")
                 }
-        except httpx.HTTPError as e:
-            print(f"HTTP error occurred: {str(e)}")
-            if hasattr(e, 'response') and e.response is not None:
-                print(f"Response content: {e.response.text}")
-            raise
+        except httpx.HTTPStatusError as e:
+            error_detail = f"HTTP Status Error: {e.response.status_code} - {e.response.text}"
+            print(error_detail)
+            raise ValueError(error_detail) from e
+        except httpx.RequestError as e:
+            error_detail = f"HTTP Request Error: An error occurred while requesting {e.request.url!r} - {str(e)}"
+            print(error_detail)
+            raise ValueError(error_detail) from e
         except Exception as e:
-            print(f"Error occurred: {str(e)}")
-            raise
+            error_detail = f"Unexpected error in OpenRouter response: {str(e)}"
+            print(error_detail)
+            raise ValueError(error_detail) from e
 
     async def process_prompt(self, prompt: str, prompt_type: str, context: Optional[Dict] = None, model: Optional[str] = None) -> PromptResponse:
         try:
@@ -125,4 +129,4 @@ class LLMClient:
             return PromptResponse(
                 status="error",
                 error=f"Failed to process prompt: {str(e)}"
-            ) 
+            )
