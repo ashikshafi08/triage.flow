@@ -53,7 +53,10 @@ export default function IssueForm({ onJobSubmit }) {
             <option value="explain">Explain Issue</option>
             <option value="fix">Suggest Fix</option>
             <option value="test">Generate Tests</option>
-            <option value="summarise">Summarise</option>
+            <option value="summarize">Summarize</option>
+            <option value="document">Generate Documentation</option>
+            <option value="review">Code Review</option>
+            <option value="prioritize">Prioritize Issue</option>
           </select>
         </div>
       </div>

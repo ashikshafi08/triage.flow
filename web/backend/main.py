@@ -23,7 +23,7 @@ class IssueRequest(BaseModel):
 @app.post("/process_issue")
 async def handle_issue(request: IssueRequest, background_tasks: BackgroundTasks):
     # Validate prompt type
-    valid_types = ["explain", "fix", "test", "summarize"]
+    valid_types = ["explain", "fix", "test", "summarize", "document", "review", "prioritize"]
     if request.prompt_type not in valid_types:
         raise HTTPException(
             status_code=400,

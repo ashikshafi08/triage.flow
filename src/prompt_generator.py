@@ -57,7 +57,49 @@ Please provide:
 1. A concise summary of the issue
 2. Key technical details
 3. Current status
-4. Next steps or recommendations"""
+4. Next steps or recommendations""",
+
+            "document": """Please generate documentation for the following GitHub issue:
+
+Title: {title}
+Description: {description}
+
+{context}
+
+Please provide:
+1. A clear problem statement
+2. Technical requirements and specifications
+3. Usage examples
+4. API reference (if applicable)
+5. Troubleshooting tips""",
+
+            "review": """Please review the code changes for the following GitHub issue:
+
+Title: {title}
+Description: {description}
+
+{context}
+
+Please provide:
+1. Code quality assessment
+2. Potential bugs or vulnerabilities
+3. Performance considerations
+4. Style and consistency feedback
+5. Suggestions for improvement""",
+
+            "prioritize": """Please prioritize the following GitHub issue:
+
+Title: {title}
+Description: {description}
+
+{context}
+
+Please provide:
+1. Severity assessment (critical, high, medium, low)
+2. Impact analysis
+3. Urgency level
+4. Resource estimation
+5. Recommended timeline"""
         }
 
     def _clean_markdown(self, text: str) -> str:
@@ -176,4 +218,4 @@ Please provide:
             return PromptResponse(
                 status="error",
                 error=f"Failed to generate prompt: {str(e)}"
-            ) 
+            )

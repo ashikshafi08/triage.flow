@@ -1,0 +1,398 @@
+:root {
+  --primary: #64b5f6;
+  --primary-dark: #42a5f5;
+  --secondary: #a7c0d9;
+  --success: #81c784;
+  --danger: #e57373;
+  --background: #121212;
+  --surface: #1e1e1e;
+  --on-background: #e0e0e0;
+  --on-surface: #f5f5f5;
+  --border: #424242;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+  line-height: 1.6;
+  color: var(--on-background);
+  background-color: var(--background);
+}
+
+.app-container {
+  max-width: 1200px; /* Increased max-width for a wider layout */
+  margin: 0 auto;
+  padding: 2rem;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+header {
+  text-align: center;
+  margin-bottom: 2rem;
+}
+
+header h1 {
+  font-size: 2.5rem;
+  color: var(--primary);
+  margin-bottom: 0.5rem;
+}
+
+header p {
+  font-size: 1.2rem;
+  color: var(--secondary);
+}
+
+.main-content {
+  display: flex;
+  flex: 1;
+  gap: 2rem; /* Space between left and right panels */
+  align-items: flex-start; /* Align items to the top */
+  max-width: 1000px; /* Limit overall content width */
+  margin: 0 auto; /* Center the main content area */
+}
+
+.main-content.one-panel .left-panel {
+  flex: 1; /* Take full width when only one panel is active */
+  /* max-width and margin auto are now on .main-content */
+}
+
+.main-content.two-panel .left-panel {
+  flex: 2; /* Takes 2/3 of the space when two panels are active */
+}
+
+.left-panel {
+  flex: 1; /* Default to taking available space */
+  min-width: 0; /* Allow content to shrink */
+}
+
+.right-panel {
+  flex: 1; /* Takes 1/3 of the space */
+  min-width: 300px; /* Minimum width for the panel */
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .main-content {
+    flex-direction: column;
+    gap: 1.5rem;
+    max-width: 100%; /* Allow full width on small screens */
+    padding: 0 1rem; /* Add some horizontal padding */
+  }
+
+  .main-content.one-panel .left-panel {
+    max-width: 100%;
+  }
+
+  .left-panel, .right-panel {
+    flex: none; /* Remove flex basis */
+    width: 100%; /* Take full width */
+    min-width: unset; /* Remove min-width constraint */
+  }
+}
+
+.issue-form {
+  background: var(--surface);
+  padding: 1.5rem;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+  margin-bottom: 2rem;
+  border: 1px solid var(--border);
+}
+
+.form-group {
+  margin-bottom: 1.5rem;
+}
+
+.form-group label {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-weight: 500;
+  color: var(--on-surface);
+}
+
+.form-input {
+  width: 100%;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 1rem;
+  background: #2d2d2d;
+  color: var(--on-surface);
+}
+
+.form-input:focus {
+  border-color: var(--primary);
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(100, 181, 246, 0.25);
+}
+
+.form-select {
+  width: 100%;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 1rem;
+  background: #2d2d2d;
+  color: var(--on-surface);
+}
+
+.form-select option {
+  background: var(--surface);
+  color: var(--on-surface);
+}
+
+.submit-btn {
+  background-color: var(--primary);
+  color: #121212;
+  border: none;
+  padding: 0.75rem 1.5rem;
+  font-size: 1rem;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.2s;
+  font-weight: 600;
+}
+
+.submit-btn:hover {
+  background-color: var(--primary-dark);
+}
+
+.submit-btn:disabled {
+  background-color: var(--secondary);
+  cursor: not-allowed;
+}
+
+.loading-panel {
+  background: var(--surface);
+  padding: 1.5rem;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+  border: 1px solid var(--border);
+  color: var(--on-surface);
+}
+
+.loading-panel h3 {
+  color: var(--primary);
+  margin-bottom: 1rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.progress-log {
+  max-height: 400px; /* Limit height for scroll */
+  overflow-y: auto;
+  margin-bottom: 1rem;
+}
+
+.log-entry {
+  font-size: 0.9rem;
+  margin-bottom: 0.5rem;
+  color: var(--secondary);
+}
+
+.log-entry .timestamp {
+  color: var(--primary);
+  font-weight: bold;
+  margin-right: 0.5rem;
+}
+
+.loading-message {
+  text-align: center;
+  font-style: italic;
+  color: var(--secondary);
+  margin-top: 1rem;
+}
+
+.error {
+  padding: 1rem;
+  background: rgba(229, 115, 115, 0.15);
+  color: var(--danger);
+  border-radius: 4px;
+  margin-bottom: 1rem;
+  border: 1px solid rgba(229, 115, 115, 0.3);
+}
+
+.error-message {
+  color: var(--danger);
+  margin-top: 1rem;
+}
+
+.results {
+  margin-top: 2rem;
+  background: var(--surface);
+  border-radius: 8px;
+  padding: 1.5rem;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+  border: 1px solid var(--border);
+}
+
+.results h2 {
+  margin-bottom: 1rem;
+  color: var(--primary);
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.result-content {
+  background: #2d2d2d;
+  border-radius: 8px;
+  overflow: hidden;
+  margin-top: 1rem;
+}
+
+footer {
+  text-align: center;
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  color: var(--secondary);
+}
+
+/* Markdown styling */
+.markdown-content {
+  padding: 1.5rem;
+  color: var(--on-surface);
+}
+
+.markdown-content h1, 
+.markdown-content h2, 
+.markdown-content h3, 
+.markdown-content h4, 
+.markdown-content h5, 
+.markdown-content h6 {
+  color: var(--primary);
+  margin-top: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.markdown-content p {
+  margin-bottom: 1rem;
+  line-height: 1.8;
+}
+
+.markdown-content pre {
+  background: #1e1e1e;
+  padding: 0.5rem 0; /* Adjust padding for line numbers */
+  border-radius: 4px;
+  overflow-x: auto;
+  margin: 1.5rem 0;
+}
+
+.markdown-content pre code {
+  display: block; /* Ensure code block takes full width */
+  padding: 1rem 1.5rem; /* Add padding inside the code block */
+  font-family: 'Fira Code', 'Consolas', monospace;
+  background: #1e1e1e; /* Ensure background is consistent */
+  border-radius: 0; /* Remove border-radius from inner code */
+}
+
+.markdown-content code {
+  font-family: 'Fira Code', 'Consolas', monospace;
+  background: rgba(100, 181, 246, 0.1);
+  padding: 0.2em 0.4em; /* Smaller padding for inline code */
+  border-radius: 3px;
+}
+
+.markdown-content ul, 
+.markdown-content ol {
+  margin-left: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.markdown-content li {
+  margin-bottom: 0.5rem;
+}
+
+/* Custom styled dropdown */
+.select-wrapper {
+  position: relative;
+  width: 100%;
+}
+
+.select-wrapper::after {
+  content: '▼';
+  position: absolute;
+  top: 50%;
+  right: 15px;
+  transform: translateY(-50%);
+  color: var(--secondary);
+  pointer-events: none;
+}
+
+.form-select {
+  width: 100%;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 1rem;
+  background: #2d2d2d;
+  color: var(--on-surface);
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  cursor: pointer;
+}
+
+.form-select:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(100, 181, 246, 0.25);
+}
+
+.form-select option {
+  background: var(--surface);
+  color: var(--on-surface);
+  padding: 0.5rem 1rem;
+}
+
+/* Hover effect for options */
+.form-select option:hover {
+  background: var(--primary);
+  color: #121212;
+}
+
+/* Accordion styles */
+.accordion {
+  margin-bottom: 1.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.accordion-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1rem 1.5rem;
+  background: #2d2d2d;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.accordion-header:hover {
+  background: #3a3a3a;
+}
+
+.accordion-header h3 {
+  margin: 0;
+  color: var(--primary);
+  font-size: 1.1rem;
+}
+
+.accordion-icon {
+  font-size: 0.9rem;
+  color: var(--secondary);
+}
+
+.accordion-content {
+  padding: 1.5rem;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+}
