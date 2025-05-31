@@ -176,17 +176,36 @@ Please provide:
                     discussion_text += f"- {user} ({created}): {body.strip()}\n"
 
             # Format the context
-            context = request.context.get("repo_context", {})
+            repo_context_data = request.context.get("repo_context", {})
             context_text = ""
-            if context:
-                context_text = "\nRepository Context:\n\n"
-                if context.get("sources"):
-                    context_text += "Relevant Files:\n"
-                    for source in context["sources"]:
-                        context_text += f"- {source['file']}\n"
+            if repo_context_data:
+                repo_info = repo_context_data.get("repo_info")
+                if repo_info:
+                    owner = repo_info.get('owner', 'N/A')
+                    repo_name = repo_info.get('repo', 'N/A')
+                    branch = repo_info.get('branch', 'N/A')
+                    url = repo_info.get('url', 'N/A')
+                    
+                    context_text += f"You are analyzing an issue from the repository: {owner}/{repo_name} (branch: {branch}, URL: {url}).\n"
+                    if repo_info.get("languages"):
+                        lang_list = ", ".join(repo_info["languages"].values())
+                        context_text += f"The primary languages in this repository appear to be: {lang_list}.\n"
+                    context_text += "Consider this repository information when forming your response.\n\n"
+
+                context_text += "Retrieved Context from Repository:\n"
+                if repo_context_data.get("sources"):
+                    context_text += "Relevant Files/Snippets:\n" # Changed heading
+                    for source in repo_context_data["sources"][:3]: # Limit to 3 sources to keep prompt concise
+                        context_text += f"  - File: {source.get('file', 'N/A')}"
+                        if source.get('language') and source.get('language') != 'unknown':
+                            context_text += f" (Language: {source.get('language')})"
+                        context_text += "\n"
+                        # Optionally include a snippet of content if desired, but can make prompts very long
+                        # content_snippet = source.get('content', '').strip()[:200] + "..." if source.get('content') else "N/A"
+                        # context_text += f"    Snippet: {content_snippet}\n"
                     context_text += "\n"
-                if context.get("response"):
-                    context_text += f"Repository Context:\n{context['response']}\n"
+                if repo_context_data.get("response"): # This is the summary from RAG
+                    context_text += f"Context Summary:\n{repo_context_data['response']}\n"
 
             # Compose the full prompt
             prompt = f"""
@@ -204,7 +223,7 @@ Please provide:
             # Format suggestions if present
             prompt = self._format_suggestions(prompt)
             # Add test references
-            prompt = self._add_test_references(prompt, context)
+            prompt = self._add_test_references(prompt, repo_context_data) # Changed context to repo_context_data
 
             # Debug print to verify inclusion of metadata
             print(f"[DEBUG] Labels: {issue.labels}, Assignees: {issue.assignees}, Comments: {len(issue.comments) if issue.comments else 0}")

@@ -11,17 +11,22 @@ class LLMClient:
         
         # Define system prompts for different types
         self.system_prompts = {
-            "explain": """You are an expert software engineer. Your task is to explain GitHub issues in a clear and technical manner.
-            Focus on understanding the problem, its root cause, and potential impact.""",
+            "explain": """You are an expert software engineer. Your task is to explain GitHub issues clearly, concisely, and technically.
+            Begin with a brief summary, then elaborate on the problem, its root cause, and potential impact.
+            When relevant, refer to the specific repository details provided in the context.""",
             
-            "fix": """You are an expert software engineer. Your task is to provide detailed solutions for GitHub issues.
-            Include code changes, necessary tests, and consider edge cases.""",
+            "fix": """You are an expert software engineer. Your task is to provide detailed yet concise solutions for GitHub issues.
+            Include essential code changes, necessary tests, and consider edge cases.
+            When relevant, refer to the specific repository details provided in the context.""",
             
-            "test": """You are an expert software engineer. Your task is to create comprehensive test cases for GitHub issues.
-            Focus on verifying the issue and validating potential fixes.""",
+            "test": """You are an expert software engineer. Your task is to create comprehensive and focused test cases for GitHub issues.
+            Focus on verifying the issue and validating potential fixes efficiently.
+            When relevant, refer to the specific repository details provided in the context.""",
             
-            "summarize": """You are an expert software engineer. Your task is to summarize GitHub issues concisely.
-            Focus on key points, current status, and next steps."""
+            "summarize": """You are an expert software engineer. Your task is to summarize GitHub issues concisely and accurately.
+            Focus on key points, current status, and actionable next steps.
+            When relevant, refer to the specific repository details provided in the context."""
+            # Add similar modifications for other prompt types if they exist (document, review, prioritize from prompt_generator.py)
         }
 
     def _get_model_config(self, model: str) -> Dict[str, Any]:

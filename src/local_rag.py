@@ -191,7 +191,8 @@ Code:
                         "content": node.text
                     }
                     for node in response.source_nodes
-                ]
+                ],
+                "repo_info": self.repo_info # Add repo_info here
             }
             
             return context
@@ -220,4 +221,4 @@ Code:
             return await self.get_relevant_context(query)
             
         except Exception as e:
-            raise Exception(f"Failed to get issue context: {str(e)}") 
+            raise Exception(f"Failed to get issue context: {str(e)}")

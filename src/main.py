@@ -18,12 +18,21 @@ app = FastAPI(
 )
 
 # Add CORS middleware
+# It's good practice to list specific origins in production.
+# For development, ["*"] is often used, but sometimes explicit origins work better.
+allowed_origins = [
+    "http://localhost:8080", # Your Vite frontend dev port from screenshot
+    "http://localhost:5173", # Common Vite default
+    "http://localhost:3000", # Common React dev port
+    # Add any other origins you might be using
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins, # Use the list here
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"], # Allows all standard methods
+    allow_headers=["*"], # Allows all headers
 )
 
 # Initialize clients and services
