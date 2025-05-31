@@ -42,4 +42,12 @@ class PromptResponse(BaseModel):
     response: Optional[str] = None
     error: Optional[str] = None
     model_used: Optional[str] = None
-    tokens_used: Optional[int] = None 
+    tokens_used: Optional[int] = None
+
+class ChatMessage(BaseModel):
+    role: str  # "system", "user", or "assistant"
+    content: str
+
+class SessionResponse(BaseModel):
+    session_id: str
+    initial_message: str
