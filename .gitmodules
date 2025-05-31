@@ -1,0 +1,3 @@
+[submodule "issue-flow-ai-prompt"]
+	path = issue-flow-ai-prompt
+	url = https://github.com/ashikshafi08/issue-flow-ai-prompt
