@@ -26,10 +26,10 @@ class LocalRepoContextExtractor:
         # Get all required extensions
         self.all_extensions = get_all_extensions()
     
-    def _process_file_content(self, content: str, metadata: Dict[str, Any]) -> str:
+    def _process_file_content(self, content: str, metadata: Dict[str, Any], file_path: str) -> str:
         """Process file content based on language-specific patterns."""
         if metadata["language"] == "unknown":
-            return content
+            return f"FILE_PATH: {file_path}\n{content}"
             
         # Extract documentation
         if metadata["doc_pattern"]:
@@ -45,7 +45,8 @@ class LocalRepoContextExtractor:
         else:
             imports = "No import pattern available"
         
-        return f"""
+        return f"""FILE_PATH: {file_path}
+
 Language: {metadata["display_name"]}
 Description: {metadata["description"]}
 
@@ -109,7 +110,7 @@ Code:
                     metadata = get_language_metadata(original_file_path)
                     
                     # Process content based on language
-                    processed_content = self._process_file_content(doc.text, metadata)
+                    processed_content = self._process_file_content(doc.text, metadata, relative_file_path)
                     
                     # Create a new document with processed content and corrected metadata
                     new_doc = Document(
@@ -150,9 +151,18 @@ Code:
                 self.index = VectorStoreIndex(nodes, storage_context=storage_context)
                 self.index.storage_context.persist()
                 self.query_engine = self.index.as_query_engine(
-                    similarity_top_k=10,
+                    similarity_top_k=30,  # Increased from 10 to get more file coverage
                     verbose=True
                 )
+                
+                # Verification: Check that key trainer files are indexed
+                trainer_files = ["ppo_trainer.py", "dpo_trainer.py", "sft_trainer.py"]
+                for trainer_file in trainer_files:
+                    any_trainer = any(
+                        trainer_file in nd.metadata.get("file_path", "")
+                        for nd in nodes
+                    )
+                    print(f"✅ {trainer_file} indexed: {any_trainer}")
                 
                 # Get unique languages with their display names
                 languages = {}
@@ -182,18 +192,26 @@ Code:
             # Get response from query engine
             response = self.query_engine.query(query)
 
-            # Extract relevant information with accurate file paths
-            context = {
-                "response": str(response),
-                "sources": [
-                    {
-                        "file": node.metadata.get("file_path", "unknown"),  # Use file_path which now has the correct relative path
+            # Extract relevant information with accurate file paths and deduplicate by file
+            files_seen = set()
+            deduped_sources = []
+            
+            for node in response.source_nodes:
+                file_path = node.metadata.get("file_path", "unknown")
+                
+                # Only add if we haven't seen this file before
+                if file_path not in files_seen:
+                    deduped_sources.append({
+                        "file": file_path,
                         "language": node.metadata.get("display_name", "unknown"),
                         "description": node.metadata.get("description", "No description available"),
                         "content": node.text[:1000] + "..." if len(node.text) > 1000 else node.text  # Limit content length
-                    }
-                    for node in response.source_nodes
-                ],
+                    })
+                    files_seen.add(file_path)
+            
+            context = {
+                "response": str(response),
+                "sources": deduped_sources,  # Use deduplicated sources
                 "repo_info": self.repo_info
             }
             
