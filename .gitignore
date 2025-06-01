@@ -186,4 +186,4 @@ Thumbs.db
 # Test coverage
 .coverage
 htmlcov/
-.pytest_cache/ 
+.pytest_cache/ node_modules/
