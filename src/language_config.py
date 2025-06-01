@@ -144,6 +144,27 @@ LANGUAGE_CONFIG: Dict[str, Dict[str, Any]] = {
         "import_pattern": r'^use\s+([\w:]+)',
         "display_name": "Perl",
         "description": "A general-purpose programming language originally developed for text manipulation."
+    },
+    "markdown": {
+        "extensions": [".md", ".markdown"],
+        "doc_pattern": None, # Markdown doesn't have specific "doc patterns" like code
+        "import_pattern": None, # No imports in markdown
+        "display_name": "Markdown",
+        "description": "A lightweight markup language for creating formatted text using a plain-text editor."
+    },
+    "html": {
+        "extensions": [".html", ".htm"],
+        "doc_pattern": r'<!--.*?-->', # HTML comments
+        "import_pattern": r'<script\s+src=["\']([^"\']+)["\']|<link\s+href=["\']([^"\']+)["\']', # Basic script/link imports
+        "display_name": "HTML",
+        "description": "The standard markup language for documents designed to be displayed in a web browser."
+    },
+    "css": {
+        "extensions": [".css"],
+        "doc_pattern": r'/\*.*?\*/', # CSS comments
+        "import_pattern": r'@import\s+url\([\'"]?([^\'"\)]+)[\'"]?\)', # CSS imports
+        "display_name": "CSS",
+        "description": "A style sheet language used for describing the presentation of a document written in HTML."
     }
 }
 
@@ -172,4 +193,4 @@ def get_language_metadata(file_path: str) -> Dict[str, Any]:
         "description": "Unknown programming language",
         "doc_pattern": None,
         "import_pattern": None
-    } 
+    }
