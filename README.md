@@ -52,7 +52,7 @@
 
 ```mermaid
 graph TD
-    A[GitHub Issue URL] --> B{Create Session};
+    A[GitHub Issue URL] --> B[Create Session];
     B --> C[Extract Issue & Comments];
     B --> D[Clone Repo Locally];
     D --> E[Analyze Code & Docs (Multi-Language)];
@@ -60,7 +60,7 @@ graph TD
     F --> G[Retrieve Relevant Context];
     C & G --> H[Generate Initial LLM Prompt];
     H --> I[LLM Response (Initial)];
-    I --> J{Interactive Chat Session};
+    I --> J[Interactive Chat Session];
     J --> K[User Query];
     K --> G;
     G --> H;
