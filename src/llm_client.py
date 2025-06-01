@@ -5,6 +5,50 @@ from llama_index.core.prompts import PromptTemplate
 from .config import settings
 from .models import PromptResponse
 
+def format_rag_context_for_llm(rag_data: Optional[Dict[str, Any]]) -> str:
+    """Formats the RAG context dictionary into a string for the LLM prompt."""
+    if not rag_data:
+        return "No specific RAG context available for this query."
+
+    context_parts = []
+    repo_info = rag_data.get("repo_info")
+    if repo_info:
+        owner = repo_info.get('owner', 'N/A')
+        repo_name = repo_info.get('repo', 'N/A')
+        branch = repo_info.get('branch', 'N/A')
+        url = repo_info.get('url', 'N/A')
+        
+        repo_info_str = f"Information about the repository under discussion:\n"
+        repo_info_str += f"- Name: {owner}/{repo_name}\n"
+        repo_info_str += f"- Branch: {branch}\n"
+        repo_info_str += f"- URL: {url}\n"
+        if repo_info.get("languages"):
+            lang_list = ", ".join(repo_info["languages"].values())
+            repo_info_str += f"- Languages: {lang_list}\n"
+        context_parts.append(repo_info_str)
+
+    rag_summary = rag_data.get("response")
+    if rag_summary:
+        context_parts.append(f"Context Summary from RAG based on your query:\n{rag_summary}")
+
+    sources = rag_data.get("sources")
+    if sources:
+        sources_str = "Relevant Files/Snippets from RAG:\n"
+        for source in sources[:3]:  # Limit to top 3 for conciseness in chat
+            sources_str += f"  - File: {source.get('file', 'N/A')}"
+            if source.get('language') and source.get('language') != 'unknown':
+                sources_str += f" (Language: {source.get('language')})"
+            # Optionally add content snippet here if desired, e.g.:
+            # content_snippet = source.get('content', '').strip()[:100] + "..."
+            # sources_str += f"\n    Snippet: {content_snippet}\n"
+            sources_str += "\n"
+        context_parts.append(sources_str)
+    
+    if not context_parts:
+        return "No specific RAG context was retrieved for this query."
+        
+    return "\n\n".join(context_parts)
+
 class LLMClient:
     def __init__(self):
         self.default_model = settings.default_model
@@ -42,19 +86,28 @@ class LLMClient:
             model=model or self.default_model
         )
 
-    async def _get_openrouter_response(self, prompt: str, model: str, system_prompt: str) -> Dict[str, Any]:
-        """Get response from OpenRouter API."""
+    async def _get_openrouter_response(self, prompt: str, model: str, system_prompt: str, dynamic_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Get response from OpenRouter API, now with dynamic_context."""
         if not settings.openrouter_api_key:
             raise ValueError("OpenRouter API key is required")
 
         headers = {
             "Authorization": f"Bearer {settings.openrouter_api_key}",
-            "HTTP-Referer": "https://github.com/your-repo",  # Replace with your actual repo
-            "X-Title": "GH Issue Prompt"  # Your app name
+            "HTTP-Referer": "https://github.com/your-repo",  # Consider making this dynamic if needed
+            "X-Title": "GH Issue Prompt"
         }
 
         model_config = self._get_model_config(model)
         
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        if dynamic_context:
+            formatted_dynamic_context_str = format_rag_context_for_llm(dynamic_context)
+            # Add formatted RAG context as a system message before the user's prompt history
+            messages.append({"role": "system", "name": "retrieved_context", "content": formatted_dynamic_context_str})
+            
+        messages.append({"role": "user", "content": prompt}) # prompt is the conversation history
+
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
@@ -62,10 +115,7 @@ class LLMClient:
                     headers=headers,
                     json={
                         "model": model,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": prompt}
-                        ],
+                        "messages": messages,
                         "max_tokens": model_config["max_tokens"],
                         "temperature": model_config["temperature"]
                     }
@@ -91,23 +141,31 @@ class LLMClient:
             print(error_detail)
             raise ValueError(error_detail) from e
 
-    async def process_prompt(self, prompt: str, prompt_type: str, context: Optional[Dict] = None, model: Optional[str] = None) -> PromptResponse:
+    async def process_prompt(self, prompt: str, prompt_type: str, context: Optional[Dict[str, Any]] = None, model: Optional[str] = None) -> PromptResponse:
         try:
             model = model or self.default_model
-            system_prompt = self.system_prompts.get(prompt_type, "")
+            system_prompt = self.system_prompts.get(prompt_type, "") # Base system prompt
+            
+            # The 'context' parameter is our fresh_rag_context from main.py
             
             if settings.llm_provider == "openai":
-                # Create a prompt template with system message
+                # Format RAG context for OpenAI
+                formatted_dynamic_context_str = ""
+                if context:
+                    formatted_dynamic_context_str = format_rag_context_for_llm(context)
+                
+                # Prepend RAG context to the main prompt (conversation history)
+                # The system_prompt from self.system_prompts is handled by PromptTemplate's system_prompt arg
+                final_prompt_for_template = f"Relevant Context:\n{formatted_dynamic_context_str}\n\nConversation History:\n{prompt}"
+
                 template = PromptTemplate(
-                    template=prompt,
-                    system_prompt=system_prompt
+                    template=final_prompt_for_template, # Now includes RAG context + conversation
+                    system_prompt=system_prompt 
                 )
                 
-                # Get LLM instance with specified model
                 llm = self._get_openai_llm(model)
+                response = await llm.acomplete(template.format()) # .format() is for template variables if any
                 
-                # Get response from LLM
-                response = await llm.acomplete(template.format())
                 return PromptResponse(
                     status="success",
                     prompt=response.text,
@@ -115,7 +173,8 @@ class LLMClient:
                 )
                 
             elif settings.llm_provider == "openrouter":
-                response_data = await self._get_openrouter_response(prompt, model, system_prompt)
+                # Pass the raw context dictionary to _get_openrouter_response, it will format it
+                response_data = await self._get_openrouter_response(prompt, model, system_prompt, dynamic_context=context)
                 return PromptResponse(
                     status="success",
                     prompt=response_data["text"],

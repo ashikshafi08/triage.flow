@@ -4,13 +4,13 @@ from typing import Dict, Any, Optional
 from .local_rag import LocalRepoContextExtractor
 from .prompt_generator import PromptGenerator
 from .github_client import GitHubIssueClient
-from .models import IssueResponse
+from .models import IssueResponse, LLMConfig # Added LLMConfig
 
 class SessionManager:
     def __init__(self):
         self.sessions: Dict[str, Dict] = {}
         
-    def create_session(self, issue_url: str, prompt_type: str) -> str:
+    def create_session(self, issue_url: str, prompt_type: str, llm_config: LLMConfig) -> str: # Added llm_config parameter
         """Create a new session with initial context"""
         session_id = str(uuid.uuid4())
         
@@ -20,9 +20,11 @@ class SessionManager:
             "last_accessed": datetime.now(),
             "issue_url": issue_url,
             "prompt_type": prompt_type,
+            "llm_config": llm_config.model_dump(), # Store llm_config as dict
             "conversation_history": [],
             "repo_context": None,
-            "issue_data": None
+            "issue_data": None,
+            "rag_instance": None # Added rag_instance
         }
         return session_id
 
@@ -66,7 +68,8 @@ class SessionManager:
                 )
                 self.update_session(session_id, {
                     "repo_context": context,
-                    "issue_data": issue_data.data
+                    "issue_data": issue_data.data,
+                    "rag_instance": rag # Store the RAG instance
                 })
         except Exception as e:
             print(f"Error initializing session context: {e}")

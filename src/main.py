@@ -5,6 +5,7 @@ from .github_client import GitHubIssueClient
 from .llm_client import LLMClient
 from .prompt_generator import PromptGenerator
 from .session_manager import SessionManager
+from .config import settings
 import nest_asyncio
 import asyncio
 
@@ -59,7 +60,11 @@ async def root():
 async def create_session(request: PromptRequest):
     try:
         # Create new session
-        session_id = session_manager.create_session(request.issue_url, request.prompt_type)
+        session_id = session_manager.create_session(
+            request.issue_url, 
+            request.prompt_type,
+            request.llm_config # Pass llm_config to session manager
+        )
         
         # Initialize session context in background
         await session_manager.initialize_session_context(session_id)
@@ -108,19 +113,39 @@ async def handle_chat_message(session_id: str, message: ChatMessage):
         session_manager.add_message(session_id, "user", message.content)
         
         # Generate response using conversation history
-        context = session.get("repo_context", {})
         history = session.get("conversation_history", [])
+        user_query = message.content
         
+        rag_instance = session.get("rag_instance")
+        fresh_rag_context = {}
+
+        if rag_instance:
+            try:
+                fresh_rag_context = await rag_instance.get_relevant_context(user_query)
+            except Exception as e:
+                print(f"Error getting fresh RAG context: {e}")
+                # Fallback to initial context or empty if preferred
+                fresh_rag_context = session.get("repo_context", {}) 
+        else:
+            # Fallback if no RAG instance (should ideally not happen after session init)
+            fresh_rag_context = session.get("repo_context", {})
+
         # Build prompt from conversation history
-        conversation = "\n".join(
+        conversation_history_for_prompt = "\n".join(
             [f"{msg['role'].upper()}: {msg['content']}" 
-             for msg in history[-6:]]  # Last 3 exchanges
+             for msg in history[-6:]]  # Last 3 exchanges (user, assistant, user, assistant...)
         )
+        # The user's current query is already part of the history as it was just added.
+        # The 'conversation_history_for_prompt' will be passed as the main 'prompt' to the LLM.
         
+        session_llm_config = session.get("llm_config", {})
+        model_name = session_llm_config.get("name", settings.default_model)
+
         llm_response = await llm_client.process_prompt(
-            conversation,
-            prompt_type=session["prompt_type"],
-            context=context
+            prompt=conversation_history_for_prompt, # This is the main user input/history
+            prompt_type=session["prompt_type"],   # Could be made dynamic or a new "chat" type
+            context=fresh_rag_context,            # This is the dynamically fetched RAG context
+            model=model_name
         )
         
         # Add assistant response
