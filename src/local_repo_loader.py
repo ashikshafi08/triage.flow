@@ -42,6 +42,31 @@ def clone_repo_to_temp(repo_url: str, branch: str = "main"):
         # Clean up the temp directory
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+# Persistent version for session-based repo storage
+def clone_repo_to_temp_persistent(repo_url: str, branch: str = "main") -> str:
+    temp_dir = tempfile.mkdtemp()
+    try:
+        subprocess.run([
+            "git", "clone",
+            "--depth", "1",
+            "--branch", branch,
+            repo_url,
+            temp_dir
+        ], check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        # Try master if main fails
+        if branch == "main":
+            subprocess.run([
+                "git", "clone",
+                "--depth", "1",
+                "--branch", "master",
+                repo_url,
+                temp_dir
+            ], check=True, capture_output=True, text=True)
+        else:
+            raise
+    return temp_dir
+
 def get_repo_info(repo_url: str) -> Tuple[str, str]:
     """Extract owner and repository name from a GitHub URL."""
     # Remove .git if present

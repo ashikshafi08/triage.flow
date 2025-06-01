@@ -47,3 +47,15 @@ async def get_job_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+# @app.get("/api/files")
+# async def list_files():
+#     file_list = []
+#     for root, dirs, files in os.walk("."):
+#         # Skip hidden files and directories
+#         dirs[:] = [d for d in dirs if not d.startswith('.')]
+#         for f in files:
+#             if not f.startswith('.'):
+#                 rel_path = os.path.relpath(os.path.join(root, f), ".")
+#                 file_list.append({"path": rel_path})
+#     return file_list

@@ -5,6 +5,8 @@ from .local_rag import LocalRepoContextExtractor
 from .prompt_generator import PromptGenerator
 from .github_client import GitHubIssueClient
 from .models import IssueResponse, LLMConfig # Added LLMConfig
+import shutil
+import os
 
 class SessionManager:
     def __init__(self):
@@ -66,10 +68,12 @@ class SessionManager:
                     issue_data.data.title,
                     issue_data.data.body
                 )
+                repo_path = rag.repo_info.get("repo_path")
                 self.update_session(session_id, {
                     "repo_context": context,
                     "issue_data": issue_data.data,
-                    "rag_instance": rag # Store the RAG instance
+                    "rag_instance": rag, # Store the RAG instance
+                    "repo_path": repo_path # Store the repo path for file listing
                 })
         except Exception as e:
             print(f"Error initializing session context: {e}")
@@ -85,9 +89,13 @@ class SessionManager:
             })
             
     def cleanup_sessions(self, max_age_minutes: int = 60):
-        """Remove inactive sessions"""
+        """Remove inactive sessions and delete their temp repo dirs"""
         now = datetime.now()
         expired = [sid for sid, session in self.sessions.items() 
                   if (now - session["last_accessed"]) > timedelta(minutes=max_age_minutes)]
         for sid in expired:
+            session = self.sessions[sid]
+            repo_path = session.get("repo_path")
+            if repo_path and os.path.exists(repo_path):
+                shutil.rmtree(repo_path, ignore_errors=True)
             del self.sessions[sid]

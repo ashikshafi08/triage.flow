@@ -62,6 +62,14 @@ def format_rag_context_for_llm(rag_data: Optional[Dict[str, Any]]) -> str:
         
         context_parts.append(sources_str)
     
+    # Add user-selected files (from @) as a special section
+    user_files = rag_data.get("user_selected_files")
+    if user_files:
+        user_files_str = "\nUSER-SELECTED FILES (via @):\n" + "="*50 + "\n"
+        for file in user_files:
+            user_files_str += f"\nFILE: {file['file']}\nCONTENT:\n{file['content'][:1000]}...\n" + "-"*30 + "\n"
+        context_parts.append(user_files_str)
+    
     if not context_parts:
         return "No specific RAG context was retrieved for this query."
         

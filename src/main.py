@@ -10,6 +10,9 @@ from .conversation_memory import ConversationContextManager
 from .config import settings
 import nest_asyncio
 import asyncio
+import os
+from typing import Optional
+import re
 
 # Enable nested event loops for Jupyter notebooks
 nest_asyncio.apply()
@@ -111,15 +114,12 @@ async def handle_chat_message(session_id: str, message: ChatMessage, stream: boo
         session = session_manager.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
-            
         session_manager.add_message(session_id, "user", message.content)
-        
         history = session.get("conversation_history", [])
         user_query = message.content
-        
         rag_instance = session.get("rag_instance")
         fresh_rag_context = {}
-
+        # Always get default RAG context (whole codebase)
         if rag_instance:
             try:
                 fresh_rag_context = await rag_instance.get_relevant_context(user_query)
@@ -128,7 +128,20 @@ async def handle_chat_message(session_id: str, message: ChatMessage, stream: boo
                 fresh_rag_context = session.get("repo_context", {})
         else:
             fresh_rag_context = session.get("repo_context", {})
-
+        # Extract @file_path mentions from message.content
+        user_file_contexts = []
+        repo_path = session.get("repo_path")
+        file_mentions = re.findall(r"@([\w\-/\\.]+)", message.content)
+        for rel_path in file_mentions:
+            abs_path = os.path.join(repo_path, rel_path)
+            if os.path.exists(abs_path):
+                with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                user_file_contexts.append({
+                    "file": rel_path,
+                    "content": content[:5000]  # Limit to 5k chars per file
+                })
+        fresh_rag_context["user_selected_files"] = user_file_contexts
         # Use production-grade conversation memory instead of simple sliding window
         conversation_context, memory_stats = await conversation_memory.get_conversation_context(
             history, llm_client, use_compression=True
@@ -208,6 +221,21 @@ async def get_memory_statistics(session_id: str):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/files")
+async def list_files(session_id: str = Query(...)):
+    session = session_manager.get_session(session_id)
+    if not session or "repo_path" not in session:
+        raise HTTPException(status_code=404, detail="No repo loaded for this session")
+    repo_path = session["repo_path"]
+    file_list = []
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for f in files:
+            if not f.startswith('.'):
+                rel_path = os.path.relpath(os.path.join(root, f), repo_path)
+                file_list.append({"path": rel_path})
+    return file_list
 
 if __name__ == "__main__":
     import uvicorn
