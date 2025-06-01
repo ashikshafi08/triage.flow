@@ -22,8 +22,8 @@ setup(
         "python-multipart",
         "python-dotenv",
         "pydantic",
-        
-        
+        "llama-index-retrievers-bm25",
+        "llama-index-postprocessor-cohere-rerank",
         
     ],
 ) 

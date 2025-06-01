@@ -6,10 +6,19 @@ from llama_index.core.node_parser import SimpleNodeParser
 from llama_index.vector_stores.faiss import FaissVectorStore
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core.schema import Document
+from llama_index.retrievers.bm25 import BM25Retriever
+from llama_index.core.postprocessor import LLMRerank
 from .config import settings
 from .local_repo_loader import clone_repo_to_temp
 from .language_config import LANGUAGE_CONFIG, get_all_extensions, get_language_metadata
+from .llm_client import LLMClient
 import re
+import Stemmer
+from llama_index.core.query_engine import RetrieverQueryEngine
+from llama_index.core.tools import RetrieverTool
+from llama_index.core.schema import IndexNode
+from llama_index.core import SummaryIndex
+from llama_index.core.retrievers import RecursiveRetriever
 
 class LocalRepoContextExtractor:
     """Extract context from a locally cloned repository with enhanced multi-language support"""
@@ -25,6 +34,9 @@ class LocalRepoContextExtractor:
         
         # Get all required extensions
         self.all_extensions = get_all_extensions()
+        
+        # Initialize LLM client
+        self.llm_client = LLMClient()
     
     def _process_file_content(self, content: str, metadata: Dict[str, Any], file_path: str) -> str:
         """Process file content based on language-specific patterns."""
@@ -150,9 +162,49 @@ Code:
                 # Create vector index with FAISS
                 self.index = VectorStoreIndex(nodes, storage_context=storage_context)
                 self.index.storage_context.persist()
-                self.query_engine = self.index.as_query_engine(
-                    similarity_top_k=30,  # Increased from 10 to get more file coverage
-                    verbose=True
+
+                # Create BM25 retriever with proper configuration
+                bm25_retriever = BM25Retriever.from_defaults(
+                    nodes=nodes,
+                    similarity_top_k=50,
+                    stemmer=Stemmer.Stemmer("english"),
+                    language="english",
+                    tokenizer=lambda t: re.split(r'[^A-Za-z0-9]', t.lower())
+                )
+
+                # Create dense retriever
+                dense_retriever = self.index.as_retriever(similarity_top_k=40)
+
+                # Create IndexNodes for each retriever
+                bm25_node = IndexNode(text="BM25 keyword retriever", index_id="bm25")
+                dense_node = IndexNode(text="Dense vector retriever", index_id="dense")
+
+                # Create a SummaryIndex with both nodes
+                summary_index = SummaryIndex([bm25_node, dense_node])
+
+                # Create a retriever dict
+                retriever_dict = {
+                    "bm25": bm25_retriever,
+                    "dense": dense_retriever,
+                    "root": summary_index.as_retriever()
+                }
+
+                # Create RecursiveRetriever to ensemble both
+                hybrid_retriever = RecursiveRetriever(
+                    root_id="root",
+                    retriever_dict=retriever_dict
+                )
+
+                # Add reranker for better results
+                reranker = LLMRerank(
+                    top_n=10,
+                    llm=self.llm_client._get_openai_llm()  # Use LLM from llm_client
+                )
+                
+                # Create query engine with hybrid retriever and reranker
+                self.query_engine = RetrieverQueryEngine(
+                    retriever=hybrid_retriever,
+                    node_postprocessors=[reranker]
                 )
                 
                 # Verification: Check that key trainer files are indexed
