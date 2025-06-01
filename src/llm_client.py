@@ -19,7 +19,7 @@ def format_rag_context_for_llm(rag_data: Optional[Dict[str, Any]]) -> str:
         branch = repo_info.get('branch', 'N/A')
         url = repo_info.get('url', 'N/A')
         
-        repo_info_str = f"Information about the repository under discussion:\n"
+        repo_info_str = f"Repository Information:\n"
         repo_info_str += f"- Name: {owner}/{repo_name}\n"
         repo_info_str += f"- Branch: {branch}\n"
         repo_info_str += f"- URL: {url}\n"
@@ -30,19 +30,36 @@ def format_rag_context_for_llm(rag_data: Optional[Dict[str, Any]]) -> str:
 
     rag_summary = rag_data.get("response")
     if rag_summary:
-        context_parts.append(f"Context Summary from RAG based on your query:\n{rag_summary}")
+        context_parts.append(f"Retrieved Context Summary:\n{rag_summary}")
 
     sources = rag_data.get("sources")
     if sources:
-        sources_str = "Relevant Files/Snippets from RAG:\n"
-        for source in sources[:3]:  # Limit to top 3 for conciseness in chat
-            sources_str += f"  - File: {source.get('file', 'N/A')}"
-            if source.get('language') and source.get('language') != 'unknown':
-                sources_str += f" (Language: {source.get('language')})"
-            # Optionally add content snippet here if desired, e.g.:
-            # content_snippet = source.get('content', '').strip()[:100] + "..."
-            # sources_str += f"\n    Snippet: {content_snippet}\n"
-            sources_str += "\n"
+        sources_str = "EXACT FILE PATHS AND CONTENT FROM REPOSITORY:\n"
+        sources_str += "=" * 50 + "\n"
+        
+        for i, source in enumerate(sources[:5], 1):  # Limit to top 5 for better focus
+            file_path = source.get('file', 'UNKNOWN_FILE')
+            language = source.get('language', 'unknown')
+            
+            sources_str += f"\n{i}. FILE: {file_path}\n"
+            if language and language != 'unknown':
+                sources_str += f"   Language: {language}\n"
+            sources_str += f"   Content Preview:\n"
+            
+            # Add a preview of the content
+            content = source.get('content', '')
+            if content:
+                # Show first 300 characters to give context without overwhelming
+                preview = content[:300].strip()
+                if len(content) > 300:
+                    preview += "..."
+                sources_str += f"   {preview}\n"
+            
+            sources_str += "-" * 30 + "\n"
+        
+        sources_str += f"\nIMPORTANT: These are the ONLY file paths that exist in the retrieved context.\n"
+        sources_str += "DO NOT reference any other file paths not listed above.\n"
+        
         context_parts.append(sources_str)
     
     if not context_parts:
@@ -58,19 +75,31 @@ class LLMClient:
         self.system_prompts = {
             "explain": """You are an expert software engineer. Your task is to explain GitHub issues clearly, concisely, and technically.
             Begin with a brief summary, then elaborate on the problem, its root cause, and potential impact.
-            When relevant, refer to the specific repository details provided in the context.""",
+            When relevant, refer to the specific repository details provided in the context.
+            
+            CRITICAL: When referencing files, use ONLY the exact file paths provided in the retrieved context. 
+            Never invent, guess, or assume file paths. If a file path is not explicitly provided in the context, say so clearly.""",
             
             "fix": """You are an expert software engineer. Your task is to provide detailed yet concise solutions for GitHub issues.
             Include essential code changes, necessary tests, and consider edge cases.
-            When relevant, refer to the specific repository details provided in the context.""",
+            When relevant, refer to the specific repository details provided in the context.
+            
+            CRITICAL: When referencing files, use ONLY the exact file paths provided in the retrieved context. 
+            Never invent, guess, or assume file paths. If a file path is not explicitly provided in the context, say so clearly.""",
             
             "test": """You are an expert software engineer. Your task is to create comprehensive and focused test cases for GitHub issues.
             Focus on verifying the issue and validating potential fixes efficiently.
-            When relevant, refer to the specific repository details provided in the context.""",
+            When relevant, refer to the specific repository details provided in the context.
+            
+            CRITICAL: When referencing files, use ONLY the exact file paths provided in the retrieved context. 
+            Never invent, guess, or assume file paths. If a file path is not explicitly provided in the context, say so clearly.""",
             
             "summarize": """You are an expert software engineer. Your task is to summarize GitHub issues concisely and accurately.
             Focus on key points, current status, and actionable next steps.
-            When relevant, refer to the specific repository details provided in the context."""
+            When relevant, refer to the specific repository details provided in the context.
+            
+            CRITICAL: When referencing files, use ONLY the exact file paths provided in the retrieved context. 
+            Never invent, guess, or assume file paths. If a file path is not explicitly provided in the context, say so clearly."""
             # Add similar modifications for other prompt types if they exist (document, review, prioritize from prompt_generator.py)
         }
 

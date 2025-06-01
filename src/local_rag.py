@@ -74,12 +74,14 @@ Code:
             with clone_repo_to_temp(repo_url, branch) as repo_path:
                 print(f"Cloned repository to: {repo_path}")
                 
+                # Store the repo_path for later use in relative path calculation
+                self.current_repo_path = repo_path
+                
                 # Load documents from the local repo
                 documents = SimpleDirectoryReader(
                     repo_path,
                     exclude_hidden=True,
                     recursive=True,
-                    filename_as_id=True,
                     required_exts=self.all_extensions,
                     exclude=["*.png", "*.jpg", "*.jpeg", "*.gif", "*.svg", "*.ico", "*.json", "*.ipynb"]
                 ).load_data()
@@ -91,20 +93,32 @@ Code:
                 owner = url_parts[-2]
                 repo = url_parts[-1]
                 
-                # Process each document with language-specific metadata
+                # Process each document with language-specific metadata and ensure proper file paths
                 processed_documents = []
                 for doc in documents:
+                    # Get the original FULL file path (not just filename)
+                    original_file_path = doc.metadata.get("file_path", "") or doc.metadata.get("source", "")
+                    
+                    # Make the file path relative to the repository root
+                    if original_file_path.startswith(repo_path):
+                        relative_file_path = os.path.relpath(original_file_path, repo_path)
+                    else:
+                        relative_file_path = original_file_path
+                    
                     # Get language metadata
-                    metadata = get_language_metadata(doc.metadata.get("file_name", ""))
+                    metadata = get_language_metadata(original_file_path)
                     
                     # Process content based on language
                     processed_content = self._process_file_content(doc.text, metadata)
                     
-                    # Create a new document with processed content and metadata
+                    # Create a new document with processed content and corrected metadata
                     new_doc = Document(
                         text=processed_content,
                         metadata={
                             **doc.metadata,
+                            "file_path": relative_file_path,  # Store the correct relative path
+                            "file_name": os.path.basename(original_file_path),  # Keep just the filename
+                            "original_file_path": original_file_path,  # Keep original for debugging
                             "owner": owner,
                             "repo": repo,
                             "branch": branch,
@@ -152,7 +166,8 @@ Code:
                     "repo": repo,
                     "branch": branch,
                     "url": repo_url,
-                    "languages": languages
+                    "languages": languages,
+                    "repo_path": repo_path  # Store the repo path for reference
                 }
         
         except Exception as e:
@@ -167,32 +182,19 @@ Code:
             # Get response from query engine
             response = self.query_engine.query(query)
 
-            # Determine the repo root (temp directory)
-            repo_root = None
-            if self.index and hasattr(self.index, 'storage_context') and hasattr(self.index.storage_context, 'persist_dir'):
-                repo_root = self.index.storage_context.persist_dir
-            elif self.repo_info and 'url' in self.repo_info:
-                # Fallback: try to extract from repo_info if available
-                repo_root = self.repo_info.get('repo_root')
-
-            def relpath(path):
-                if repo_root and path.startswith(repo_root):
-                    return os.path.relpath(path, repo_root)
-                return path
-
-            # Extract relevant information with language context and repo-relative file paths
+            # Extract relevant information with accurate file paths
             context = {
                 "response": str(response),
                 "sources": [
                     {
-                        "file": relpath(node.metadata.get("file_name", "unknown")),
+                        "file": node.metadata.get("file_path", "unknown"),  # Use file_path which now has the correct relative path
                         "language": node.metadata.get("display_name", "unknown"),
                         "description": node.metadata.get("description", "No description available"),
-                        "content": node.text
+                        "content": node.text[:1000] + "..." if len(node.text) > 1000 else node.text  # Limit content length
                     }
                     for node in response.source_nodes
                 ],
-                "repo_info": self.repo_info # Add repo_info here
+                "repo_info": self.repo_info
             }
             
             return context

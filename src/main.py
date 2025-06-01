@@ -6,6 +6,7 @@ from .github_client import GitHubIssueClient
 from .llm_client import LLMClient
 from .prompt_generator import PromptGenerator
 from .session_manager import SessionManager
+from .conversation_memory import ConversationContextManager
 from .config import settings
 import nest_asyncio
 import asyncio
@@ -42,6 +43,7 @@ github_client = GitHubIssueClient()
 llm_client = LLMClient()
 prompt_generator = PromptGenerator()
 session_manager = SessionManager()
+conversation_memory = ConversationContextManager(max_context_tokens=8000)
 
 # Background task to clean up old sessions
 async def cleanup_sessions_periodically():
@@ -127,9 +129,22 @@ async def handle_chat_message(session_id: str, message: ChatMessage, stream: boo
         else:
             fresh_rag_context = session.get("repo_context", {})
 
-        conversation_history_for_prompt = "\n".join(
-            [f"{msg['role'].upper()}: {msg['content']}" for msg in history[-6:]]
+        # Use production-grade conversation memory instead of simple sliding window
+        conversation_context, memory_stats = await conversation_memory.get_conversation_context(
+            history, llm_client, use_compression=True
         )
+        
+        # Log memory statistics for debugging
+        print(f"Memory stats for session {session_id}: {memory_stats}")
+        
+        # Debug: Log the actual file paths being retrieved from RAG
+        if fresh_rag_context and fresh_rag_context.get("sources"):
+            print(f"RAG retrieved {len(fresh_rag_context['sources'])} sources:")
+            for i, source in enumerate(fresh_rag_context['sources'][:5], 1):
+                file_path = source.get('file', 'UNKNOWN')
+                print(f"  {i}. {file_path}")
+        else:
+            print("No RAG sources retrieved for this query")
         
         session_llm_config = session.get("llm_config", {})
         model_name = session_llm_config.get("name", settings.default_model)
@@ -139,7 +154,7 @@ async def handle_chat_message(session_id: str, message: ChatMessage, stream: boo
             async def generate_stream():
                 nonlocal full_response_content
                 async for chunk in llm_client.stream_openrouter_response(
-                    prompt=conversation_history_for_prompt,
+                    prompt=conversation_context,  # Use smart context instead of simple history
                     prompt_type=session["prompt_type"],
                     context=fresh_rag_context,
                     model=model_name
@@ -151,7 +166,7 @@ async def handle_chat_message(session_id: str, message: ChatMessage, stream: boo
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
         else:
             llm_response = await llm_client.process_prompt(
-                prompt=conversation_history_for_prompt,
+                prompt=conversation_context,  # Use smart context instead of simple history
                 prompt_type=session["prompt_type"],
                 context=fresh_rag_context,
                 model=model_name
@@ -161,6 +176,35 @@ async def handle_chat_message(session_id: str, message: ChatMessage, stream: boo
                 role="assistant",
                 content=llm_response.prompt
             )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/sessions/{session_id}/memory-stats")
+async def get_memory_statistics(session_id: str):
+    """Get conversation memory statistics for debugging and monitoring"""
+    try:
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        history = session.get("conversation_history", [])
+        
+        # Get memory statistics
+        _, memory_stats = await conversation_memory.get_conversation_context(
+            history, llm_client, use_compression=False  # Don't compress for stats
+        )
+        
+        return {
+            "session_id": session_id,
+            "memory_statistics": memory_stats,
+            "session_info": {
+                "created_at": session["created_at"].isoformat(),
+                "last_accessed": session["last_accessed"].isoformat(),
+                "prompt_type": session["prompt_type"],
+                "model_name": session.get("llm_config", {}).get("name", "unknown")
+            }
+        }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
