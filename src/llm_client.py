@@ -1,9 +1,10 @@
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, AsyncGenerator
 import httpx
 from llama_index.llms.openai import OpenAI
 from llama_index.core.prompts import PromptTemplate
 from .config import settings
 from .models import PromptResponse
+import json
 
 def format_rag_context_for_llm(rag_data: Optional[Dict[str, Any]]) -> str:
     """Formats the RAG context dictionary into a string for the LLM prompt."""
@@ -194,3 +195,78 @@ class LLMClient:
                 status="error",
                 error=f"Failed to process prompt: {str(e)}"
             )
+
+    async def stream_openrouter_response(self, prompt: str, prompt_type: str, context: Optional[Dict[str, Any]] = None, model: Optional[str] = None) -> AsyncGenerator[str, None]:
+        """Stream response from OpenRouter API."""
+        if not settings.openrouter_api_key:
+            raise ValueError("OpenRouter API key is required")
+
+        model = model or self.default_model
+        system_prompt = self.system_prompts.get(prompt_type, "")
+
+        headers = {
+            "Authorization": f"Bearer {settings.openrouter_api_key}",
+            "HTTP-Referer": "https://github.com/your-repo",
+            "X-Title": "GH Issue Prompt",
+            "Content-Type": "application/json"
+        }
+
+        model_config = self._get_model_config(model)
+        
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        if context:
+            formatted_dynamic_context_str = format_rag_context_for_llm(context)
+            messages.append({"role": "system", "name": "retrieved_context", "content": formatted_dynamic_context_str})
+            
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": model_config["max_tokens"],
+            "temperature": model_config["temperature"],
+            "stream": True
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST",
+                    f"{settings.openrouter_base_url}/chat/completions",
+                    headers=headers,
+                    json=payload
+                ) as response:
+                    response.raise_for_status()
+                    
+                    async for line in response.aiter_lines():
+                        if line.startswith("data: "):
+                            data = line[6:]  # Remove "data: " prefix
+                            
+                            if data == "[DONE]":
+                                break
+                                
+                            try:
+                                json_data = json.loads(data)
+                                if "choices" in json_data and len(json_data["choices"]) > 0:
+                                    delta = json_data["choices"][0].get("delta", {})
+                                    content = delta.get("content", "")
+                                    if content:
+                                        # Format as SSE for frontend consumption
+                                        yield f"data: {json.dumps({'choices': [{'delta': {'content': content}}]})}\n\n"
+                            except json.JSONDecodeError:
+                                # Skip malformed JSON
+                                continue
+                                
+                    # Send final done message
+                    yield "data: [DONE]\n\n"
+                    
+        except httpx.HTTPStatusError as e:
+            error_msg = f"HTTP Status Error: {e.response.status_code} - {e.response.text}"
+            yield f"data: {json.dumps({'error': error_msg})}\n\n"
+        except httpx.RequestError as e:
+            error_msg = f"HTTP Request Error: {str(e)}"
+            yield f"data: {json.dumps({'error': error_msg})}\n\n"
+        except Exception as e:
+            error_msg = f"Unexpected error: {str(e)}"
+            yield f"data: {json.dumps({'error': error_msg})}\n\n"

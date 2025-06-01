@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from .models import PromptRequest, PromptResponse, ChatMessage, SessionResponse
 from .github_client import GitHubIssueClient
 from .llm_client import LLMClient
@@ -103,16 +104,14 @@ async def create_session(request: PromptRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/sessions/{session_id}/messages", response_model=ChatMessage)
-async def handle_chat_message(session_id: str, message: ChatMessage):
+async def handle_chat_message(session_id: str, message: ChatMessage, stream: bool = Query(False)):
     try:
         session = session_manager.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
             
-        # Add user message to history
         session_manager.add_message(session_id, "user", message.content)
         
-        # Generate response using conversation history
         history = session.get("conversation_history", [])
         user_query = message.content
         
@@ -124,37 +123,44 @@ async def handle_chat_message(session_id: str, message: ChatMessage):
                 fresh_rag_context = await rag_instance.get_relevant_context(user_query)
             except Exception as e:
                 print(f"Error getting fresh RAG context: {e}")
-                # Fallback to initial context or empty if preferred
-                fresh_rag_context = session.get("repo_context", {}) 
+                fresh_rag_context = session.get("repo_context", {})
         else:
-            # Fallback if no RAG instance (should ideally not happen after session init)
             fresh_rag_context = session.get("repo_context", {})
 
-        # Build prompt from conversation history
         conversation_history_for_prompt = "\n".join(
-            [f"{msg['role'].upper()}: {msg['content']}" 
-             for msg in history[-6:]]  # Last 3 exchanges (user, assistant, user, assistant...)
+            [f"{msg['role'].upper()}: {msg['content']}" for msg in history[-6:]]
         )
-        # The user's current query is already part of the history as it was just added.
-        # The 'conversation_history_for_prompt' will be passed as the main 'prompt' to the LLM.
         
         session_llm_config = session.get("llm_config", {})
         model_name = session_llm_config.get("name", settings.default_model)
 
-        llm_response = await llm_client.process_prompt(
-            prompt=conversation_history_for_prompt, # This is the main user input/history
-            prompt_type=session["prompt_type"],   # Could be made dynamic or a new "chat" type
-            context=fresh_rag_context,            # This is the dynamically fetched RAG context
-            model=model_name
-        )
-        
-        # Add assistant response
-        session_manager.add_message(session_id, "assistant", llm_response.prompt)
-        
-        return ChatMessage(
-            role="assistant",
-            content=llm_response.prompt
-        )
+        if stream:
+            full_response_content = ""
+            async def generate_stream():
+                nonlocal full_response_content
+                async for chunk in llm_client.stream_openrouter_response(
+                    prompt=conversation_history_for_prompt,
+                    prompt_type=session["prompt_type"],
+                    context=fresh_rag_context,
+                    model=model_name
+                ):
+                    full_response_content += chunk
+                    yield chunk
+                session_manager.add_message(session_id, "assistant", full_response_content)
+
+            return StreamingResponse(generate_stream(), media_type="text/event-stream")
+        else:
+            llm_response = await llm_client.process_prompt(
+                prompt=conversation_history_for_prompt,
+                prompt_type=session["prompt_type"],
+                context=fresh_rag_context,
+                model=model_name
+            )
+            session_manager.add_message(session_id, "assistant", llm_response.prompt)
+            return ChatMessage(
+                role="assistant",
+                content=llm_response.prompt
+            )
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
