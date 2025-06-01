@@ -1,16 +1,16 @@
 from typing import Optional, List, Dict, Any, Tuple
 import os
 import faiss
-from llama_index.core import VectorStoreIndex, StorageContext, Settings
+from llama_index.core import VectorStoreIndex, StorageContext, Settings, SimpleDirectoryReader
 from llama_index.core.node_parser import SimpleNodeParser
 from llama_index.vector_stores.faiss import FaissVectorStore
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core.schema import Document
 from llama_index.retrievers.bm25 import BM25Retriever
-from config import settings
-from local_repo_loader import clone_repo_to_temp, clone_repo_to_temp_persistent
-from language_config import LANGUAGE_CONFIG, get_all_extensions, get_language_metadata
-from llm_client import LLMClient
+from .config import settings
+from .local_repo_loader import clone_repo_to_temp, clone_repo_to_temp_persistent
+from .language_config import LANGUAGE_CONFIG, get_all_extensions, get_language_metadata
+from .llm_client import LLMClient
 import re
 import Stemmer
 from llama_index.core.query_engine import RetrieverQueryEngine
@@ -21,6 +21,7 @@ from llama_index.core.tools import RetrieverTool
 from llama_index.core.schema import IndexNode
 from llama_index.core import SummaryIndex
 from llama_index.core.retrievers import RecursiveRetriever
+
 
 class LocalRepoContextExtractor:
     """Extract context from a locally cloned repository with enhanced multi-language support"""

@@ -4,17 +4,17 @@ import os
 import sys
 from pathlib import Path
 
-# Add the parent directory to the sys.path to allow importing src modules
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'src')))
+# Add the current directory to the sys.path to allow importing src as a package
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
-from new_rag import LocalRepoContextExtractor # Import from your new file
-from config import settings # Assuming config.py is in src/
-from local_repo_loader import clone_repo_to_temp_persistent # Assuming this is in src/
+from src.new_rag import LocalRepoContextExtractor # Import from src package
+from src.config import settings # Import from src package  
+from src.local_repo_loader import clone_repo_to_temp_persistent # Import from src package
 
 async def run_rag_test():
     # --- Configuration ---
     # Replace with a public GitHub repository URL for testing
-    test_repo_url = "https://github.com/huggingface/smolagents.git" # A small, simple repo
+    test_repo_url = "https://github.com/langchain-ai/langchain.git" # A small, simple repo
     # test_repo_url = "https://github.com/langchain-ai/langchain.git" # A larger, more complex repo for performance testing
     test_branch = "main"
     test_query_code = "How does the main function work?"

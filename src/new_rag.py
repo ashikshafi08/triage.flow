@@ -11,10 +11,10 @@ from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core.schema import Document
 from llama_index.retrievers.bm25 import BM25Retriever
 from llama_index.core.postprocessor import LLMRerank
-from config import settings
-from local_repo_loader import clone_repo_to_temp, clone_repo_to_temp_persistent
-from language_config import LANGUAGE_CONFIG, get_all_extensions, get_language_metadata
-from llm_client import LLMClient
+from .config import settings
+from .local_repo_loader import clone_repo_to_temp, clone_repo_to_temp_persistent
+from .language_config import LANGUAGE_CONFIG, get_all_extensions, get_language_metadata
+from .llm_client import LLMClient
 import re
 import Stemmer
 from llama_index.core.query_engine import RetrieverQueryEngine
@@ -27,6 +27,7 @@ from llama_index.core.schema import RelatedNodeInfo, NodeRelationship
 import asyncio
 from pathlib import Path
 import aiofiles # You would need to install aiofiles
+import aiofiles.os as aios
 
 # Add a mapping for tree-sitter languages if necessary, or assume direct match
 TREE_SITTER_LANGUAGE_MAP = {
@@ -78,6 +79,22 @@ CUSTOM_SIGNATURE_IDENTIFIERS = {
             name_identifier="info_string",
         ),
     },
+    "javascript": {
+        "method_definition": _SignatureCaptureOptions(
+            end_signature_types=[_SignatureCaptureType(type="{", inclusive=False)],
+            name_identifier="name.definition.method",
+        ),
+        "function_declaration": _SignatureCaptureOptions(
+            end_signature_types=[_SignatureCaptureType(type="{", inclusive=False)],
+            name_identifier="name.definition.function",
+        ),
+        "class_declaration": _SignatureCaptureOptions(
+            end_signature_types=[_SignatureCaptureType(type="{", inclusive=False)],
+            name_identifier="name.definition.class",
+        ),
+    },
+
+    
 }
 
 # Custom comment options for additional languages
@@ -87,6 +104,9 @@ CUSTOM_COMMENT_OPTIONS = {
     ),
     "markdown": _CommentOptions(
         comment_template="<!-- {} -->", scope_method=_ScopeMethod.INDENTATION
+    ),
+    "javascript": _CommentOptions(
+        comment_template="// {}", scope_method=_ScopeMethod.BRACKETS
     ),
 }
 
@@ -101,7 +121,7 @@ class AsyncDirectoryReader:
 
     async def load_data(self) -> List[Document]:
         documents = []
-        tasks = []
+        file_paths = []
         
         for dirpath, dirnames, filenames in os.walk(self.input_dir):
             if not self.recursive:
@@ -124,24 +144,28 @@ class AsyncDirectoryReader:
                 if any(file_path.match(pattern) for pattern in self.exclude_files):
                     continue
                 
-                tasks.append(self._read_file_async(file_path))
+                file_paths.append(file_path)
 
-        # Run file reading tasks concurrently
-        file_contents = await asyncio.gather(*tasks)
+        semaphore = asyncio.Semaphore(100)  # Limit to 100 concurrent open files
+        tasks = [self._read_file(file_path, semaphore) for file_path in file_paths]
+        results = await asyncio.gather(*tasks)
+        # Filter out None results (files that couldn't be read or were skipped)
+        return [doc for doc in results if doc is not None]
 
-        for file_path, content in file_contents:
-            if content is not None:
-                documents.append(Document(text=content, metadata={"file_path": str(file_path)}))
-        return documents
-
-    async def _read_file_async(self, file_path: Path) -> Tuple[Path, Optional[str]]:
-        try:
-            async with aiofiles.open(file_path, mode="r", encoding="utf-8", errors="ignore") as f:
-                content = await f.read()
-            return file_path, content
-        except Exception as e:
-            print(f"Error reading file {file_path}: {e}")
-            return file_path, None
+    async def _read_file(self, file_path: Path, semaphore: asyncio.Semaphore) -> Optional[Document]:
+        """Read a single file and return a Document object or None if reading fails."""
+        async with semaphore: # Acquire semaphore before opening file
+            try:
+                # Check if it's a valid file and not a special file type like a socket or FIFO
+                if not await aios.path.isfile(file_path) or await aios.path.islink(file_path) or await aios.path.ismount(file_path):
+                    # print(f"Skipping non-regular file: {file_path}") # Optional: for debugging
+                    return None
+                async with aiofiles.open(file_path, mode="r", encoding="utf-8", errors="ignore") as f:
+                    content = await f.read()
+                return Document(text=content, metadata={"file_path": str(file_path)})
+            except Exception as e:
+                # print(f"Error reading file {file_path}: {e}") # Optional: for debugging, can be noisy
+                return None
 
 
 def fix_node_relationships(node):

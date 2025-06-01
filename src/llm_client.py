@@ -2,8 +2,8 @@ from typing import Optional, Dict, Any, AsyncGenerator
 import httpx
 from llama_index.llms.openai import OpenAI
 from llama_index.core.prompts import PromptTemplate
-from config import settings
-from models import PromptResponse
+from .config import settings
+from .models import PromptResponse
 import json
 
 def format_rag_context_for_llm(rag_data: Optional[Dict[str, Any]]) -> str:
