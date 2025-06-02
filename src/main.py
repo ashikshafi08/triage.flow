@@ -237,6 +237,154 @@ async def list_files(session_id: str = Query(...)):
                 file_list.append({"path": rel_path})
     return file_list
 
+@app.get("/api/file-content")
+async def get_file_content(session_id: str = Query(...), file_path: str = Query(...)):
+    """Get the content of a specific file from the repository"""
+    session = session_manager.get_session(session_id)
+    if not session or "repo_path" not in session:
+        raise HTTPException(status_code=404, detail="No repo loaded for this session")
+    
+    repo_path = session["repo_path"]
+    abs_file_path = os.path.join(repo_path, file_path)
+    
+    # Security check: ensure the file is within the repo directory
+    if not abs_file_path.startswith(repo_path):
+        raise HTTPException(status_code=403, detail="Access denied: File outside repository")
+    
+    if not os.path.exists(abs_file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    if not os.path.isfile(abs_file_path):
+        raise HTTPException(status_code=400, detail="Path is not a file")
+    
+    try:
+        # Get file size
+        file_size = os.path.getsize(abs_file_path)
+        
+        # Check if file is likely binary
+        def is_binary_file(file_path):
+            """Check if a file is binary by reading the first chunk"""
+            try:
+                with open(file_path, 'rb') as f:
+                    chunk = f.read(1024)
+                    # If there are null bytes, it's likely binary
+                    return b'\x00' in chunk
+            except:
+                return True
+        
+        # Determine file type
+        file_ext = os.path.splitext(file_path)[1].lower()
+        image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp', '.bmp'}
+        text_extensions = {
+            '.txt', '.md', '.py', '.js', '.jsx', '.ts', '.tsx', '.json', '.yaml', '.yml',
+            '.xml', '.html', '.css', '.scss', '.sass', '.less', '.php', '.rb', '.go',
+            '.rs', '.java', '.cpp', '.c', '.h', '.hpp', '.cs', '.swift', '.kt', '.scala',
+            '.sh', '.bash', '.zsh', '.fish', '.ps1', '.sql', '.r', '.dockerfile', '.env',
+            '.gitignore', '.gitattributes', '.log', '.conf', '.config', '.ini', '.toml'
+        }
+        
+        if file_ext in image_extensions:
+            # Handle image files
+            try:
+                import base64
+                with open(abs_file_path, 'rb') as f:
+                    content = base64.b64encode(f.read()).decode('utf-8')
+                return {
+                    "content": content,
+                    "size": file_size,
+                    "type": "image",
+                    "encoding": "base64"
+                }
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error reading image file: {str(e)}")
+        
+        elif file_ext in text_extensions or not is_binary_file(abs_file_path):
+            # Handle text files
+            try:
+                with open(abs_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                
+                # Limit content size for very large files (>1MB)
+                if len(content) > 1024 * 1024:  # 1MB
+                    content = content[:1024 * 1024] + "\n\n... (File truncated due to size)"
+                
+                return {
+                    "content": content,
+                    "size": file_size,
+                    "type": "text",
+                    "encoding": "utf-8"
+                }
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error reading text file: {str(e)}")
+        
+        else:
+            # Handle binary files
+            return {
+                "content": "",
+                "size": file_size,
+                "type": "binary",
+                "encoding": None
+            }
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error accessing file: {str(e)}")
+
+@app.get("/api/tree")
+async def get_tree_structure(session_id: str = Query(...)):
+    """Get the tree structure of the repository"""
+    session = session_manager.get_session(session_id)
+    if not session or "repo_path" not in session:
+        raise HTTPException(status_code=404, detail="No repo loaded for this session")
+    
+    repo_path = session["repo_path"]
+    
+    def build_tree_recursive(current_path: str, relative_path: str = "") -> dict:
+        """Recursively build tree structure"""
+        items = []
+        
+        try:
+            # Get all items in current directory
+            for item in sorted(os.listdir(current_path)):
+                # Skip hidden files and directories
+                if item.startswith('.'):
+                    continue
+                
+                item_path = os.path.join(current_path, item)
+                item_relative_path = os.path.join(relative_path, item) if relative_path else item
+                
+                if os.path.isdir(item_path):
+                    # Directory
+                    dir_node = {
+                        "name": item,
+                        "path": item_relative_path.replace("\\", "/"),  # Normalize path separators
+                        "type": "directory",
+                        "children": build_tree_recursive(item_path, item_relative_path)
+                    }
+                    items.append(dir_node)
+                else:
+                    # File
+                    file_node = {
+                        "name": item,
+                        "path": item_relative_path.replace("\\", "/"),  # Normalize path separators
+                        "type": "file"
+                    }
+                    items.append(file_node)
+                    
+        except PermissionError:
+            # Skip directories we can't read
+            pass
+        except Exception as e:
+            print(f"Error reading directory {current_path}: {e}")
+            pass
+        
+        return items
+    
+    try:
+        tree = build_tree_recursive(repo_path)
+        return tree
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error building tree structure: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
