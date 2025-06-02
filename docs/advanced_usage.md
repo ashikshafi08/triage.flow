@@ -11,7 +11,7 @@ You can import and use the core components in your own Python applications, scri
 ```python
 from fastapi import FastAPI
 from src.github_client import GitHubIssueClient
-from src.local_rag import LocalRepoContextExtractor
+from src.new_rag import LocalRepoContextExtractor
 from src.prompt_generator import PromptGenerator
 import asyncio
 

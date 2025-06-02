@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
-from .local_rag import LocalRepoContextExtractor
+from .new_rag import LocalRepoContextExtractor
 from .prompt_generator import PromptGenerator
 from .github_client import GitHubIssueClient
 from .models import IssueResponse, LLMConfig # Added LLMConfig

@@ -39,7 +39,7 @@ You can use the tool in your own script:
 
 ```python
 from src.github_client import GitHubIssueClient
-from src.local_rag import LocalRepoContextExtractor
+from src.new_rag import LocalRepoContextExtractor
 from src.prompt_generator import PromptGenerator
 import asyncio
 

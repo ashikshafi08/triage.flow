@@ -16,7 +16,7 @@ from src.models import PromptRequest, IssueResponse, LLMConfig
 from src.github_client import GitHubIssueClient
 from src.llm_client import LLMClient
 from src.prompt_generator import PromptGenerator
-from src.local_rag import LocalRepoContextExtractor
+from src.new_rag import LocalRepoContextExtractor
 import nest_asyncio
 
 # Enable nested event loops

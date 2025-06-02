@@ -37,7 +37,7 @@ def format_rag_context_for_llm(rag_data: Optional[Dict[str, Any]]) -> str:
         sources_str = "EXACT FILE PATHS AND CONTENT FROM REPOSITORY:\n"
         sources_str += "=" * 50 + "\n"
         
-        for i, source in enumerate(sources[:5], 1):  # Limit to top 5 for better focus
+        for i, source in enumerate(sources[:15], 1):  # Limit to top 5 for better focus
             file_path = source.get('file', 'UNKNOWN_FILE')
             language = source.get('language', 'unknown')
             

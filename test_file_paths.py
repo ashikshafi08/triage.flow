@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 # Add src to path
 sys.path.append('src')
 
-from src.local_rag import LocalRepoContextExtractor
+from src.new_rag import LocalRepoContextExtractor
 
 # Load environment variables
 load_dotenv()

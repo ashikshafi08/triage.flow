@@ -7,7 +7,7 @@ import os
 import sys
 import asyncio
 from dotenv import load_dotenv
-from src.local_rag import LocalRepoContextExtractor
+from src.new_rag import LocalRepoContextExtractor
 
 # Load environment variables
 load_dotenv()
