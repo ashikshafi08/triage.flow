@@ -6,6 +6,26 @@ from .config import settings
 from .models import PromptResponse
 import json
 
+# Try to import tiktoken for better token estimation
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    TIKTOKEN_AVAILABLE = False
+
+def estimate_tokens(text: str) -> int:
+    """Estimate token count for text."""
+    if TIKTOKEN_AVAILABLE:
+        try:
+            encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+            return len(encoding.encode(text))
+        except Exception:
+            # Fallback to word-based estimation if tiktoken fails
+            pass
+    
+    # Fallback: rough estimation (words * 1.3)
+    return int(len(text.split()) * 1.3)
+
 def format_rag_context_for_llm(rag_data: Optional[Dict[str, Any]]) -> str:
     """Formats the RAG context dictionary into a string for the LLM prompt."""
     if not rag_data:
@@ -33,32 +53,85 @@ def format_rag_context_for_llm(rag_data: Optional[Dict[str, Any]]) -> str:
         context_parts.append(f"Retrieved Context Summary:\n{rag_summary}")
 
     sources = rag_data.get("sources")
+    search_type = rag_data.get("search_type", "regular")
+    
     if sources:
-        sources_str = "EXACT FILE PATHS AND CONTENT FROM REPOSITORY:\n"
-        sources_str += "=" * 50 + "\n"
+        # Token budget guard - estimate tokens and limit sources if too many
+        estimated_tokens = sum(estimate_tokens(part) for part in context_parts)
+        max_sources = 15
         
-        for i, source in enumerate(sources[:15], 1):  # Limit to top 5 for better focus
-            file_path = source.get('file', 'UNKNOWN_FILE')
-            language = source.get('language', 'unknown')
-            
-            sources_str += f"\n{i}. FILE: {file_path}\n"
-            if language and language != 'unknown':
-                sources_str += f"   Language: {language}\n"
-            sources_str += f"   Content Preview:\n"
-            
-            # Add a preview of the content
-            content = source.get('content', '')
-            if content:
-                # Show first 300 characters to give context without overwhelming
-                preview = content[:300].strip()
-                if len(content) > 300:
-                    preview += "..."
-                sources_str += f"   {preview}\n"
-            
-            sources_str += "-" * 30 + "\n"
+        # If file-oriented search, prioritize showing more files with less content
+        if search_type == "file_oriented":
+            max_sources = 25
+            content_preview_length = 150
+        else:
+            content_preview_length = 300
         
-        sources_str += f"\nIMPORTANT: These are the ONLY file paths that exist in the retrieved context.\n"
-        sources_str += "DO NOT reference any other file paths not listed above.\n"
+        # Estimate tokens from sources and reduce if needed
+        for source in sources[:max_sources]:
+            estimated_tokens += estimate_tokens(source.get('content', ''))
+            if estimated_tokens > 12000:  # Conservative limit for 16k context
+                max_sources = max(5, max_sources - 5)
+                content_preview_length = max(100, content_preview_length - 50)
+                break
+        
+        if search_type == "file_oriented":
+            sources_str = "FILE SEARCH RESULTS:\n"
+            sources_str += "=" * 50 + "\n"
+            sources_str += f"Found {len(sources)} relevant files"
+            if len(sources) > max_sources:
+                sources_str += f" (showing top {max_sources}):\n\n"
+            else:
+                sources_str += ":\n\n"
+            
+            for i, source in enumerate(sources[:max_sources], 1):
+                file_path = source.get('file', 'UNKNOWN_FILE')
+                language = source.get('language', 'unknown')
+                match_reasons = source.get('match_reasons', [])
+                
+                sources_str += f"{i}. FILE: {file_path}\n"
+                if language and language != 'unknown':
+                    sources_str += f"   Language: {language}\n"
+                if match_reasons:
+                    sources_str += f"   Match reasons: {', '.join(match_reasons)}\n"
+                
+                # Add a preview of the content
+                content = source.get('content', '')
+                if content:
+                    preview = content[:content_preview_length].strip()
+                    if len(content) > content_preview_length:
+                        preview += "..."
+                    sources_str += f"   Content Preview:\n   {preview}\n"
+                
+                sources_str += "-" * 30 + "\n"
+            
+            sources_str += f"\nIMPORTANT: These files were found using file pattern matching.\n"
+            sources_str += "The file paths listed above are the exact paths in the repository.\n"
+        else:
+            sources_str = "EXACT FILE PATHS AND CONTENT FROM REPOSITORY:\n"
+            sources_str += "=" * 50 + "\n"
+            
+            for i, source in enumerate(sources[:max_sources], 1):
+                file_path = source.get('file', 'UNKNOWN_FILE')
+                language = source.get('language', 'unknown')
+                
+                sources_str += f"\n{i}. FILE: {file_path}\n"
+                if language and language != 'unknown':
+                    sources_str += f"   Language: {language}\n"
+                sources_str += f"   Content Preview:\n"
+                
+                # Add a preview of the content
+                content = source.get('content', '')
+                if content:
+                    preview = content[:content_preview_length].strip()
+                    if len(content) > content_preview_length:
+                        preview += "..."
+                    sources_str += f"   {preview}\n"
+                
+                sources_str += "-" * 30 + "\n"
+            
+            sources_str += f"\nIMPORTANT: These are the ONLY file paths that exist in the retrieved context.\n"
+            sources_str += "DO NOT reference any other file paths not listed above.\n"
         
         context_parts.append(sources_str)
     
@@ -192,6 +265,35 @@ class LLMClient:
                 if context:
                     formatted_dynamic_context_str = format_rag_context_for_llm(context)
                 
+                # Final token budget check - ensure total doesn't exceed limit
+                system_tokens = estimate_tokens(system_prompt)
+                context_tokens = estimate_tokens(formatted_dynamic_context_str)
+                prompt_tokens = estimate_tokens(prompt)
+                total_tokens = system_tokens + context_tokens + prompt_tokens
+                
+                # If we're over the limit, trim the context
+                if total_tokens > 15500:  # Conservative limit for 16k context
+                    print(f"Token budget exceeded ({total_tokens}), trimming context...")
+                    # Reduce context by trimming sources or shortening previews
+                    if context and context.get("sources"):
+                        sources = context["sources"]
+                        # Try reducing to fewer sources first
+                        while len(sources) > 3 and total_tokens > 15500:
+                            sources = sources[:-1]  # Remove last source
+                            temp_context = {**context, "sources": sources}
+                            temp_formatted = format_rag_context_for_llm(temp_context)
+                            total_tokens = system_tokens + estimate_tokens(temp_formatted) + prompt_tokens
+                        
+                        # If still too long, shorten content previews
+                        if total_tokens > 15500:
+                            for source in sources:
+                                if "content" in source and len(source["content"]) > 100:
+                                    source["content"] = source["content"][:100] + "..."
+                            temp_context = {**context, "sources": sources}
+                            formatted_dynamic_context_str = format_rag_context_for_llm(temp_context)
+                        else:
+                            formatted_dynamic_context_str = format_rag_context_for_llm({**context, "sources": sources})
+                
                 # Prepend RAG context to the main prompt (conversation history)
                 # The system_prompt from self.system_prompts is handled by PromptTemplate's system_prompt arg
                 final_prompt_for_template = f"Relevant Context:\n{formatted_dynamic_context_str}\n\nConversation History:\n{prompt}"
@@ -211,8 +313,37 @@ class LLMClient:
                 )
                 
             elif settings.llm_provider == "openrouter":
-                # Pass the raw context dictionary to _get_openrouter_response, it will format it
-                response_data = await self._get_openrouter_response(prompt, model, system_prompt, dynamic_context=context)
+                # Format context and check token budget for OpenRouter too
+                formatted_dynamic_context = context
+                if context:
+                    # Apply same token budget logic as OpenAI
+                    formatted_context_str = format_rag_context_for_llm(context)
+                    system_tokens = estimate_tokens(system_prompt)
+                    context_tokens = estimate_tokens(formatted_context_str)
+                    prompt_tokens = estimate_tokens(prompt)
+                    total_tokens = system_tokens + context_tokens + prompt_tokens
+                    
+                    if total_tokens > 15500:  # Conservative limit for 16k context
+                        print(f"Token budget exceeded ({total_tokens}), trimming context...")
+                        if context.get("sources"):
+                            sources = context["sources"]
+                            # Try reducing to fewer sources first
+                            while len(sources) > 3 and total_tokens > 15500:
+                                sources = sources[:-1]  # Remove last source
+                                temp_context = {**context, "sources": sources}
+                                temp_formatted = format_rag_context_for_llm(temp_context)
+                                total_tokens = system_tokens + estimate_tokens(temp_formatted) + prompt_tokens
+                            
+                            # If still too long, shorten content previews
+                            if total_tokens > 15500:
+                                for source in sources:
+                                    if "content" in source and len(source["content"]) > 100:
+                                        source["content"] = source["content"][:100] + "..."
+                            
+                            formatted_dynamic_context = {**context, "sources": sources}
+                
+                # Pass the potentially trimmed context dictionary to _get_openrouter_response
+                response_data = await self._get_openrouter_response(prompt, model, system_prompt, dynamic_context=formatted_dynamic_context)
                 return PromptResponse(
                     status="success",
                     prompt=response_data["text"],
@@ -252,7 +383,33 @@ class LLMClient:
         
         messages = [{"role": "system", "content": system_prompt}]
         
+        # Apply token budget check for streaming too
         if context:
+            formatted_context_str = format_rag_context_for_llm(context)
+            system_tokens = estimate_tokens(system_prompt)
+            context_tokens = estimate_tokens(formatted_context_str)
+            prompt_tokens = estimate_tokens(prompt)
+            total_tokens = system_tokens + context_tokens + prompt_tokens
+            
+            if total_tokens > 15500:  # Conservative limit for 16k context
+                print(f"Token budget exceeded ({total_tokens}), trimming context...")
+                if context.get("sources"):
+                    sources = context["sources"]
+                    # Try reducing to fewer sources first
+                    while len(sources) > 3 and total_tokens > 15500:
+                        sources = sources[:-1]  # Remove last source
+                        temp_context = {**context, "sources": sources}
+                        temp_formatted = format_rag_context_for_llm(temp_context)
+                        total_tokens = system_tokens + estimate_tokens(temp_formatted) + prompt_tokens
+                    
+                    # If still too long, shorten content previews
+                    if total_tokens > 15500:
+                        for source in sources:
+                            if "content" in source and len(source["content"]) > 100:
+                                source["content"] = source["content"][:100] + "..."
+                    
+                    context = {**context, "sources": sources}
+            
             formatted_dynamic_context_str = format_rag_context_for_llm(context)
             messages.append({"role": "system", "name": "retrieved_context", "content": formatted_dynamic_context_str})
             

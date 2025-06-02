@@ -224,7 +224,15 @@ async def get_memory_statistics(session_id: str):
 
 @app.get("/api/files")
 async def list_files(session_id: str = Query(...)):
+    print(f"[DEBUG] /api/files called with session_id: {session_id}")
     session = session_manager.get_session(session_id)
+    print(f"[DEBUG] Session found: {session is not None}")
+    if session:
+        print(f"[DEBUG] Session keys: {session.keys()}")
+        print(f"[DEBUG] repo_path in session: {'repo_path' in session}")
+        if "repo_path" in session:
+            print(f"[DEBUG] repo_path value: {session['repo_path']}")
+    
     if not session or "repo_path" not in session:
         raise HTTPException(status_code=404, detail="No repo loaded for this session")
     repo_path = session["repo_path"]
@@ -332,8 +340,12 @@ async def get_file_content(session_id: str = Query(...), file_path: str = Query(
 @app.get("/api/tree")
 async def get_tree_structure(session_id: str = Query(...)):
     """Get the tree structure of the repository"""
+    print(f"[DEBUG] /api/tree called with session_id: {session_id}")
     session = session_manager.get_session(session_id)
+    print(f"[DEBUG] Session found: {session is not None}")
     if not session or "repo_path" not in session:
+        if session:
+            print(f"[DEBUG] Session keys: {session.keys()}")
         raise HTTPException(status_code=404, detail="No repo loaded for this session")
     
     repo_path = session["repo_path"]

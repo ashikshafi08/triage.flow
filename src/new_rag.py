@@ -23,6 +23,7 @@ from llama_index.core.schema import IndexNode
 from llama_index.core import SummaryIndex
 from llama_index.core.retrievers import RecursiveRetriever
 from llama_index.core.schema import RelatedNodeInfo, NodeRelationship
+import fnmatch
 
 import asyncio
 from pathlib import Path
@@ -218,6 +219,127 @@ class LocalRepoContextExtractor:
         
         # Initialize LLM client
         self.llm_client = LLMClient()
+        
+        # Cache for file pattern searches to avoid repeated disk walks
+        self._file_pattern_cache = {}
+    
+    def _invalidate_file_cache(self):
+        """Invalidate file pattern cache (call when repo is reloaded)."""
+        self._file_pattern_cache = {}
+    
+    def _is_file_oriented_query(self, query: str) -> bool:
+        """Determine if the query is asking about files specifically."""
+        file_patterns = [
+            r'\bwhich files?\b',
+            r'\bwhat files?\b', 
+            r'\blist.*files?\b',
+            r'\bfiles? .*contain\b',
+            r'\bfiles? .*define\b',
+            r'\bfiles? .*implement\b',
+            r'\bfiles? that\b',
+            r'\bwhere.*file\b',
+            r'\bfile.*path\b',
+            r'\bshow.*files?\b',
+            r'\bfind.*files?\b',
+            r'\bshow me.*\.py\b',  # Added: "show me *.py"
+            r'\bcontains class\b',  # Added: "contains class"
+            r'\*\.py\b',  # glob patterns
+            r'\*\.js\b',
+            r'\*\.ts\b',
+            r'\.py$',     # file extensions
+            r'\.js$',
+            r'\.ts$'
+        ]
+        return any(re.search(pattern, query, re.IGNORECASE) for pattern in file_patterns)
+    
+    def _search_files_by_pattern(self, query: str, restrict_files: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """Search for files using glob patterns and keywords."""
+        if not self.current_repo_path or not os.path.exists(self.current_repo_path):
+            return []
+        
+        # Create cache key based on query and restrict_files
+        cache_key = (query.lower(), tuple(sorted(restrict_files)) if restrict_files else None)
+        
+        # Check cache first
+        if cache_key in self._file_pattern_cache:
+            return self._file_pattern_cache[cache_key]
+        
+        results = []
+        query_lower = query.lower()
+        
+        # Extract potential glob patterns from query
+        glob_patterns = re.findall(r'\*\.[a-zA-Z]+', query)
+        
+        # Extract keywords that might be in file names
+        keywords = re.findall(r'\b\w+\b', query_lower)
+        keywords = [k for k in keywords if len(k) > 2 and k not in ['the', 'and', 'are', 'files', 'that', 'which', 'what']]
+        
+        for root, dirs, files in os.walk(self.current_repo_path):
+            # Skip hidden directories
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            
+            for file in files:
+                if file.startswith('.'):
+                    continue
+                    
+                file_path = os.path.join(root, file)
+                rel_path = os.path.relpath(file_path, self.current_repo_path)
+                
+                # Skip if restrict_files is set and this file isn't in it
+                if restrict_files and rel_path not in restrict_files:
+                    continue
+                
+                match_score = 0
+                match_reasons = []
+                
+                # Check glob patterns
+                for pattern in glob_patterns:
+                    if fnmatch.fnmatch(file.lower(), pattern.lower()):
+                        match_score += 10
+                        match_reasons.append(f"matches pattern {pattern}")
+                
+                # Check keywords in filename and path
+                file_text = (file + " " + rel_path).lower()
+                for keyword in keywords:
+                    if keyword in file_text:
+                        match_score += 5
+                        match_reasons.append(f"contains '{keyword}'")
+                
+                if match_score > 0:
+                    # Get language metadata without reading file content yet
+                    metadata = get_language_metadata(file_path)
+                    
+                    file_result = {
+                        "file": rel_path,
+                        "language": metadata["display_name"],
+                        "description": metadata["description"],
+                        "content": "",  # Will be filled if score is high enough
+                        "match_score": match_score,
+                        "match_reasons": match_reasons
+                    }
+                    
+                    # Only read file content if match score is high enough (threshold = 15)
+                    if match_score >= 15:  # Raised from 10 to 15 for better performance
+                        try:
+                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                # Read only first 1KB for preview to keep latency predictable
+                                content = f.read(1024)
+                                file_result["content"] = content + "..." if len(content) == 1024 else content
+                        except Exception:
+                            file_result["content"] = "Could not read file content"
+                    else:
+                        file_result["content"] = "Preview not loaded (low match score)"
+                    
+                    results.append(file_result)
+        
+        # Sort by match score descending
+        results.sort(key=lambda x: x["match_score"], reverse=True)
+        final_results = results[:20]  # Limit to top 20 matches
+        
+        # Cache the results
+        self._file_pattern_cache[cache_key] = final_results
+        
+        return final_results
     
     def _process_file_content(self, content: str, metadata: Dict[str, Any], file_path: str) -> str:
         """Process file content based on language-specific patterns."""
@@ -387,8 +509,8 @@ Code:
 
             # Dynamically set similarity_top_k based on corpus size
             num_nodes = len(nodes)
-            bm25_top_k = min(50, max(1, num_nodes // 2))  # Use half the nodes or 50, whichever is smaller
-            dense_top_k = min(40, max(1, num_nodes // 2))  # Use half the nodes or 40, whichever is smaller
+            bm25_top_k = min(200, max(1, num_nodes // 3))  # Use 1/3 of nodes or 200, whichever is smaller
+            dense_top_k = min(200, max(1, num_nodes // 3))  # Use 1/3 of nodes or 200, whichever is smaller
             
             print(f"Number of nodes: {num_nodes}, BM25 top_k: {bm25_top_k}, Dense top_k: {dense_top_k}")
 
@@ -424,9 +546,9 @@ Code:
                 retriever_dict=retriever_dict
             )
 
-            # Add reranker for better results
+            # Add reranker for better results - increased top_n for better recall
             reranker = LLMRerank(
-                top_n=10,
+                top_n=50,  # Increased from 10 to 50
                 llm=self.llm_client._get_openai_llm()  # Use LLM from llm_client
             )
             
@@ -452,6 +574,9 @@ Code:
                 "languages": languages,
                 "repo_path": repo_path  # Store the repo path for reference
             }
+            
+            # Invalidate file pattern cache when repo is reloaded
+            self._invalidate_file_cache()
     
         except Exception as e:
             raise Exception(f"Failed to load repository: {str(e)}")
@@ -462,7 +587,84 @@ Code:
             raise Exception("Repository not loaded. Call load_repository first.")
         
         try:
-            # Get response from query engine
+            # Check if this is a file-oriented query
+            if self._is_file_oriented_query(query):
+                print(f"Detected file-oriented query: {query}")
+                
+                # Use file pattern search
+                file_results = self._search_files_by_pattern(query, restrict_files)
+                
+                if file_results:
+                    # If we found files by pattern matching, also get some context from RAG
+                    # but limit it to those files
+                    file_paths = [f["file"] for f in file_results[:10]]  # Top 10 files
+                    wanted_files = set(file_paths)
+                    
+                    try:
+                        # Get RAG context restricted to these files with higher similarity_top_k
+                        # Skip reranker for speed since we're already filtering by wanted files
+                        rag_response = self.query_engine.query(query, similarity_top_k=200)
+                        rag_sources = []
+                        
+                        # Normalize file paths for Windows compatibility
+                        wanted_files_normalized = {fp.replace("\\", "/") for fp in wanted_files}
+                        
+                        for node in rag_response.source_nodes:
+                            file_path = node.metadata.get("file_path", "unknown")
+                            # Normalize the node's file path for comparison
+                            normalized_file_path = file_path.replace("\\", "/")
+                            # Only include nodes from the files we found
+                            if normalized_file_path in wanted_files_normalized:
+                                rag_sources.append({
+                                    "file": file_path,  # Keep original path format
+                                    "language": node.metadata.get("display_name", "unknown"),
+                                    "description": node.metadata.get("description", "No description available"),
+                                    "content": node.text[:1000] + "..." if len(node.text) > 1000 else node.text
+                                })
+                    except Exception as e:
+                        print(f"Error getting RAG context for file results: {e}")
+                        rag_sources = []
+                    
+                    # Combine file search results with RAG context
+                    combined_sources = []
+                    seen_files = set()
+                    
+                    # Add file search results first
+                    for file_result in file_results:
+                        file_path = file_result["file"]
+                        if file_path not in seen_files:
+                            combined_sources.append({
+                                "file": file_path,
+                                "language": file_result["language"],
+                                "description": file_result["description"],
+                                "content": file_result["content"],
+                                "match_reasons": file_result.get("match_reasons", [])
+                            })
+                            seen_files.add(file_path)
+                    
+                    # Add any additional RAG sources
+                    for rag_source in rag_sources:
+                        file_path = rag_source["file"]
+                        if file_path not in seen_files:
+                            combined_sources.append(rag_source)
+                            seen_files.add(file_path)
+                    
+                    return {
+                        "response": f"Found {len(file_results)} files matching your query. Here are the most relevant files:",
+                        "sources": combined_sources,
+                        "repo_info": self.repo_info,
+                        "search_type": "file_oriented"
+                    }
+                else:
+                    # No file pattern matches found - return clear message
+                    return {
+                        "response": "No files matched your query pattern. The search looked for file names, paths, and extensions but found no matches.",
+                        "sources": [],
+                        "repo_info": self.repo_info,
+                        "search_type": "file_oriented_no_match"
+                    }
+            
+            # Regular RAG search (original logic)
             response = self.query_engine.query(query)
 
             # Extract relevant information with accurate file paths and deduplicate by file
@@ -487,7 +689,8 @@ Code:
             context = {
                 "response": str(response),
                 "sources": deduped_sources,  # Use deduplicated sources
-                "repo_info": self.repo_info
+                "repo_info": self.repo_info,
+                "search_type": "regular"
             }
             
             return context
