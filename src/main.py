@@ -119,29 +119,64 @@ async def handle_chat_message(session_id: str, message: ChatMessage, stream: boo
         user_query = message.content
         rag_instance = session.get("rag_instance")
         fresh_rag_context = {}
-        # Always get default RAG context (whole codebase)
-        if rag_instance:
-            try:
-                fresh_rag_context = await rag_instance.get_relevant_context(user_query)
-            except Exception as e:
-                print(f"Error getting fresh RAG context: {e}")
-                fresh_rag_context = session.get("repo_context", {})
-        else:
-            fresh_rag_context = session.get("repo_context", {})
+        
         # Extract @file_path mentions from message.content
         user_file_contexts = []
         repo_path = session.get("repo_path")
+        
+        # Extract both file and folder mentions
         file_mentions = re.findall(r"@([\w\-/\\.]+)", message.content)
+        folder_mentions = re.findall(r"@folder/([\w\-/\\.]+)", message.content)
+        
+        # Process individual file mentions
         for rel_path in file_mentions:
             abs_path = os.path.join(repo_path, rel_path)
-            if os.path.exists(abs_path):
+            if os.path.exists(abs_path) and os.path.isfile(abs_path):
                 with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
                 user_file_contexts.append({
                     "file": rel_path,
                     "content": content[:5000]  # Limit to 5k chars per file
                 })
+        
+        # Process folder mentions - collect all files in the folder
+        restricted_files = []
+        for folder_path in folder_mentions:
+            abs_folder_path = os.path.join(repo_path, folder_path)
+            if os.path.exists(abs_folder_path) and os.path.isdir(abs_folder_path):
+                # Get all files in the folder (recursively)
+                for root, dirs, files in os.walk(abs_folder_path):
+                    # Skip hidden directories
+                    dirs[:] = [d for d in dirs if not d.startswith('.')]
+                    for file in files:
+                        if not file.startswith('.'):
+                            file_abs_path = os.path.join(root, file)
+                            file_rel_path = os.path.relpath(file_abs_path, repo_path)
+                            restricted_files.append(file_rel_path)
+        
         fresh_rag_context["user_selected_files"] = user_file_contexts
+        
+        # If we have folder mentions, restrict RAG to those files
+        if folder_mentions:
+            if rag_instance:
+                try:
+                    fresh_rag_context = await rag_instance.get_relevant_context(
+                        user_query, 
+                        restrict_files=restricted_files
+                    )
+                    fresh_rag_context["user_selected_files"] = user_file_contexts
+                except Exception as e:
+                    print(f"Error getting folder-restricted RAG context: {e}")
+                    fresh_rag_context = session.get("repo_context", {})
+        else:
+            # Regular RAG without folder restrictions
+            if rag_instance:
+                try:
+                    fresh_rag_context = await rag_instance.get_relevant_context(user_query)
+                    fresh_rag_context["user_selected_files"] = user_file_contexts
+                except Exception as e:
+                    print(f"Error getting fresh RAG context: {e}")
+                    fresh_rag_context = session.get("repo_context", {})
         # Use production-grade conversation memory instead of simple sliding window
         conversation_context, memory_stats = await conversation_memory.get_conversation_context(
             history, llm_client, use_compression=True
@@ -156,6 +191,8 @@ async def handle_chat_message(session_id: str, message: ChatMessage, stream: boo
             for i, source in enumerate(fresh_rag_context['sources'][:5], 1):
                 file_path = source.get('file', 'UNKNOWN')
                 print(f"  {i}. {file_path}")
+            if folder_mentions:
+                print(f"Folder-restricted query for folders: {folder_mentions}")
         else:
             print("No RAG sources retrieved for this query")
         
