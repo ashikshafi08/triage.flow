@@ -57,24 +57,15 @@ def format_rag_context_for_llm(rag_data: Optional[Dict[str, Any]]) -> str:
     search_type = rag_data.get("search_type", "regular")
     
     if sources:
-        # Token budget guard - estimate tokens and limit sources if too many
-        estimated_tokens = sum(estimate_tokens(part) for part in context_parts)
+        # Set max sources without token-based limiting
         max_sources = 15
         
-        # If file-oriented search, prioritize showing more files with less content
+        # If file-oriented search, prioritize showing more files
         if search_type == "file_oriented":
             max_sources = 25
-            content_preview_length = 150
-        else:
             content_preview_length = 300
-        
-        # Estimate tokens from sources and reduce if needed
-        for source in sources[:max_sources]:
-            estimated_tokens += estimate_tokens(source.get('content', ''))
-            if estimated_tokens > 12000:  # Conservative limit for 16k context
-                max_sources = max(5, max_sources - 5)
-                content_preview_length = max(100, content_preview_length - 50)
-                break
+        else:
+            content_preview_length = 500
         
         if search_type == "file_oriented":
             sources_str = "FILE SEARCH RESULTS:\n"
@@ -224,35 +215,6 @@ class LLMClient:
                 if context:
                     formatted_dynamic_context_str = format_rag_context_for_llm(context)
                 
-                # Final token budget check - ensure total doesn't exceed limit
-                system_tokens = estimate_tokens(system_prompt)
-                context_tokens = estimate_tokens(formatted_dynamic_context_str)
-                prompt_tokens = estimate_tokens(prompt)
-                total_tokens = system_tokens + context_tokens + prompt_tokens
-                
-                # If we're over the limit, trim the context
-                if total_tokens > 15500:  # Conservative limit for 16k context
-                    print(f"Token budget exceeded ({total_tokens}), trimming context...")
-                    # Reduce context by trimming sources or shortening previews
-                    if context and context.get("sources"):
-                        sources = context["sources"]
-                        # Try reducing to fewer sources first
-                        while len(sources) > 3 and total_tokens > 15500:
-                            sources = sources[:-1]  # Remove last source
-                            temp_context = {**context, "sources": sources}
-                            temp_formatted = format_rag_context_for_llm(temp_context)
-                            total_tokens = system_tokens + estimate_tokens(temp_formatted) + prompt_tokens
-                        
-                        # If still too long, shorten content previews
-                        if total_tokens > 15500:
-                            for source in sources:
-                                if "content" in source and len(source["content"]) > 100:
-                                    source["content"] = source["content"][:100] + "..."
-                            temp_context = {**context, "sources": sources}
-                            formatted_dynamic_context_str = format_rag_context_for_llm(temp_context)
-                        else:
-                            formatted_dynamic_context_str = format_rag_context_for_llm({**context, "sources": sources})
-                
                 # Prepend RAG context to the main prompt (conversation history)
                 # The system_prompt from self.system_prompts is handled by PromptTemplate's system_prompt arg
                 final_prompt_for_template = f"Relevant Context:\n{formatted_dynamic_context_str}\n\nConversation History:\n{prompt}"
@@ -276,35 +238,6 @@ class LLMClient:
                 formatted_dynamic_context_str = ""
                 if context:
                     formatted_dynamic_context_str = format_rag_context_for_llm(context)
-                
-                # Apply same token budget logic as OpenAI
-                system_tokens = estimate_tokens(system_prompt)
-                context_tokens = estimate_tokens(formatted_dynamic_context_str)
-                prompt_tokens = estimate_tokens(prompt)
-                total_tokens = system_tokens + context_tokens + prompt_tokens
-                
-                # If we're over the limit, trim the context
-                if total_tokens > 15500:  # Conservative limit for 16k context
-                    print(f"Token budget exceeded ({total_tokens}), trimming context...")
-                    # Reduce context by trimming sources or shortening previews
-                    if context and context.get("sources"):
-                        sources = context["sources"]
-                        # Try reducing to fewer sources first
-                        while len(sources) > 3 and total_tokens > 15500:
-                            sources = sources[:-1]  # Remove last source
-                            temp_context = {**context, "sources": sources}
-                            temp_formatted = format_rag_context_for_llm(temp_context)
-                            total_tokens = system_tokens + estimate_tokens(temp_formatted) + prompt_tokens
-                        
-                        # If still too long, shorten content previews
-                        if total_tokens > 15500:
-                            for source in sources:
-                                if "content" in source and len(source["content"]) > 100:
-                                    source["content"] = source["content"][:100] + "..."
-                            temp_context = {**context, "sources": sources}
-                            formatted_dynamic_context_str = format_rag_context_for_llm(temp_context)
-                        else:
-                            formatted_dynamic_context_str = format_rag_context_for_llm({**context, "sources": sources})
                 
                 # Prepend RAG context to the main prompt (conversation history)
                 final_prompt_for_template = f"Relevant Context:\n{formatted_dynamic_context_str}\n\nConversation History:\n{prompt}"
@@ -345,33 +278,6 @@ class LLMClient:
         formatted_dynamic_context_str = ""
         if context:
             formatted_dynamic_context_str = format_rag_context_for_llm(context)
-        
-        # Apply token budget check for streaming too
-        system_tokens = estimate_tokens(system_prompt)
-        context_tokens = estimate_tokens(formatted_dynamic_context_str)
-        prompt_tokens = estimate_tokens(prompt)
-        total_tokens = system_tokens + context_tokens + prompt_tokens
-        
-        if total_tokens > 15500:  # Conservative limit for 16k context
-            print(f"Token budget exceeded ({total_tokens}), trimming context...")
-            if context and context.get("sources"):
-                sources = context["sources"]
-                # Try reducing to fewer sources first
-                while len(sources) > 3 and total_tokens > 15500:
-                    sources = sources[:-1]  # Remove last source
-                    temp_context = {**context, "sources": sources}
-                    temp_formatted = format_rag_context_for_llm(temp_context)
-                    total_tokens = system_tokens + estimate_tokens(temp_formatted) + prompt_tokens
-                
-                # If still too long, shorten content previews
-                if total_tokens > 15500:
-                    for source in sources:
-                        if "content" in source and len(source["content"]) > 100:
-                            source["content"] = source["content"][:100] + "..."
-                    temp_context = {**context, "sources": sources}
-                    formatted_dynamic_context_str = format_rag_context_for_llm(temp_context)
-                else:
-                    formatted_dynamic_context_str = format_rag_context_for_llm({**context, "sources": sources})
         
         # Prepend RAG context to the main prompt (conversation history)
         final_prompt_for_template = f"Relevant Context:\n{formatted_dynamic_context_str}\n\nConversation History:\n{prompt}"

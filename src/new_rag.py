@@ -322,9 +322,9 @@ class LocalRepoContextExtractor:
                     if match_score >= 15:  # Raised from 10 to 15 for better performance
                         try:
                             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                # Read only first 1KB for preview to keep latency predictable
-                                content = f.read(1024)
-                                file_result["content"] = content + "..." if len(content) == 1024 else content
+                                # Read first 3KB for preview instead of 1KB to show more actual code
+                                content = f.read(3000)
+                                file_result["content"] = content + "..." if len(content) == 3000 else content
                         except Exception:
                             file_result["content"] = "Could not read file content"
                     else:
@@ -466,9 +466,9 @@ Code:
                             signature_identifiers=signature_identifiers,
                             code_splitter=CodeSplitter(
                                 language=tree_sitter_lang,
-                                chunk_lines=40, # Default, can be configured
-                                chunk_lines_overlap=15, # Default, can be configured
-                                max_chars=1500 # Default, can be configured
+                                chunk_lines=150, # Increased from 40 to show more actual code
+                                chunk_lines_overlap=50, # Increased from 15 for better context
+                                max_chars=8000 # Increased from 1500 to preserve actual code content
                             )
                         )
                         nodes_for_doc = node_parser.get_nodes_from_documents([doc])
@@ -601,15 +601,18 @@ Code:
                     wanted_files = set(file_paths)
                     
                     try:
-                        # Get RAG context restricted to these files with higher similarity_top_k
-                        # Skip reranker for speed since we're already filtering by wanted files
-                        rag_response = self.query_engine.query(query, similarity_top_k=200)
+                        # Get RAG context restricted to these files
+                        # Retrieve nodes directly from the retriever to bypass reranker/synthesis from query_engine
+                        # The similarity_top_k for sub-retrievers (BM25, dense) are set at their initialization.
+                        # This aligns with the intent "# Skip reranker for speed"
+                        retrieved_nodes_with_score = self.query_engine.retriever.retrieve(query)
                         rag_sources = []
                         
                         # Normalize file paths for Windows compatibility
                         wanted_files_normalized = {fp.replace("\\", "/") for fp in wanted_files}
                         
-                        for node in rag_response.source_nodes:
+                        for node_with_score in retrieved_nodes_with_score: # Iterate through NodeWithScore
+                            node = node_with_score.node # Get the actual node
                             file_path = node.metadata.get("file_path", "unknown")
                             # Normalize the node's file path for comparison
                             normalized_file_path = file_path.replace("\\", "/")
@@ -619,7 +622,7 @@ Code:
                                     "file": file_path,  # Keep original path format
                                     "language": node.metadata.get("display_name", "unknown"),
                                     "description": node.metadata.get("description", "No description available"),
-                                    "content": node.text[:1000] + "..." if len(node.text) > 1000 else node.text
+                                    "content": node.text[:5000] + "..." if len(node.text) > 5000 else node.text
                                 })
                     except Exception as e:
                         print(f"Error getting RAG context for file results: {e}")
@@ -682,7 +685,7 @@ Code:
                         "file": file_path,
                         "language": node.metadata.get("display_name", "unknown"),
                         "description": node.metadata.get("description", "No description available"),
-                        "content": node.text[:1000] + "..." if len(node.text) > 1000 else node.text  # Limit content length
+                        "content": node.text[:5000] + "..." if len(node.text) > 5000 else node.text  # Increased from 1000 to 5000 for better code visibility
                     })
                     files_seen.add(file_path)
             
