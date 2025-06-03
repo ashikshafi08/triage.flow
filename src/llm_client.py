@@ -1,6 +1,7 @@
 from typing import Optional, Dict, Any, AsyncGenerator
 import httpx
 from llama_index.llms.openai import OpenAI
+from llama_index.llms.openrouter import OpenRouter
 from llama_index.core.prompts import PromptTemplate
 from .config import settings
 from .models import PromptResponse
@@ -197,60 +198,18 @@ class LLMClient:
             model=model or self.default_model
         )
 
-    async def _get_openrouter_response(self, prompt: str, model: str, system_prompt: str, dynamic_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Get response from OpenRouter API, now with dynamic_context."""
+    def _get_openrouter_llm(self, model: Optional[str] = None):
+        """Get OpenRouter LLM instance."""
         if not settings.openrouter_api_key:
             raise ValueError("OpenRouter API key is required")
-
-        headers = {
-            "Authorization": f"Bearer {settings.openrouter_api_key}",
-            "HTTP-Referer": "https://github.com/your-repo",  # Consider making this dynamic if needed
-            "X-Title": "GH Issue Prompt"
-        }
-
-        model_config = self._get_model_config(model)
         
-        messages = [{"role": "system", "content": system_prompt}]
-        
-        if dynamic_context:
-            formatted_dynamic_context_str = format_rag_context_for_llm(dynamic_context)
-            # Add formatted RAG context as a system message before the user's prompt history
-            messages.append({"role": "system", "name": "retrieved_context", "content": formatted_dynamic_context_str})
-            
-        messages.append({"role": "user", "content": prompt}) # prompt is the conversation history
-
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{settings.openrouter_base_url}/chat/completions",
-                    headers=headers,
-                    json={
-                        "model": model,
-                        "messages": messages,
-                        "max_tokens": model_config["max_tokens"],
-                        "temperature": model_config["temperature"]
-                    }
-                )
-                response.raise_for_status()
-                data = response.json()
-                
-                # Extract the response and token usage
-                return {
-                    "text": data["choices"][0]["message"]["content"],
-                    "tokens_used": data.get("usage", {}).get("total_tokens")
-                }
-        except httpx.HTTPStatusError as e:
-            error_detail = f"HTTP Status Error: {e.response.status_code} - {e.response.text}"
-            print(error_detail)
-            raise ValueError(error_detail) from e
-        except httpx.RequestError as e:
-            error_detail = f"HTTP Request Error: An error occurred while requesting {e.request.url!r} - {str(e)}"
-            print(error_detail)
-            raise ValueError(error_detail) from e
-        except Exception as e:
-            error_detail = f"Unexpected error in OpenRouter response: {str(e)}"
-            print(error_detail)
-            raise ValueError(error_detail) from e
+        model_config = self._get_model_config(model or self.default_model)
+        return OpenRouter(
+            api_key=settings.openrouter_api_key,
+            model=model or self.default_model,
+            max_tokens=model_config["max_tokens"],
+            temperature=model_config["temperature"]
+        )
 
     async def process_prompt(self, prompt: str, prompt_type: str, context: Optional[Dict[str, Any]] = None, model: Optional[str] = None) -> PromptResponse:
         try:
@@ -313,42 +272,55 @@ class LLMClient:
                 )
                 
             elif settings.llm_provider == "openrouter":
-                # Format context and check token budget for OpenRouter too
-                formatted_dynamic_context = context
+                # Format RAG context for OpenRouter (same as OpenAI approach)
+                formatted_dynamic_context_str = ""
                 if context:
-                    # Apply same token budget logic as OpenAI
-                    formatted_context_str = format_rag_context_for_llm(context)
-                    system_tokens = estimate_tokens(system_prompt)
-                    context_tokens = estimate_tokens(formatted_context_str)
-                    prompt_tokens = estimate_tokens(prompt)
-                    total_tokens = system_tokens + context_tokens + prompt_tokens
-                    
-                    if total_tokens > 15500:  # Conservative limit for 16k context
-                        print(f"Token budget exceeded ({total_tokens}), trimming context...")
-                        if context.get("sources"):
-                            sources = context["sources"]
-                            # Try reducing to fewer sources first
-                            while len(sources) > 3 and total_tokens > 15500:
-                                sources = sources[:-1]  # Remove last source
-                                temp_context = {**context, "sources": sources}
-                                temp_formatted = format_rag_context_for_llm(temp_context)
-                                total_tokens = system_tokens + estimate_tokens(temp_formatted) + prompt_tokens
-                            
-                            # If still too long, shorten content previews
-                            if total_tokens > 15500:
-                                for source in sources:
-                                    if "content" in source and len(source["content"]) > 100:
-                                        source["content"] = source["content"][:100] + "..."
-                            
-                            formatted_dynamic_context = {**context, "sources": sources}
+                    formatted_dynamic_context_str = format_rag_context_for_llm(context)
                 
-                # Pass the potentially trimmed context dictionary to _get_openrouter_response
-                response_data = await self._get_openrouter_response(prompt, model, system_prompt, dynamic_context=formatted_dynamic_context)
+                # Apply same token budget logic as OpenAI
+                system_tokens = estimate_tokens(system_prompt)
+                context_tokens = estimate_tokens(formatted_dynamic_context_str)
+                prompt_tokens = estimate_tokens(prompt)
+                total_tokens = system_tokens + context_tokens + prompt_tokens
+                
+                # If we're over the limit, trim the context
+                if total_tokens > 15500:  # Conservative limit for 16k context
+                    print(f"Token budget exceeded ({total_tokens}), trimming context...")
+                    # Reduce context by trimming sources or shortening previews
+                    if context and context.get("sources"):
+                        sources = context["sources"]
+                        # Try reducing to fewer sources first
+                        while len(sources) > 3 and total_tokens > 15500:
+                            sources = sources[:-1]  # Remove last source
+                            temp_context = {**context, "sources": sources}
+                            temp_formatted = format_rag_context_for_llm(temp_context)
+                            total_tokens = system_tokens + estimate_tokens(temp_formatted) + prompt_tokens
+                        
+                        # If still too long, shorten content previews
+                        if total_tokens > 15500:
+                            for source in sources:
+                                if "content" in source and len(source["content"]) > 100:
+                                    source["content"] = source["content"][:100] + "..."
+                            temp_context = {**context, "sources": sources}
+                            formatted_dynamic_context_str = format_rag_context_for_llm(temp_context)
+                        else:
+                            formatted_dynamic_context_str = format_rag_context_for_llm({**context, "sources": sources})
+                
+                # Prepend RAG context to the main prompt (conversation history)
+                final_prompt_for_template = f"Relevant Context:\n{formatted_dynamic_context_str}\n\nConversation History:\n{prompt}"
+
+                template = PromptTemplate(
+                    template=final_prompt_for_template, # Now includes RAG context + conversation
+                    system_prompt=system_prompt 
+                )
+                
+                llm = self._get_openrouter_llm(model)
+                response = await llm.acomplete(template.format())
+                
                 return PromptResponse(
                     status="success",
-                    prompt=response_data["text"],
-                    model_used=model,
-                    tokens_used=response_data.get("tokens_used")
+                    prompt=response.text,
+                    model_used=model
                 )
                 
             else:
@@ -365,102 +337,61 @@ class LLMClient:
             )
 
     async def stream_openrouter_response(self, prompt: str, prompt_type: str, context: Optional[Dict[str, Any]] = None, model: Optional[str] = None) -> AsyncGenerator[str, None]:
-        """Stream response from OpenRouter API."""
-        if not settings.openrouter_api_key:
-            raise ValueError("OpenRouter API key is required")
-
+        """Stream response from OpenRouter API using LlamaIndex."""
         model = model or self.default_model
         system_prompt = self.system_prompts.get(prompt_type, "")
 
-        headers = {
-            "Authorization": f"Bearer {settings.openrouter_api_key}",
-            "HTTP-Referer": "https://github.com/your-repo",
-            "X-Title": "GH Issue Prompt",
-            "Content-Type": "application/json"
-        }
-
-        model_config = self._get_model_config(model)
-        
-        messages = [{"role": "system", "content": system_prompt}]
+        # Format RAG context (same logic as non-streaming)
+        formatted_dynamic_context_str = ""
+        if context:
+            formatted_dynamic_context_str = format_rag_context_for_llm(context)
         
         # Apply token budget check for streaming too
-        if context:
-            formatted_context_str = format_rag_context_for_llm(context)
-            system_tokens = estimate_tokens(system_prompt)
-            context_tokens = estimate_tokens(formatted_context_str)
-            prompt_tokens = estimate_tokens(prompt)
-            total_tokens = system_tokens + context_tokens + prompt_tokens
-            
-            if total_tokens > 15500:  # Conservative limit for 16k context
-                print(f"Token budget exceeded ({total_tokens}), trimming context...")
-                if context.get("sources"):
-                    sources = context["sources"]
-                    # Try reducing to fewer sources first
-                    while len(sources) > 3 and total_tokens > 15500:
-                        sources = sources[:-1]  # Remove last source
-                        temp_context = {**context, "sources": sources}
-                        temp_formatted = format_rag_context_for_llm(temp_context)
-                        total_tokens = system_tokens + estimate_tokens(temp_formatted) + prompt_tokens
-                    
-                    # If still too long, shorten content previews
-                    if total_tokens > 15500:
-                        for source in sources:
-                            if "content" in source and len(source["content"]) > 100:
-                                source["content"] = source["content"][:100] + "..."
-                    
-                    context = {**context, "sources": sources}
-            
-            formatted_dynamic_context_str = format_rag_context_for_llm(context)
-            messages.append({"role": "system", "name": "retrieved_context", "content": formatted_dynamic_context_str})
-            
-        messages.append({"role": "user", "content": prompt})
+        system_tokens = estimate_tokens(system_prompt)
+        context_tokens = estimate_tokens(formatted_dynamic_context_str)
+        prompt_tokens = estimate_tokens(prompt)
+        total_tokens = system_tokens + context_tokens + prompt_tokens
+        
+        if total_tokens > 15500:  # Conservative limit for 16k context
+            print(f"Token budget exceeded ({total_tokens}), trimming context...")
+            if context and context.get("sources"):
+                sources = context["sources"]
+                # Try reducing to fewer sources first
+                while len(sources) > 3 and total_tokens > 15500:
+                    sources = sources[:-1]  # Remove last source
+                    temp_context = {**context, "sources": sources}
+                    temp_formatted = format_rag_context_for_llm(temp_context)
+                    total_tokens = system_tokens + estimate_tokens(temp_formatted) + prompt_tokens
+                
+                # If still too long, shorten content previews
+                if total_tokens > 15500:
+                    for source in sources:
+                        if "content" in source and len(source["content"]) > 100:
+                            source["content"] = source["content"][:100] + "..."
+                    temp_context = {**context, "sources": sources}
+                    formatted_dynamic_context_str = format_rag_context_for_llm(temp_context)
+                else:
+                    formatted_dynamic_context_str = format_rag_context_for_llm({**context, "sources": sources})
+        
+        # Prepend RAG context to the main prompt (conversation history)
+        final_prompt_for_template = f"Relevant Context:\n{formatted_dynamic_context_str}\n\nConversation History:\n{prompt}"
 
-        payload = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": model_config["max_tokens"],
-            "temperature": model_config["temperature"],
-            "stream": True
-        }
-
+        template = PromptTemplate(
+            template=final_prompt_for_template,
+            system_prompt=system_prompt 
+        )
+        
         try:
-            async with httpx.AsyncClient() as client:
-                async with client.stream(
-                    "POST",
-                    f"{settings.openrouter_base_url}/chat/completions",
-                    headers=headers,
-                    json=payload
-                ) as response:
-                    response.raise_for_status()
-                    
-                    async for line in response.aiter_lines():
-                        if line.startswith("data: "):
-                            data = line[6:]  # Remove "data: " prefix
-                            
-                            if data == "[DONE]":
-                                break
-                                
-                            try:
-                                json_data = json.loads(data)
-                                if "choices" in json_data and len(json_data["choices"]) > 0:
-                                    delta = json_data["choices"][0].get("delta", {})
-                                    content = delta.get("content", "")
-                                    if content:
-                                        # Format as SSE for frontend consumption
-                                        yield f"data: {json.dumps({'choices': [{'delta': {'content': content}}]})}\n\n"
-                            except json.JSONDecodeError:
-                                # Skip malformed JSON
-                                continue
-                                
-                    # Send final done message
-                    yield "data: [DONE]\n\n"
-                    
-        except httpx.HTTPStatusError as e:
-            error_msg = f"HTTP Status Error: {e.response.status_code} - {e.response.text}"
-            yield f"data: {json.dumps({'error': error_msg})}\n\n"
-        except httpx.RequestError as e:
-            error_msg = f"HTTP Request Error: {str(e)}"
-            yield f"data: {json.dumps({'error': error_msg})}\n\n"
+            llm = self._get_openrouter_llm(model)
+            response_stream = await llm.astream_complete(template.format())
+            
+            async for chunk in response_stream:
+                # Format as SSE for frontend consumption
+                yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk.delta}}]})}\n\n"
+                
+            # Send final done message
+            yield "data: [DONE]\n\n"
+            
         except Exception as e:
-            error_msg = f"Unexpected error: {str(e)}"
+            error_msg = f"Error in OpenRouter streaming: {str(e)}"
             yield f"data: {json.dumps({'error': error_msg})}\n\n"

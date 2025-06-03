@@ -56,7 +56,7 @@ async def process_issue(job_id: str, issue_url: str, prompt_type: str):
         # Configure LLM (using OpenRouter by default)
         llm_config = LLMConfig(
             provider="openrouter",
-            name="openai/o4-mini-high", 
+            name="google/gemini-2.5-flash-preview-05-20", 
 
         )
         
