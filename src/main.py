@@ -7,12 +7,14 @@ from .llm_client import LLMClient
 from .prompt_generator import PromptGenerator
 from .session_manager import SessionManager
 from .conversation_memory import ConversationContextManager
+from .cache_manager import response_cache, cleanup_caches_periodically
 from .config import settings
 import nest_asyncio
 import asyncio
 import os
 from typing import Optional
 import re
+import json
 
 # Enable nested event loops for Jupyter notebooks
 nest_asyncio.apply()
@@ -57,6 +59,7 @@ async def cleanup_sessions_periodically():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(cleanup_sessions_periodically())
+    asyncio.create_task(cleanup_caches_periodically())  # Add cache cleanup
 
 @app.get("/")
 async def root():
@@ -197,7 +200,49 @@ async def handle_chat_message(session_id: str, message: ChatMessage, stream: boo
             print("No RAG sources retrieved for this query")
         
         session_llm_config = session.get("llm_config", {})
-        model_name = session_llm_config.get("name", settings.default_model)
+        model_name = session_llm_config.name if session_llm_config and hasattr(session_llm_config, 'name') else settings.default_model
+        
+        # Query classification and caching
+        query_type = _classify_query_type(user_query)
+        use_cache = settings.ENABLE_RESPONSE_CACHING and _should_use_cached_response(query_type, user_query)
+        response_cache_key = None  # Initialize to prevent NameError
+        
+        # Generate cache key for response caching
+        if use_cache:
+            # Get repo name from RAG instance if available
+            repo_name = ""
+            if rag_instance and hasattr(rag_instance, 'repo_info'):
+                repo_name = rag_instance.repo_info.get("repo", "")
+            
+            response_cache_key = response_cache._generate_cache_key(
+                user_query, 
+                session["prompt_type"],
+                restricted_files,
+                repo_name
+            )
+            
+            # Try to get cached response
+            cached_response = await response_cache.get(response_cache_key)
+            if cached_response:
+                print(f"Response cache hit for query type: {query_type}")
+                session_manager.add_message(session_id, "assistant", cached_response)
+                
+                if stream:
+                    # Stream the cached response
+                    async def stream_cached():
+                        words = cached_response.split()
+                        for i in range(0, len(words), 3):  # Stream 3 words at a time
+                            chunk = ' '.join(words[i:i+3]) + ' '
+                            yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}\n\n"
+                            await asyncio.sleep(0.01)  # Small delay for streaming effect
+                        yield "data: [DONE]\n\n"
+                    
+                    return StreamingResponse(stream_cached(), media_type="text/event-stream")
+                else:
+                    return ChatMessage(
+                        role="assistant",
+                        content=cached_response
+                    )
 
         if stream:
             full_response_content = ""
@@ -209,9 +254,25 @@ async def handle_chat_message(session_id: str, message: ChatMessage, stream: boo
                     context=fresh_rag_context,
                     model=model_name
                 ):
-                    full_response_content += chunk
+                    # The chunk is already SSE-formatted, don't modify it
+                    # Extract content for session storage
+                    if chunk.startswith('data: '):
+                        data = chunk[6:].strip()
+                        if data and data != '[DONE]':
+                            try:
+                                json_data = json.loads(data)
+                                content = json_data.get('choices', [{}])[0].get('delta', {}).get('content', '')
+                                if content:
+                                    full_response_content += content
+                            except:
+                                pass
                     yield chunk
                 session_manager.add_message(session_id, "assistant", full_response_content)
+                
+                # Cache the response if appropriate
+                if use_cache and full_response_content and response_cache_key:
+                    await response_cache.set(response_cache_key, full_response_content, settings.CACHE_TTL_RESPONSE)
+                    print(f"Cached response for query type: {query_type}")
 
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
         else:
@@ -222,13 +283,79 @@ async def handle_chat_message(session_id: str, message: ChatMessage, stream: boo
                 model=model_name
             )
             session_manager.add_message(session_id, "assistant", llm_response.prompt)
+            
+            # Cache the response if appropriate
+            if use_cache and response_cache_key:
+                await response_cache.set(response_cache_key, llm_response.prompt, settings.CACHE_TTL_RESPONSE)
+                print(f"Cached response for query type: {query_type}")
+            
             return ChatMessage(
                 role="assistant",
                 content=llm_response.prompt
             )
         
     except Exception as e:
+        import traceback
+        error_details = f"Error in handle_chat_message: {str(e)}\nTraceback: {traceback.format_exc()}"
+        print(error_details)
         raise HTTPException(status_code=500, detail=str(e))
+
+def _classify_query_type(query: str) -> str:
+    """Classify query type for caching and optimization"""
+    query_lower = query.lower()
+    
+    # File/folder exploration queries
+    if any(pattern in query_lower for pattern in [
+        "what's in", "what is in", "show me", "list files", "list the files",
+        "which files", "what files", "folder contains", "directory contains"
+    ]):
+        return "exploration"
+    
+    # Code explanation queries
+    if any(pattern in query_lower for pattern in [
+        "explain", "what does", "how does", "what is", "describe"
+    ]):
+        return "explanation"
+    
+    # Implementation queries
+    if any(pattern in query_lower for pattern in [
+        "how to", "implement", "create", "build", "add", "modify"
+    ]):
+        return "implementation"
+    
+    # Debugging queries
+    if any(pattern in query_lower for pattern in [
+        "bug", "error", "issue", "problem", "fix", "debug", "wrong"
+    ]):
+        return "debugging"
+    
+    # Architecture queries
+    if any(pattern in query_lower for pattern in [
+        "architecture", "structure", "design", "pattern", "organized"
+    ]):
+        return "architecture"
+    
+    return "general"
+
+def _should_use_cached_response(query_type: str, query: str) -> bool:
+    """Determine if we should try to use cached response"""
+    # Always try cache for exploration queries
+    if query_type == "exploration":
+        return True
+    
+    # Cache simple explanations
+    if query_type == "explanation" and len(query.split()) < 15:
+        return True
+    
+    # Cache architecture queries (they don't change often)
+    if query_type == "architecture":
+        return True
+    
+    # Don't cache debugging or complex implementation queries
+    if query_type in ["debugging", "implementation"]:
+        return False
+    
+    return False
 
 @app.get("/sessions/{session_id}/memory-stats")
 async def get_memory_statistics(session_id: str):
@@ -433,6 +560,24 @@ async def get_tree_structure(session_id: str = Query(...)):
         return tree
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error building tree structure: {str(e)}")
+
+@app.get("/cache-stats")
+async def get_cache_statistics():
+    """Get cache statistics for monitoring performance"""
+    from .cache_manager import rag_cache, response_cache, folder_cache
+    
+    return {
+        "rag_cache": rag_cache.get_stats(),
+        "response_cache": response_cache.get_stats(),
+        "folder_cache": folder_cache.get_stats(),
+        "cache_enabled": settings.CACHE_ENABLED,
+        "feature_flags": {
+            "rag_caching": settings.ENABLE_RAG_CACHING,
+            "response_caching": settings.ENABLE_RESPONSE_CACHING,
+            "smart_sizing": settings.ENABLE_SMART_SIZING,
+            "repo_summaries": settings.ENABLE_REPO_SUMMARIES
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn

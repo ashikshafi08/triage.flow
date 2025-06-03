@@ -15,6 +15,7 @@ from .config import settings
 from .local_repo_loader import clone_repo_to_temp, clone_repo_to_temp_persistent
 from .language_config import LANGUAGE_CONFIG, get_all_extensions, get_language_metadata
 from .llm_client import LLMClient
+from .cache_manager import rag_cache, folder_cache
 import re
 import Stemmer
 from llama_index.core.query_engine import RetrieverQueryEngine
@@ -213,6 +214,7 @@ class LocalRepoContextExtractor:
         self.index = None
         self.query_engine = None
         self.repo_info = None
+        self.reranker = None  # Initialize reranker
         
         # Get all required extensions
         self.all_extensions = get_all_extensions()
@@ -548,9 +550,12 @@ Code:
 
             # Add reranker for better results - increased top_n for better recall
             reranker = LLMRerank(
-                top_n=50,  # Increased from 10 to 50
-                llm=self.llm_client._get_openai_llm()  # Use LLM from llm_client
+                top_n=10,  
+                llm=self.llm_client._get_openrouter_llm(model="google/gemini-2.5-flash-preview-05-20")  
             )
+            
+            # Store reranker for later access
+            self.reranker = reranker
             
             # Create query engine with hybrid retriever and reranker
             self.query_engine = RetrieverQueryEngine(
@@ -581,10 +586,116 @@ Code:
         except Exception as e:
             raise Exception(f"Failed to load repository: {str(e)}")
     
+    def _calculate_query_complexity(self, query: str, restrict_files: Optional[List[str]] = None) -> int:
+        """Calculate query complexity score to determine optimal retrieval depth."""
+        complexity = 0
+        
+        # Word count factor
+        word_count = len(query.split())
+        if word_count <= settings.SIMPLE_QUERY_WORD_LIMIT:
+            complexity += 1
+        elif word_count <= settings.COMPLEX_QUERY_WORD_THRESHOLD:
+            complexity += 3
+        else:
+            complexity += 5
+        
+        # File mentions (@file) add complexity
+        file_mentions = len(re.findall(r'@[\w\-/\\.]+', query))
+        complexity += file_mentions * settings.FILE_MENTION_WEIGHT
+        
+        # Folder restrictions add complexity
+        if restrict_files:
+            complexity += min(5, len(restrict_files) // 10)  # Cap at 5
+        
+        # Technical terms and patterns
+        technical_patterns = [
+            r'\b(implement|algorithm|optimize|refactor|debug|architecture)\b',
+            r'\b(class|function|method|interface|abstract)\b',
+            r'\b(async|await|promise|callback|thread|concurrent)\b',
+            r'\b(api|endpoint|route|middleware|handler)\b',
+            r'\b(bug|error|exception|issue|problem)\b'
+        ]
+        
+        for pattern in technical_patterns:
+            if re.search(pattern, query, re.IGNORECASE):
+                complexity += 2
+        
+        # Question complexity indicators
+        if any(word in query.lower() for word in ['how', 'why', 'explain', 'analyze']):
+            complexity += 3
+        
+        return complexity
+    
+    def _get_optimal_source_count(self, complexity: int) -> int:
+        """Determine optimal number of sources based on query complexity."""
+        if complexity <= 5:
+            return settings.MIN_RAG_SOURCES
+        elif complexity <= 10:
+            return settings.DEFAULT_RAG_SOURCES
+        elif complexity <= 20:
+            return 15
+        else:
+            return settings.MAX_RAG_SOURCES
+    
+    async def _generate_folder_summary(self, folder_path: str) -> Dict[str, Any]:
+        """Generate a summary for a folder (cached for performance)."""
+        cache_key = f"folder_summary_{folder_path}"
+        
+        # Try to get from cache
+        cached = await folder_cache.get(cache_key)
+        if cached:
+            return cached
+        
+        summary = {
+            "path": folder_path,
+            "file_count": 0,
+            "languages": {},
+            "key_files": [],
+            "structure": {}
+        }
+        
+        # Analyze folder structure
+        for root, dirs, files in os.walk(os.path.join(self.current_repo_path, folder_path)):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            
+            for file in files:
+                if file.startswith('.'):
+                    continue
+                
+                summary["file_count"] += 1
+                file_path = os.path.join(root, file)
+                metadata = get_language_metadata(file_path)
+                
+                lang = metadata["language"]
+                if lang != "unknown":
+                    summary["languages"][lang] = summary["languages"].get(lang, 0) + 1
+                
+                # Identify key files (configs, main files, etc.)
+                if file in ['README.md', 'package.json', 'requirements.txt', 'setup.py', 
+                           'main.py', 'index.js', 'index.ts', 'app.py', 'server.py']:
+                    rel_path = os.path.relpath(file_path, self.current_repo_path)
+                    summary["key_files"].append(rel_path)
+        
+        # Cache the summary
+        await folder_cache.set(cache_key, summary, settings.CACHE_TTL_FOLDER)
+        
+        return summary
+    
     async def get_relevant_context(self, query: str, restrict_files: Optional[List[str]] = None) -> Dict[str, Any]:
         """Get relevant context from repository for a given query. Optionally restrict to specific files."""
         if not self.query_engine:
             raise Exception("Repository not loaded. Call load_repository first.")
+        
+        # Check if caching is enabled
+        if settings.ENABLE_RAG_CACHING:
+            # Generate cache key
+            cache_key = rag_cache._generate_cache_key(query, restrict_files, self.repo_info)
+            
+            # Try to get from cache
+            cached_result = await rag_cache.get(cache_key)
+            if cached_result:
+                print(f"RAG cache hit for query: {query[:50]}...")
+                return cached_result
         
         try:
             # Check if this is a file-oriented query
@@ -595,16 +706,12 @@ Code:
                 file_results = self._search_files_by_pattern(query, restrict_files)
                 
                 if file_results:
-                    # If we found files by pattern matching, also get some context from RAG
-                    # but limit it to those files
+                  
                     file_paths = [f["file"] for f in file_results[:10]]  # Top 10 files
                     wanted_files = set(file_paths)
                     
                     try:
-                        # Get RAG context restricted to these files
-                        # Retrieve nodes directly from the retriever to bypass reranker/synthesis from query_engine
-                        # The similarity_top_k for sub-retrievers (BM25, dense) are set at their initialization.
-                        # This aligns with the intent "# Skip reranker for speed"
+                  
                         retrieved_nodes_with_score = self.query_engine.retriever.retrieve(query)
                         rag_sources = []
                         
@@ -652,29 +759,63 @@ Code:
                             combined_sources.append(rag_source)
                             seen_files.add(file_path)
                     
-                    return {
+                    result = {
                         "response": f"Found {len(file_results)} files matching your query. Here are the most relevant files:",
                         "sources": combined_sources,
                         "repo_info": self.repo_info,
                         "search_type": "file_oriented"
                     }
+                    
+                    # Cache the result
+                    if settings.ENABLE_RAG_CACHING:
+                        await rag_cache.set(cache_key, result, settings.CACHE_TTL_RAG)
+                    
+                    return result
                 else:
                     # No file pattern matches found - return clear message
-                    return {
+                    result = {
                         "response": "No files matched your query pattern. The search looked for file names, paths, and extensions but found no matches.",
                         "sources": [],
                         "repo_info": self.repo_info,
                         "search_type": "file_oriented_no_match"
                     }
+                    
+                    # Cache even empty results to avoid repeated searches
+                    if settings.ENABLE_RAG_CACHING:
+                        await rag_cache.set(cache_key, result, settings.CACHE_TTL_RAG // 2)  # Shorter TTL for empty results
+                    
+                    return result
             
-            # Regular RAG search (original logic)
+            # Regular RAG search with smart sizing
+            complexity = self._calculate_query_complexity(query, restrict_files)
+            optimal_source_count = self._get_optimal_source_count(complexity)
+            
+            print(f"Query complexity: {complexity}, using {optimal_source_count} sources")
+            
+            # Temporarily adjust retriever settings if smart sizing is enabled
+            if settings.ENABLE_SMART_SIZING:
+                # Store original settings
+                original_dense_top_k = self.index.as_retriever().similarity_top_k
+                original_reranker_top_n = self.reranker.top_n if hasattr(self, 'reranker') else 10
+                
+                # Apply smart sizing
+                self.index.as_retriever().similarity_top_k = optimal_source_count * 2  # Get more initially
+                if hasattr(self, 'reranker'):
+                    self.reranker.top_n = optimal_source_count
+            
             response = self.query_engine.query(query)
+            
+            # Restore original settings if we changed them
+            if settings.ENABLE_SMART_SIZING:
+                self.index.as_retriever().similarity_top_k = original_dense_top_k
+                if hasattr(self, 'reranker'):
+                    self.reranker.top_n = original_reranker_top_n
 
             # Extract relevant information with accurate file paths and deduplicate by file
             files_seen = set()
             deduped_sources = []
             
-            for node in response.source_nodes:
+            for node in response.source_nodes[:optimal_source_count]:  # Limit to optimal count
                 file_path = node.metadata.get("file_path", "unknown")
                 # If restrict_files is set, only include those files
                 if restrict_files and file_path not in restrict_files:
@@ -693,8 +834,14 @@ Code:
                 "response": str(response),
                 "sources": deduped_sources,  # Use deduplicated sources
                 "repo_info": self.repo_info,
-                "search_type": "regular"
+                "search_type": "regular",
+                "complexity": complexity,
+                "optimal_source_count": optimal_source_count
             }
+            
+            # Cache the result
+            if settings.ENABLE_RAG_CACHING:
+                await rag_cache.set(cache_key, context, settings.CACHE_TTL_RAG)
             
             return context
             

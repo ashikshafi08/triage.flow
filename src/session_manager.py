@@ -1,37 +1,42 @@
+from uuid import UUID
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
-from .new_rag import LocalRepoContextExtractor
-from .prompt_generator import PromptGenerator
+from typing import Dict, Optional
 from .github_client import GitHubIssueClient
-from .models import IssueResponse, LLMConfig # Added LLMConfig
-import shutil
-import os
+from .new_rag import LocalRepoContextExtractor
+from .repo_summarizer import RepositorySummarizer
+from .config import settings
+from .models import Issue, IssueComment  # Import the models
+import asyncio
 
 class SessionManager:
     def __init__(self):
         self.sessions: Dict[str, Dict] = {}
+        self.github_client = GitHubIssueClient()
         
-    def create_session(self, issue_url: str, prompt_type: str, llm_config: LLMConfig) -> str: # Added llm_config parameter
-        """Create a new session with initial context"""
+    def create_session(self, issue_url: str, prompt_type: str, llm_config: Optional[Dict] = None) -> str:
+        """Create a new session with issue data"""
         session_id = str(uuid.uuid4())
         
-        # Initialize session data
         self.sessions[session_id] = {
-            "created_at": datetime.now(),
-            "last_accessed": datetime.now(),
+            "id": session_id,
             "issue_url": issue_url,
             "prompt_type": prompt_type,
-            "llm_config": llm_config.model_dump(), # Store llm_config as dict
+            "llm_config": llm_config,  # Store LLM config in session
+            "created_at": datetime.now(),
+            "last_accessed": datetime.now(),
             "conversation_history": [],
-            "repo_context": None,
             "issue_data": None,
-            "rag_instance": None # Added rag_instance
+            "repo_context": None,
+            "repo_overview": None,  # Add repo overview
+            "rag_instance": None,
+            "repo_path": None  # Store repo path for file access
         }
+        
         return session_id
 
     def get_session(self, session_id: str) -> Optional[Dict]:
-        """Retrieve session data and update last accessed time"""
+        """Get session by ID and update last accessed time"""
         session = self.sessions.get(session_id)
         if session:
             session["last_accessed"] = datetime.now()
@@ -44,58 +49,78 @@ class SessionManager:
             self.sessions[session_id]["last_accessed"] = datetime.now()
             
     async def initialize_session_context(self, session_id: str):
-        """Load repo context and issue data for a session"""
-        session = self.get_session(session_id)
-        if not session or session["repo_context"]:
+        """Initialize session with issue data and repository context"""
+        session = self.sessions.get(session_id)
+        if not session:
             return
+        
+        # Fetch issue data using the async method
+        issue_response = await self.github_client.get_issue(session["issue_url"])
+        if issue_response.status != "success" or not issue_response.data:
+            raise Exception(f"Failed to fetch issue: {issue_response.error}")
             
-        try:
-            # Extract repo info from URL
-            url_parts = session["issue_url"].split('/')
-            owner = url_parts[3]
-            repo = url_parts[4]
-            repo_url = f"https://github.com/{owner}/{repo}.git"
+        # Store the Issue object directly, not a dictionary
+        session["issue_data"] = issue_response.data
+        
+        # Get repository info from the issue data
+        issue_info = self.github_client._extract_issue_info(session["issue_url"])
+        if not issue_info:
+            raise Exception("Invalid GitHub issue URL")
             
-            # Load repository context
-            rag = LocalRepoContextExtractor()
-            await rag.load_repository(repo_url)
-            
-            github_client = GitHubIssueClient()
-            issue_data = await github_client.get_issue(session["issue_url"])
-            
-            if isinstance(issue_data, IssueResponse) and issue_data.status == "success":
-                context = await rag.get_issue_context(
-                    issue_data.data.title,
-                    issue_data.data.body
-                )
-                repo_path = rag.repo_info.get("repo_path")
-                self.update_session(session_id, {
-                    "repo_context": context,
-                    "issue_data": issue_data.data,
-                    "rag_instance": rag, # Store the RAG instance
-                    "repo_path": repo_path # Store the repo path for file listing
-                })
-        except Exception as e:
-            print(f"Error initializing session context: {e}")
+        owner, repo, _ = issue_info
+        repo_url = f"https://github.com/{owner}/{repo}.git"
+        branch = "main"  # Default branch assumption
+        
+        # Initialize RAG for repository context
+        rag = LocalRepoContextExtractor()
+        
+        # Load repository
+        await rag.load_repository(repo_url, branch)
+        session["rag_instance"] = rag
+        session["repo_path"] = rag.current_repo_path  # Store the repo path
+        
+        # Generate repository overview if enabled
+        if settings.ENABLE_REPO_SUMMARIES:
+            try:
+                summarizer = RepositorySummarizer(rag.current_repo_path)
+                overview = await summarizer.generate_repo_overview()
+                session["repo_overview"] = overview
+                print(f"Generated repo overview: {overview['total_files']} files, {len(overview['languages'])} languages")
+            except Exception as e:
+                print(f"Failed to generate repo overview: {e}")
+                session["repo_overview"] = None
+        
+        # Get initial context
+        issue_context = await rag.get_issue_context(
+            issue_response.data.title,
+            issue_response.data.body or ""
+        )
+        session["repo_context"] = issue_context
+        
+        self.sessions[session_id] = session
 
     def add_message(self, session_id: str, role: str, content: str):
-        """Add a message to conversation history"""
-        session = self.get_session(session_id)
+        """Add a message to session conversation history"""
+        session = self.sessions.get(session_id)
         if session:
             session["conversation_history"].append({
                 "role": role,
                 "content": content,
-                "timestamp": datetime.now()
+                "timestamp": datetime.now().isoformat()
             })
-            
-    def cleanup_sessions(self, max_age_minutes: int = 60):
-        """Remove inactive sessions and delete their temp repo dirs"""
-        now = datetime.now()
-        expired = [sid for sid, session in self.sessions.items() 
-                  if (now - session["last_accessed"]) > timedelta(minutes=max_age_minutes)]
-        for sid in expired:
-            session = self.sessions[sid]
-            repo_path = session.get("repo_path")
-            if repo_path and os.path.exists(repo_path):
-                shutil.rmtree(repo_path, ignore_errors=True)
-            del self.sessions[sid]
+            session["last_accessed"] = datetime.now()
+
+    def cleanup_sessions(self, max_age_hours: int = 24):
+        """Remove sessions older than max_age_hours"""
+        cutoff_time = datetime.now() - timedelta(hours=max_age_hours)
+        sessions_to_remove = []
+        
+        for session_id, session in self.sessions.items():
+            if session["last_accessed"] < cutoff_time:
+                sessions_to_remove.append(session_id)
+        
+        for session_id in sessions_to_remove:
+            del self.sessions[session_id]
+        
+        if sessions_to_remove:
+            print(f"Cleaned up {len(sessions_to_remove)} old sessions")

@@ -12,7 +12,9 @@ class GitHubIssueClient:
             raise ValueError("GitHub token is required. Please set GITHUB_TOKEN in your .env file.")
         self.token = settings.github_token
         self.cache: Dict[str, Dict[str, Any]] = {}
-        self.cache_duration = timedelta(minutes=settings.cache_duration_minutes)
+        self.cache_duration = timedelta(minutes=30)  # Default 30 minutes cache
+        self.max_retries = 3  # Default 3 retries
+        self.backoff_factor = 2  # Default exponential backoff factor
         self.headers = {
             "Authorization": f"token {self.token}",
             "Accept": "application/vnd.github.v3+json"
@@ -52,11 +54,11 @@ class GitHubIssueClient:
                     if response.status == 200:
                         comments = await response.json()
                         return [
-                            {
-                                "body": c["body"],
-                                "user": c["user"]["login"] if "user" in c and c["user"] else "",
-                                "created_at": c["created_at"]
-                            }
+                            IssueComment(
+                                body=c["body"],
+                                user=c["user"]["login"] if "user" in c and c["user"] else "",
+                                created_at=datetime.fromisoformat(c["created_at"].replace('Z', '+00:00'))
+                            )
                             for c in comments
                         ]
                     else:
@@ -86,7 +88,7 @@ class GitHubIssueClient:
 
         owner, repo, issue_number = issue_info
         
-        for attempt in range(settings.max_retries):
+        for attempt in range(self.max_retries):
             try:
                 async with aiohttp.ClientSession() as session:
                     # Get issue details
@@ -100,32 +102,64 @@ class GitHubIssueClient:
                         response.raise_for_status()
                         issue_data = await response.json()
                         
-                        # Fetch comments
+                        # Fetch comments as IssueComment objects
                         comments = await self._fetch_issue_comments(owner, repo, issue_number)
                         
-                        result = {
-                            "number": issue_number,
-                            "title": issue_data['title'],
-                            "body": issue_data['body'],
-                            "state": issue_data['state'],
-                            "created_at": issue_data['created_at'],
-                            "url": issue_url,
-                            "labels": [label['name'] for label in issue_data.get('labels', [])],
-                            "assignees": [assignee['login'] for assignee in issue_data.get('assignees', [])],
-                            "comments": comments
-                        }
+                        # Create Issue object directly
+                        issue = Issue(
+                            number=issue_number,
+                            title=issue_data['title'],
+                            body=issue_data['body'] or "",  # Ensure body is never None
+                            state=issue_data['state'],
+                            created_at=datetime.fromisoformat(issue_data['created_at'].replace('Z', '+00:00')),
+                            url=issue_url,
+                            labels=[label['name'] for label in issue_data.get('labels', [])],
+                            assignees=[assignee['login'] for assignee in issue_data.get('assignees', [])],
+                            comments=comments
+                        )
                         
-                        # Cache the successful result
-                        self._cache_issue(issue_url, result)
-                        return IssueResponse(status="success", data=Issue(**result))
+                        # Cache the successful result (as dict for caching)
+                        self._cache_issue(issue_url, issue.model_dump())
+                        return IssueResponse(status="success", data=issue)
                 
             except Exception as e:
-                if attempt == settings.max_retries - 1:
+                if attempt == self.max_retries - 1:
                     return IssueResponse(
                         status="error",
-                        error=f"Failed to fetch issue after {settings.max_retries} attempts: {str(e)}"
+                        error=f"Failed to fetch issue after {self.max_retries} attempts: {str(e)}"
                     )
                 # Exponential backoff
-                await asyncio.sleep(settings.backoff_factor ** attempt)
+                await asyncio.sleep(self.backoff_factor ** attempt)
         
-        return IssueResponse(status="error", error="Unknown error occurred") 
+        return IssueResponse(status="error", error="Unknown error occurred")
+    
+    def get_issue_data(self, issue_url: str) -> Dict[str, Any]:
+        """
+        Synchronous wrapper to get issue data as a dictionary.
+        Used by session_manager for backward compatibility.
+        """
+        # Run the async method in a new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            response = loop.run_until_complete(self.get_issue(issue_url))
+            if response.status == "success" and response.data:
+                # Convert Issue model to dict and add repository info
+                issue_dict = response.data.model_dump()
+                
+                # Extract repository info from URL
+                issue_info = self._extract_issue_info(issue_url)
+                if issue_info:
+                    owner, repo, _ = issue_info
+                    issue_dict["repository"] = {
+                        "owner": {"login": owner},
+                        "name": repo,
+                        "clone_url": f"https://github.com/{owner}/{repo}.git",
+                        "default_branch": "main"  # Default assumption
+                    }
+                
+                return issue_dict
+            else:
+                raise Exception(f"Failed to fetch issue: {response.error}")
+        finally:
+            loop.close() 
