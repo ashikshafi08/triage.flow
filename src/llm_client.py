@@ -177,8 +177,22 @@ class LLMClient:
         }
 
     def _get_model_config(self, model: str) -> Dict[str, Any]:
-        """Get model-specific configuration."""
-        return settings.model_configs.get(model, settings.model_configs[self.default_model])
+        """Get model configuration with fallback for unknown models"""
+        # Try to get the specific model config
+        if model in settings.model_configs:
+            return settings.model_configs[model]
+        
+        # Try to get the default model config
+        if self.default_model in settings.model_configs:
+            return settings.model_configs[self.default_model]
+        
+        # Fallback: create a reasonable default config
+        print(f"Warning: No configuration found for model '{model}', using default config")
+        return {
+            "max_tokens": 4096,
+            "temperature": 0.7,
+            "context_window": 32000  # Reasonable default
+        }
 
     def _get_openai_llm(self, model: Optional[str] = None):
         """Get OpenAI LLM instance."""

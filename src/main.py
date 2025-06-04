@@ -12,13 +12,26 @@ from .config import settings
 import nest_asyncio
 import asyncio
 import os
-from typing import Optional
+from typing import Optional, Dict
 import re
 import json
 from datetime import datetime
+import time
+import logging
+import git
+from git import Repo
+import tempfile
+import shutil
+from pathlib import Path
+from .new_rag import LocalRepoContextExtractor
+from .agentic_tools import AgenticCodebaseExplorer
 
 # Enable nested event loops for Jupyter notebooks
 nest_asyncio.apply()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="GH Issue Prompt",
@@ -44,6 +57,9 @@ llm_client = LLMClient()
 prompt_generator = PromptGenerator()
 session_manager = SessionManager()
 conversation_memory = ConversationContextManager(max_context_tokens=8000)
+
+# Global storage for agentic explorers (in production, use proper session management)
+agentic_explorers: Dict[str, AgenticCodebaseExplorer] = {}
 
 # Background task to clean up old sessions
 async def cleanup_sessions_periodically():
@@ -107,11 +123,39 @@ async def create_session(request: PromptRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/sessions/{session_id}/messages", response_model=ChatMessage)
-async def handle_chat_message(session_id: str, message: ChatMessage, stream: bool = Query(False)):
+async def handle_chat_message(
+    session_id: str, 
+    message: ChatMessage, 
+    stream: bool = Query(False),
+    agentic: bool = Query(False, description="Use agentic system for deeper analysis")
+):
+    """Enhanced message handler with automatic agentic capabilities when beneficial"""
     try:
         session = session_manager.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Auto-enable agentic capabilities for the session if not already enabled
+        if not session.get("agentic_enabled", False):
+            repo_path = session.get("repo_path")
+            if repo_path:
+                try:
+                    agentic_explorer = AgenticCodebaseExplorer(session_id, repo_path)
+                    agentic_explorers[session_id] = agentic_explorer
+                    session["agentic_enabled"] = True
+                    logger.info(f"Auto-enabled agentic capabilities for session {session_id}")
+                except Exception as e:
+                    logger.warning(f"Could not enable agentic capabilities: {e}")
+        
+        # Determine if this query would benefit from agentic capabilities
+        should_use_agentic = agentic or _should_use_agentic_approach(message.content)
+        
+        # If agentic mode is beneficial and available, use it
+        if should_use_agentic and session.get("agentic_enabled", False) and session_id in agentic_explorers:
+            logger.info(f"Using agentic system for query: {message.content[:100]}...")
+            return await agentic_query(session_id, message, stream)
+        
+        # Otherwise, use the enhanced RAG system
         session_manager.add_message(session_id, "user", message.content)
         history = session.get("conversation_history", [])
         user_query = message.content
@@ -346,6 +390,53 @@ def _should_use_cached_response(query_type: str, query: str) -> bool:
     # Don't cache debugging or complex implementation queries
     if query_type in ["debugging", "implementation"]:
         return False
+    
+    return False
+
+def _should_use_agentic_approach(query: str) -> bool:
+    """Determine if a query would benefit from agentic capabilities"""
+    query_lower = query.lower()
+    
+    # Agentic approach is beneficial for:
+    # 1. Complex exploration queries
+    agentic_patterns = [
+        "explore", "analyze", "find all", "search for", "what files", "which files",
+        "how does", "explain how", "trace", "follow", "investigate", "deep dive",
+        "architecture", "structure", "relationship", "dependency", "related to",
+        "implement", "build", "create", "example", "show me how",
+        "debug", "troubleshoot", "fix", "error", "issue", "problem"
+    ]
+    
+    # 2. Multi-step reasoning queries
+    multi_step_indicators = [
+        "step by step", "walk through", "process", "flow", "sequence",
+        "first", "then", "next", "finally", "overall"
+    ]
+    
+    # 3. Comprehensive analysis queries (but be more selective)
+    comprehensive_indicators = [
+        "comprehensive", "complete", "full", "entire", "everything",
+        "overview", "summary", "breakdown", "detailed"
+    ]
+    
+    # Check if query contains agentic patterns
+    if any(pattern in query_lower for pattern in agentic_patterns):
+        return True
+    
+    # Check for multi-step reasoning
+    if any(indicator in query_lower for indicator in multi_step_indicators):
+        return True
+    
+    # Only use agentic for comprehensive analysis if it's also specific
+    if any(indicator in query_lower for indicator in comprehensive_indicators):
+        # If it's comprehensive AND specific (mentions files, directories, etc.), use agentic
+        specific_terms = ["file", "directory", "folder", "class", "function", "module", "component"]
+        if any(term in query_lower for term in specific_terms):
+            return True
+    
+    # Long queries (>15 words) might benefit from agentic approach, but be more conservative
+    if len(query.split()) > 15 and any(pattern in query_lower for pattern in agentic_patterns):
+        return True
     
     return False
 
@@ -667,42 +758,166 @@ async def get_session_metadata(session_id: str):
 
 @app.get("/assistant/sessions/{session_id}/messages")
 async def get_session_messages(session_id: str):
-    """Get conversation history for a session"""
-    session = session_manager.get_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    conversation_history = session.get("conversation_history", [])
-    
-    # Convert timestamps to proper format for frontend
-    formatted_history = []
-    for msg in conversation_history:
-        formatted_msg = {
-            "role": msg["role"],
-            "content": msg["content"]
+    try:
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        conversation_history = session.get("conversation_history", [])
+        
+        return {
+            "session_id": session_id,
+            "messages": conversation_history,
+            "total_messages": len(conversation_history)
         }
-        # Handle timestamp conversion
-        if "timestamp" in msg:
-            if isinstance(msg["timestamp"], str):
-                # If it's a string, parse it to datetime then to timestamp
-                try:
-                    dt = datetime.fromisoformat(msg["timestamp"].replace('Z', '+00:00'))
-                    formatted_msg["timestamp"] = int(dt.timestamp() * 1000)  # Convert to milliseconds
-                except:
-                    formatted_msg["timestamp"] = int(datetime.now().timestamp() * 1000)
-            else:
-                # If it's already a datetime or timestamp
-                formatted_msg["timestamp"] = int(msg["timestamp"] * 1000) if msg["timestamp"] < 1e10 else msg["timestamp"]
-        else:
-            formatted_msg["timestamp"] = int(datetime.now().timestamp() * 1000)
+        
+    except Exception as e:
+        logger.error(f"Error retrieving session messages: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================================
+# AGENTIC SYSTEM ENDPOINTS
+# ============================================================================
+
+@app.post("/assistant/sessions/{session_id}/enable-agentic")
+async def enable_agentic_mode(session_id: str):
+    """Enable agentic capabilities for a session"""
+    try:
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        repo_path = session.get("repo_path")
+        if not repo_path:
+            raise HTTPException(status_code=400, detail="No repository path found for session")
+        
+        # Initialize agentic explorer for this session
+        agentic_explorer = AgenticCodebaseExplorer(session_id, repo_path)
+        agentic_explorers[session_id] = agentic_explorer
+        
+        # Mark session as agentic-enabled
+        session["agentic_enabled"] = True
+        
+        return {
+            "session_id": session_id,
+            "agentic_enabled": True,
+            "tools_available": [
+                "explore_directory",
+                "search_codebase", 
+                "read_file",
+                "analyze_file_structure",
+                "rag_query",
+                "find_related_files"
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"Error enabling agentic mode: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/assistant/sessions/{session_id}/agentic-status")
+async def get_agentic_status(session_id: str):
+    """Check if agentic mode is enabled for a session"""
+    try:
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        is_agentic = session.get("agentic_enabled", False)
+        has_explorer = session_id in agentic_explorers
+        
+        return {
+            "session_id": session_id,
+            "agentic_enabled": is_agentic,
+            "explorer_initialized": has_explorer,
+            "tools_available": [
+                "explore_directory",
+                "search_codebase", 
+                "read_file",
+                "analyze_file_structure",
+                "rag_query",
+                "find_related_files"
+            ] if is_agentic else []
+        }
+        
+    except Exception as e:
+        logger.error(f"Error checking agentic status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/assistant/sessions/{session_id}/agentic-query")
+async def agentic_query(
+    session_id: str, 
+    message: ChatMessage,
+    stream: bool = Query(False)
+):
+    """Process a query using the agentic system"""
+    try:
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        if not session.get("agentic_enabled", False):
+            raise HTTPException(status_code=400, detail="Agentic mode not enabled for this session")
+        
+        if session_id not in agentic_explorers:
+            raise HTTPException(status_code=400, detail="Agentic explorer not initialized")
+        
+        explorer = agentic_explorers[session_id]
+        
+        # Add user message to session history
+        session_manager.add_message(session_id, "user", message.content)
+        
+        # Process query with agentic system
+        if stream:
+            # For now, agentic queries don't support streaming (would need more complex implementation)
+            response = await explorer.query(message.content)
             
-        formatted_history.append(formatted_msg)
-    
-    return {
-        "session_id": session_id,
-        "messages": formatted_history,
-        "total": len(formatted_history)
-    }
+            async def stream_agentic_response():
+                # Simulate streaming by yielding chunks
+                words = response.split()
+                for i in range(0, len(words), 5):  # Yield 5 words at a time
+                    chunk = " ".join(words[i:i+5])
+                    if i + 5 < len(words):
+                        chunk += " "
+                    yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}\n\n"
+                    await asyncio.sleep(0.1)  # Small delay for streaming effect
+                yield "data: [DONE]\n\n"
+            
+            return StreamingResponse(
+                stream_agentic_response(),
+                media_type="text/plain",
+                headers={"Cache-Control": "no-cache"}
+            )
+        else:
+            response = await explorer.query(message.content)
+            
+            # Add assistant response to session history
+            session_manager.add_message(session_id, "assistant", response)
+            
+            return ChatMessage(role="assistant", content=response)
+        
+    except Exception as e:
+        logger.error(f"Error processing agentic query: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/assistant/sessions/{session_id}/reset-agentic-memory")
+async def reset_agentic_memory(session_id: str):
+    """Reset the agentic system's memory for a session"""
+    try:
+        if session_id not in agentic_explorers:
+            raise HTTPException(status_code=404, detail="Agentic explorer not found")
+        
+        explorer = agentic_explorers[session_id]
+        explorer.reset_memory()
+        
+        return {
+            "session_id": session_id,
+            "memory_reset": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Error resetting agentic memory: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     
     # LLM Configuration
     llm_provider: str = os.getenv("LLM_PROVIDER", "openrouter")  # "openai" or "openrouter"
-    default_model: str = os.getenv("DEFAULT_MODEL", "anthropic/claude-3.5-sonnet")
+    default_model: str = os.getenv("DEFAULT_MODEL", "google/gemini-2.5-flash-preview-05-20")
     
     # Model configurations
     model_configs: Dict[str, Any] = {
@@ -36,6 +36,11 @@ class Settings(BaseSettings):
             "max_tokens": 4096,
             "temperature": 0.7,
             "context_window": 200000
+        },
+        "google/gemini-2.5-flash-preview-05-20": {
+            "max_tokens": 8192,
+            "temperature": 0.7,
+            "context_window": 1000000  # Gemini 2.5 Flash has 1M context window
         },
         "meta-llama/llama-3.1-70b-instruct": {
             "max_tokens": 4096,
@@ -77,6 +82,9 @@ class Settings(BaseSettings):
     
     # Prompt Caching Configuration
     PROMPT_CACHE_MIN_TOKENS: int = int(os.getenv("PROMPT_CACHE_MIN_TOKENS", "1000"))  # Minimum tokens to enable caching
+    
+    # Agentic System Configuration
+    AGENTIC_MAX_ITERATIONS: int = int(os.getenv("AGENTIC_MAX_ITERATIONS", "10"))  # Maximum steps for agentic exploration
     
     class Config:
         env_file = ".env"
