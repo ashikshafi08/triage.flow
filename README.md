@@ -5,7 +5,7 @@
 # triage.flow
 
 <p align="center">
-  <b>AI-Powered Interactive GitHub Repository Analysis with Advanced Chat Interface</b><br>
+  <b>Agentic AI-Powered Interactive GitHub Repository Analysis with Advanced Chat Interface</b><br>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License"></a>
   <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.8%2B-blue.svg" alt="Python"></a>
   <a href="https://reactjs.org"><img src="https://img.shields.io/badge/React-18%2B-blue.svg" alt="React"></a>
@@ -15,14 +15,18 @@
 
 ## 🚀 What is triage.flow?
 
-A modern, web-based AI assistant that helps you **understand, analyze, and explore entire GitHub repositories** through an interactive chat interface. Get deep, code-aware insights with beautiful presentation, smart context retrieval, and cost-optimized AI interactions.
+A modern, web-based **agentic AI assistant** that helps you **understand, analyze, and explore entire GitHub repositories** through an interactive chat interface. Powered by **ReAct (Reasoning + Acting) agents** that autonomously use tools, reason through complex problems, and provide deep, code-aware insights with beautiful presentation, smart context retrieval, and cost-optimized AI interactions.
 
 ### ✨ Key Highlights
 
-- **🎯 Interactive Repository Chat** - ChatGPT-style conversation with full repository context
+- **🤖 Agentic AI System** - ReAct agents that think, plan, and use tools autonomously to solve complex coding questions
+- **🧠 Real-time Reasoning** - Watch the AI think through problems with live Thought/Action/Observation streaming
+- **🛠️ Autonomous Tool Usage** - AI independently explores files, searches code, and analyzes patterns across your repository
+- **🎯 Interactive Repository Chat** - ChatGPT-style conversation with full repository context and agent reasoning
 - **🌲 Smart Codebase Explorer** - High-performance file picker with search and tree navigation  
 - **📋 Enhanced Markdown** - Context-aware emojis, file linking, and professional formatting
-- **📎 Smart File & Folder Mentions** - Use `@filename.py` or `@folder/path` to reference specific files/folders
+- **📎 Smart File & Folder Mentions** - Use `@filename.py` or `@folder/path` with autocomplete to reference specific files/folders
+- **👀 Integrated File Viewer** - Side-by-side file viewing pane with syntax highlighting and quick actions
 - **⚡ Real-time Streaming** - Live AI responses with typing indicators and cost optimization
 - **🎨 Modern UI/UX** - Professional, responsive interface with session management
 - **🔍 Advanced RAG System** - Smart context sizing with 10-25 sources from indexed repositories
@@ -30,13 +34,41 @@ A modern, web-based AI assistant that helps you **understand, analyze, and explo
 
 ---
 
+## 🤖 Agentic AI Capabilities
+
+Our system uses **ReAct (Reasoning + Acting) agents** that don't just answer questions - they autonomously reason through complex problems and take actions to solve them:
+
+### 🧠 Autonomous Reasoning
+- **Multi-step problem solving** - Breaks down complex questions into logical steps
+- **Dynamic tool selection** - Chooses the right tools for each task automatically
+- **Context-aware decisions** - Adapts approach based on repository structure and user intent
+- **Self-correction** - Re-evaluates and adjusts when initial approaches don't work
+
+### 🛠️ Intelligent Tool Usage
+- **File exploration** - Autonomously navigates and examines repository structure
+- **Smart code search** - Semantically searches across files for relevant patterns
+- **Pattern analysis** - Identifies architectural patterns and relationships
+- **Code generation** - Creates context-aware examples based on existing codebase patterns
+
+### 📊 Real-time Transparency
+- **Live reasoning display** - See exactly how the AI thinks through problems
+- **Tool execution tracking** - Watch as tools are selected and executed
+- **Step-by-step breakdown** - Understand the agent's decision-making process
+- **Interactive feedback** - Agent adapts based on your responses and clarifications
+
+---
+
 ## 🎨 Interface Features
 
 | Feature | Description |
 |---------|-------------|
+| **Real-time Agent Reasoning** | Live display of Thought/Action/Observation cycles as the AI works |
 | **Context-Aware Headers** | Headers automatically get relevant emojis (🐛 for bugs, 🔧 for fixes, etc.) |
 | **Smart Bullet Points** | List items get contextual icons (❌ for errors, ✅ for success, 💡 for tips) |
 | **File Cross-linking** | Automatic detection and highlighting of referenced files |
+| **@-Mention Autocomplete** | Type `@` to get intelligent file/folder suggestions with fuzzy search |
+| **Integrated File Viewer** | Click any file in the tree to view it in a side pane with syntax highlighting |
+| **Agentic Step Visualization** | Beautiful UI for displaying AI reasoning steps with type-specific styling |
 | **Numbered Step Badges** | Visual badges for step-by-step instructions |
 | **Professional Code Blocks** | VS Code theme with copy buttons and language detection |
 | **Enhanced Blockquotes** | Important notes with lightbulb indicators |
@@ -57,7 +89,43 @@ A modern, web-based AI assistant that helps you **understand, analyze, and explo
 
 ---
 
+## 🏗️ Agentic Architecture
+
+### ReAct Agent Framework
+- **LlamaIndex-powered agents** with autonomous tool selection
+- **Multi-step reasoning** with self-correction capabilities  
+- **Real-time streaming** of thought processes and tool executions
+- **Context-aware memory** that remembers previous interactions and reasoning chains
+
+### Intelligent Tool Ecosystem
+- **`explore_directory`** - Autonomous file system navigation with metadata
+- **`search_codebase`** - Semantic code search across entire repositories
+- **`read_file`** - Smart file reading with size optimization
+- **`analyze_file_structure`** - Deep structural analysis and pattern recognition
+- **`find_related_files`** - Relationship discovery through imports and naming
+- **`semantic_content_search`** - AI-powered content understanding
+- **`generate_code_example`** - Context-aware code generation from repository patterns
+
+### Live Reasoning Visualization
+The UI provides real-time insight into the agent's decision-making:
+- 🧠 **Purple Thought bubbles** - Shows reasoning and planning
+- ⚡ **Blue Action blocks** - Displays tool selection and parameters  
+- 👁️ **Green Observation panels** - Shows tool execution results
+- 💬 **Teal Answer sections** - Final synthesized responses
+- ⚠️ **Status indicators** - Real-time processing updates
+
+---
+
 ## 🚀 Quick Start
+
+1. **Clone and setup** the repository
+2. **Start the backend** with repository indexing
+3. **Launch the frontend** for the chat interface
+4. **Create a new session** by entering any GitHub repo URL
+5. **Watch the AI agent** clone, index, and analyze the repository
+6. **Ask complex questions** and watch the agent reason through solutions step-by-step
+7. **Use @-mentions** for specific file context and explore with the file tree
+8. **Observe real-time reasoning** as the agent explores, searches, and synthesizes answers
 
 ### 1. Backend Setup
 
@@ -122,29 +190,43 @@ ENABLE_ASYNC_RAG=true
 3. Wait for repository cloning and indexing (progress shown)
 4. Start chatting with the AI about the codebase
 5. Use the sidebar to explore files and folders
-6. Mention files with `@filename.py` or folders with `@folder/subfolder`
+6. **Click any file** in the tree to open it in the integrated viewer pane
+7. **Type `@`** in the chat for intelligent file/folder autocomplete
+8. Mention files with `@filename.py` or folders with `@folder/subfolder`
 
 ---
 
-## 💬 How to Use the Chat Interface
+## 💬 How to Use the Agentic Chat Interface
 
-### Repository Analysis Commands
-- **Overview**: "What is this repository about?"
-- **Architecture**: "Explain the project structure"
-- **Code exploration**: "Show me the main components"
-- **Debugging**: "Help me understand this error in @file.py"
-- **Implementation**: "How does the authentication work?"
+### Agentic Repository Analysis Commands
+- **Overview**: "What is this repository about?" - *Agent explores structure, reads key files, analyzes patterns*
+- **Architecture**: "Explain the project structure" - *Agent navigates directories, examines relationships*
+- **Code exploration**: "Show me the main components" - *Agent searches, categorizes, and explains findings*
+- **Debugging**: "Help me understand this error in @file.py" - *Agent reads file, searches for related code, analyzes context*
+- **Implementation**: "How does the authentication work?" - *Agent searches auth patterns, traces code flow*
+
+### Watch the AI Think
+- **Thought steps** show the agent's reasoning process
+- **Action steps** display which tools the agent chooses to use
+- **Observation steps** show the results of tool execution
+- **Answer steps** provide the final synthesized response
 
 ### Smart Context Features
 - **File references**: "Look at @config.py for the settings"
 - **Folder exploration**: "What's in @folder/src/components?"
 - **Multi-file analysis**: "Compare @file1.js and @file2.js"
 - **Complex queries**: "Find all database-related files and explain the schema"
+- **Autocomplete suggestions**: Type `@` to see file/folder suggestions with fuzzy search
+- **Integrated file viewing**: Click files in the explorer to view them alongside chat
 
 ### Pro Tips
 - Use **@** for file autocomplete (optimized for large repos)
+- **Arrow keys** navigate autocomplete suggestions, **Enter/Tab** to select
+- **Ask complex questions** - the agent will break them down automatically
+- **Watch the reasoning** - each step shows how the AI approaches your problem
 - **Folder mentions** automatically include all files in context
-- The AI **remembers conversation history** across session reloads
+- **File viewer pane** opens when clicking files in the explorer tree
+- The AI **remembers conversation history** and previous reasoning
 - **Query complexity** automatically adjusts context size (10-25 sources)
 - **Prompt caching** reduces costs for repetitive repository questions
 
@@ -214,6 +296,8 @@ ENABLE_ASYNC_RAG=true
 - **Multiple repository sessions** - work with different repos simultaneously
 - **Real-time status** - repository cloning and indexing progress
 - **Advanced file picker** - search, folders, and performance optimization
+- **@-mention autocomplete** - intelligent file/folder suggestions with keyboard navigation
+- **Integrated file viewer** - side-by-side code viewing with syntax highlighting and actions
 - **Responsive chat interface** - mobile-friendly with typing indicators
 
 ### Enterprise-Ready Features
@@ -253,8 +337,6 @@ ENABLE_ASYNC_RAG=true
 - [ ] **Integration with IDEs** - VS Code extension for seamless workflow
 - [ ] **Team collaboration** - Shared sessions and annotations
 - [ ] **Export functionality** - Save conversations and insights
-- [ ] **Custom AI models** - Fine-tuned models for specific domains
-- [ ] **API documentation** - Interactive API explorer and docs
 
 ---
 
@@ -268,27 +350,6 @@ We love contributions! Here's how to get started:
 4. **Push** to the branch (`git push origin feature/amazing-feature`)
 5. **Open** a Pull Request
 
-### Development Setup
-```bash
-# Backend development with hot reload
-cd triage.flow
-python -m uvicorn src.main:app --reload --port 8000
-
-# Frontend development with Vite
-cd issue-flow-ai-prompt
-npm run dev
-
-# Monitor performance and caching
-curl http://localhost:8000/cache-stats
-```
-
-### Key Development Areas
-- **RAG improvements** - Better context selection and ranking
-- **UI/UX enhancements** - More intuitive file navigation
-- **Performance optimization** - Faster indexing and response times
-- **Cost optimization** - Better prompt caching strategies
-- **New AI providers** - Support for additional model providers
-
 ---
 
 ## 📄 License
@@ -301,8 +362,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - Built with [React](https://reactjs.org) and [FastAPI](https://fastapi.tiangolo.com)
 - UI components from [shadcn/ui](https://ui.shadcn.com)
-- Icons by [Lucide](https://lucide.dev)
 - AI providers: [OpenAI](https://openai.com) and [OpenRouter](https://openrouter.ai)
 - Vector search powered by [FAISS](https://github.com/facebookresearch/faiss)
 - Code parsing via [tree-sitter](https://tree-sitter.github.io/)
-- Syntax highlighting by [react-syntax-highlighter](https://github.com/react-syntax-highlighter/react-syntax-highlighter)
