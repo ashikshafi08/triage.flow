@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     PROMPT_CACHE_MIN_TOKENS: int = int(os.getenv("PROMPT_CACHE_MIN_TOKENS", "1000"))  # Minimum tokens to enable caching
     
     # Agentic System Configuration
-    AGENTIC_MAX_ITERATIONS: int = int(os.getenv("AGENTIC_MAX_ITERATIONS", "10"))  # Maximum steps for agentic exploration
+    AGENTIC_MAX_ITERATIONS: int = int(os.getenv("AGENTIC_MAX_ITERATIONS", "30"))  # Maximum steps for agentic exploration
     
     class Config:
         env_file = ".env"

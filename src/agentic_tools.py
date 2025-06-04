@@ -9,6 +9,9 @@ import asyncio
 from typing import List, Dict, Any, Optional, Annotated
 from pathlib import Path
 import logging
+import io
+import sys
+import contextlib
 
 from llama_index.core.tools import FunctionTool
 from llama_index.core.agent import ReActAgent
@@ -20,6 +23,21 @@ from llama_index.llms.openai import OpenAI
 from .config import settings
 
 logger = logging.getLogger(__name__)
+
+@contextlib.contextmanager
+def capture_output():
+    """Capture stdout and stderr during execution"""
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    try:
+        sys.stdout = stdout_buffer
+        sys.stderr = stderr_buffer
+        yield stdout_buffer, stderr_buffer
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
 
 class AgenticCodebaseExplorer:
     """
@@ -1002,67 +1020,155 @@ fun main() {{
             logger.error(f"Error extracting patterns: {e}")
             return {}
     
+    def _parse_react_steps(self, raw_response: str):
+        """Parse ReAct steps from raw agent response"""
+        logger.info(f"[DEBUG] Parsing raw response length: {len(raw_response)}")
+        logger.info(f"[DEBUG] Raw response first 500 chars: {raw_response[:500]}")
+        
+        steps = []
+        current_type = None
+        current_content = []
+        
+        for line in raw_response.split('\n'):
+            line_lower = line.strip().lower()
+            
+            # Check for ReAct control tokens
+            if line_lower.startswith('thought:'):
+                if current_type and current_content:
+                    steps.append({
+                        "type": current_type, 
+                        "content": "\n".join(current_content).strip(),
+                        "step": len(steps)
+                    })
+                current_type = "thought"
+                current_content = [line.split(':', 1)[1].strip() if ':' in line else line]
+                logger.info(f"[DEBUG] Found Thought step")
+                
+            elif line_lower.startswith('action:'):
+                if current_type and current_content:
+                    steps.append({
+                        "type": current_type, 
+                        "content": "\n".join(current_content).strip(),
+                        "step": len(steps)
+                    })
+                current_type = "action"
+                current_content = [line.split(':', 1)[1].strip() if ':' in line else line]
+                logger.info(f"[DEBUG] Found Action step")
+                
+            elif line_lower.startswith('observation:'):
+                if current_type and current_content:
+                    steps.append({
+                        "type": current_type, 
+                        "content": "\n".join(current_content).strip(),
+                        "step": len(steps)
+                    })
+                current_type = "observation" 
+                current_content = [line.split(':', 1)[1].strip() if ':' in line else line]
+                logger.info(f"[DEBUG] Found Observation step")
+                
+            elif line_lower.startswith('answer:'):
+                if current_type and current_content:
+                    steps.append({
+                        "type": current_type, 
+                        "content": "\n".join(current_content).strip(),
+                        "step": len(steps)
+                    })
+                current_type = "answer"
+                current_content = [line.split(':', 1)[1].strip() if ':' in line else line]
+                logger.info(f"[DEBUG] Found Answer step")
+                
+            else:
+                # Continue accumulating content for current step
+                if current_content is not None:
+                    current_content.append(line)
+        
+        # Add final step if present
+        if current_type and current_content:
+            steps.append({
+                "type": current_type, 
+                "content": "\n".join(current_content).strip(),
+                "step": len(steps)
+            })
+        
+        # Extract final answer from the last answer step
+        final_answer = None
+        for step in reversed(steps):
+            if step["type"] == "answer":
+                final_answer = step["content"]
+                break
+        
+        logger.info(f"[DEBUG] Parsed {len(steps)} steps, final_answer: {final_answer[:100] if final_answer else 'None'}")
+        return steps, final_answer
+
+    def _format_agentic_response(self, steps, final_answer=None, partial=False, suggestions=None):
+        """Format agentic output as structured JSON for the frontend UI."""
+        return json.dumps({
+            "type": "final",
+            "steps": steps,
+            "final_answer": final_answer,
+            "partial": partial,
+            "suggestions": suggestions or []
+        })
+
     async def query(self, user_message: str) -> str:
-        """Main query method that uses the agent to respond"""
+        """Main query method that uses the agent to respond (now returns structured output)."""
         try:
             logger.info(f"Starting agentic analysis: {user_message[:100]}...")
             
-            # Use the ReAct agent to process the query
-            response = await self.agent.achat(user_message)
+            # Capture the verbose output during agent execution
+            with capture_output() as (stdout_buffer, stderr_buffer):
+                response = await self.agent.achat(user_message)
             
             logger.info(f"Agentic analysis completed successfully")
             
-            # Extract clean final answer from ReAct agent response
-            response_text = str(response)
+            # Get the captured verbose output which contains the full ReAct trace
+            captured_output = stdout_buffer.getvalue()
+            if not captured_output.strip():
+                captured_output = stderr_buffer.getvalue()
             
-            # Clean up the response to remove ReAct framework artifacts
-            cleaned_response = self._extract_clean_answer(response_text)
+            # Clean the captured output to remove logging noise
+            captured_output = self._clean_captured_output(captured_output)
             
-            return cleaned_response
+            logger.info(f"[DEBUG] Captured output length: {len(captured_output)}")
+            logger.info(f"[DEBUG] Captured output first 500 chars: {captured_output[:500]}")
             
+            # Use captured output if it contains ReAct steps, otherwise fallback to response
+            if "Thought:" in captured_output or "Action:" in captured_output:
+                full_react_trace = captured_output
+                logger.info(f"[DEBUG] Using captured output for ReAct trace")
+            else:
+                # Fallback to agent memory approach
+                chat_history = self.agent.memory.get_all()
+                logger.info(f"[DEBUG] Agent memory has {len(chat_history)} messages")
+                
+                full_react_trace = ""
+                for msg in reversed(chat_history):
+                    if hasattr(msg, 'role') and msg.role.value == "assistant":
+                        full_react_trace = msg.content
+                        break
+                
+                if not full_react_trace:
+                    full_react_trace = str(response)
+                logger.info(f"[DEBUG] Using agent memory/response for ReAct trace")
+            
+            logger.info(f"[DEBUG] Full ReAct trace length: {len(full_react_trace)}")
+            logger.info(f"[DEBUG] Full ReAct trace first 500 chars: {full_react_trace[:500]}")
+            
+            # Parse steps from the full ReAct trace
+            steps, final_answer = self._parse_react_steps(full_react_trace)
+            
+            # Extract suggestions from cleaned response 
+            cleaned_response = self._extract_clean_answer(str(response))
+            suggestions = []
+            if "Would you like me to" in cleaned_response:
+                suggestions = [s.strip("* ") for s in cleaned_response.split("\n") if s.strip().startswith("* ")]
+
+            return self._format_agentic_response(steps, final_answer, partial=False, suggestions=suggestions)
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Error in agentic query: {error_msg}")
-            
-            # If it's a max iterations error, provide natural continuation instead of exposing limits
-            if "max iterations" in error_msg.lower() or "reached max iterations" in error_msg.lower():
-                logger.info("Converting iteration limit to natural continuation prompt")
-                
-                # Try to extract what was accomplished from memory
-                try:
-                    chat_history = self.memory.get_all()
-                    
-                    if chat_history:
-                        # Get the last meaningful response
-                        assistant_messages = [msg for msg in chat_history if hasattr(msg, 'role') and msg.role == 'assistant']
-                        
-                        if assistant_messages and len(assistant_messages) > 0:
-                            last_response = assistant_messages[-1].content
-                            
-                            # Clean and return partial results with natural continuation
-                            cleaned_partial = self._extract_clean_answer(last_response)
-                            
-                            return f"""{cleaned_partial}
-
----
-
-**I've made good progress exploring your codebase! Would you like me to:**
-
-🔍 **Dive deeper** into specific files or modules  
-📁 **Explore** a particular directory in more detail  
-🏗️ **Analyze** the architecture and relationships  
-💡 **Explain** how specific components work  
-
-*Just ask about what interests you most, and I'll focus my analysis there.*"""
-                
-                except Exception as memory_error:
-                    logger.error(f"Error accessing agent memory: {memory_error}")
-                
-                # Fallback - provide natural exploration suggestions
-                return self._get_natural_exploration_suggestions(user_message)
-            
-            # For other errors, provide helpful guidance without technical details
-            return self._get_natural_error_recovery(user_message, error_msg)
+            # Fallback: return partial/structured error
+            return self._format_agentic_response([], final_answer=None, partial=True, suggestions=["Try a more specific question", "Explore a directory", "Ask about a file"])
     
     def _extract_clean_answer(self, raw_response: str) -> str:
         """Extract clean final answer from ReAct agent response"""
@@ -1219,4 +1325,155 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
     
     def reset_memory(self):
         """Reset the agent's memory"""
-        self.memory.reset() 
+        self.memory.reset()
+
+    async def stream_query(self, user_message: str):
+        """Async generator that streams agentic steps as JSON lines for real-time UI updates."""
+        try:
+            logger.info(f"[stream] Starting agentic analysis: {user_message[:100]}...")
+            
+            # Yield initial status
+            yield json.dumps({
+                "type": "status",
+                "content": "Starting analysis...",
+                "step": 0
+            })
+            
+            # Capture the verbose output during agent execution
+            with capture_output() as (stdout_buffer, stderr_buffer):
+                response = await self.agent.achat(user_message)
+            
+            logger.info(f"[stream] Agentic analysis completed successfully")
+            
+            # Get the captured verbose output which contains the full ReAct trace
+            captured_output = stdout_buffer.getvalue()
+            if not captured_output.strip():
+                captured_output = stderr_buffer.getvalue()
+            
+            # Clean the captured output to remove logging noise
+            captured_output = self._clean_captured_output(captured_output)
+            
+            logger.info(f"[DEBUG] Captured output length: {len(captured_output)}")
+            logger.info(f"[DEBUG] Captured output first 500 chars: {captured_output[:500]}")
+            
+            # Use captured output if it contains ReAct steps, otherwise fallback to response
+            if "Thought:" in captured_output or "Action:" in captured_output:
+                full_react_trace = captured_output
+                logger.info(f"[DEBUG] Using captured output for ReAct trace")
+            else:
+                # Fallback to agent memory approach
+                chat_history = self.agent.memory.get_all()
+                logger.info(f"[DEBUG] Agent memory has {len(chat_history)} messages")
+                
+                full_react_trace = ""
+                for msg in reversed(chat_history):
+                    if hasattr(msg, 'role') and msg.role.value == "assistant":
+                        full_react_trace = msg.content
+                        break
+                
+                if not full_react_trace:
+                    full_react_trace = str(response)
+                logger.info(f"[DEBUG] Using agent memory/response for ReAct trace")
+            
+            logger.info(f"[DEBUG] Full ReAct trace length: {len(full_react_trace)}")
+            logger.info(f"[DEBUG] Full ReAct trace first 500 chars: {full_react_trace[:500]}")
+            
+            # Parse steps from the full ReAct trace
+            steps, final_answer = self._parse_react_steps(full_react_trace)
+            logger.info(f"[DEBUG] About to yield {len(steps)} steps")
+            
+            # Yield each step incrementally
+            for i, step in enumerate(steps):
+                logger.info(f"[DEBUG] Yielding step {i}: type={step['type']}, content_len={len(step['content'])}")
+                yield json.dumps({"type": "step", "step": step})
+                await asyncio.sleep(0.01)  # Small delay for streaming effect
+            
+            # Extract suggestions from cleaned response
+            cleaned_response = self._extract_clean_answer(str(response))
+            suggestions = []
+            if "Would you like me to" in cleaned_response:
+                suggestions = [s.strip("* ") for s in cleaned_response.split("\n") if s.strip().startswith("* ")]
+
+            # Yield a final event with all steps, final answer, and suggestions
+            final_payload = {
+                "type": "final",
+                "final": True,
+                "steps": steps,
+                "final_answer": final_answer,
+                "partial": False,
+                "suggestions": suggestions or [],
+                "total_steps": len(steps)
+            }
+            logger.info(f"[DEBUG] Yielding final payload with {len(steps)} steps and final_answer: {bool(final_answer)}")
+            yield json.dumps(final_payload)
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"[stream] Error in agentic stream_query: {error_msg}")
+            # Yield a structured error/partial result
+            yield json.dumps({
+                "type": "error",
+                "final": True,
+                "steps": [],
+                "final_answer": None,
+                "partial": True,
+                "suggestions": ["Try a more specific question", "Explore a directory", "Ask about a file"],
+                "error": error_msg
+            }) 
+
+    def _clean_captured_output(self, captured_output: str) -> str:
+        """Clean captured output to only include ReAct steps"""
+        if not captured_output:
+            return ""
+        
+        lines = captured_output.split('\n')
+        cleaned_lines = []
+        in_react_block = False
+        
+        for line in lines:
+            line = line.strip()
+            
+            # Skip empty lines
+            if not line:
+                continue
+            
+            # Skip common logging/debug patterns
+            skip_patterns = [
+                'Running step',
+                'Step input:',
+                'INFO:httpx:',
+                'HTTP Request:',
+                'DEBUG:',
+                'INFO:',
+                'WARNING:',
+                'ERROR:',
+                'Step new_user_msg produced event',
+                'Step prepare_chat_history produced event',
+                'Step handle_llm_input produced event'
+            ]
+            
+            # Check if this line should be skipped
+            should_skip = False
+            for pattern in skip_patterns:
+                if pattern in line:
+                    should_skip = True
+                    break
+            
+            if should_skip:
+                continue
+            
+            # Include ReAct control tokens and their content
+            if any(token in line for token in ['Thought:', 'Action:', 'Action Input:', 'Observation:', 'Answer:']):
+                in_react_block = True
+                cleaned_lines.append(line)
+            elif in_react_block and line and not line.startswith('>'):
+                # Continue capturing content that's part of the ReAct block
+                cleaned_lines.append(line)
+            elif line.startswith('Response:'):
+                # End of ReAct block
+                in_react_block = False
+                cleaned_lines.append(line)
+            elif in_react_block:
+                # Include other content while in ReAct block
+                cleaned_lines.append(line)
+        
+        return '\n'.join(cleaned_lines) 

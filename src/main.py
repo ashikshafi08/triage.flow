@@ -869,31 +869,73 @@ async def agentic_query(
         
         # Process query with agentic system
         if stream:
-            # For now, agentic queries don't support streaming (would need more complex implementation)
-            response = await explorer.query(message.content)
-            
-            async def stream_agentic_response():
-                # Simulate streaming by yielding chunks
-                words = response.split()
-                for i in range(0, len(words), 5):  # Yield 5 words at a time
-                    chunk = " ".join(words[i:i+5])
-                    if i + 5 < len(words):
-                        chunk += " "
-                    yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}\n\n"
-                    await asyncio.sleep(0.1)  # Small delay for streaming effect
-                yield "data: [DONE]\n\n"
-            
-            return StreamingResponse(
-                stream_agentic_response(),
-                media_type="text/plain",
-                headers={"Cache-Control": "no-cache"}
+            # We need to collect all steps and the final answer during streaming, then save them at the end
+            steps = []
+            final_answer = None
+            partial = None
+            suggestions = None
+            error = None
+            async def stream_agentic_steps():
+                nonlocal steps, final_answer, partial, suggestions, error
+                try:
+                    async for step_json in explorer.stream_query(message.content):
+                        # Add proper SSE formatting
+                        yield f"data: {step_json}\n\n"
+                        # Parse and collect agentic output
+                        try:
+                            parsed = json.loads(step_json)
+                            if parsed.get("type") == "step" and parsed.get("step"):
+                                steps.append(parsed["step"])
+                            elif parsed.get("type") == "final":
+                                final_answer = parsed.get("final_answer")
+                                partial = parsed.get("partial")
+                                suggestions = parsed.get("suggestions")
+                                if parsed.get("steps"):
+                                    steps = parsed["steps"]
+                            elif parsed.get("type") == "error":
+                                error = parsed.get("error")
+                        except Exception:
+                            pass
+                    yield "data: [DONE]\n\n"
+                except Exception as e:
+                    # Send error as SSE event
+                    error_json = json.dumps({
+                        "type": "error",
+                        "error": str(e),
+                        "final": True
+                    })
+                    yield f"data: {error_json}\n\n"
+                    yield "data: [DONE]\n\n"
+            response = StreamingResponse(
+                stream_agentic_steps(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"  # Disable proxy buffering
+                }
             )
+            # After streaming, save the agentic output to history
+            # (FastAPI doesn't support post-stream hooks, so we use a background task)
+            async def save_agentic_message():
+                # Wait a moment to ensure streaming is done
+                await asyncio.sleep(0.1)
+                session_manager.add_message(
+                    session_id,
+                    "assistant",
+                    content="",  # Don't duplicate fallback
+                    steps=steps if steps else None,
+                    final_answer=final_answer,
+                    partial=partial,
+                    suggestions=suggestions,
+                    error=error
+                )
+            asyncio.create_task(save_agentic_message())
+            return response
         else:
             response = await explorer.query(message.content)
-            
             # Add assistant response to session history
             session_manager.add_message(session_id, "assistant", response)
-            
             return ChatMessage(role="assistant", content=response)
         
     except Exception as e:

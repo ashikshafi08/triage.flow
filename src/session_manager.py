@@ -213,15 +213,18 @@ class SessionManager:
         del self.sessions[session_id]
         return True
     
-    def add_message(self, session_id: str, role: str, content: str) -> None:
-        """Add a message to the conversation history"""
+    def add_message(self, session_id: str, role: str, content: str = "", **kwargs) -> None:
+        """Add a message to the conversation history, supporting extra fields."""
         session = self.sessions.get(session_id)
         if session:
-            session["conversation_history"].append({
+            message = {
                 "role": role,
                 "content": content,
                 "timestamp": datetime.now().isoformat()
-            })
+            }
+            # Add any extra fields (steps, final_answer, etc.)
+            message.update(kwargs)
+            session["conversation_history"].append(message)
             session["last_accessed"] = datetime.now()
     
     def cleanup_sessions(self) -> None:
