@@ -51,3 +51,21 @@ class ChatMessage(BaseModel):
 class SessionResponse(BaseModel):
     session_id: str
     initial_message: str
+
+class RepoRequest(BaseModel):
+    """Request model for creating repository-only chat sessions"""
+    repo_url: str = Field(..., description="GitHub repository URL")
+    initial_file: Optional[str] = Field(None, description="Initial file to focus on")
+    session_name: Optional[str] = Field(None, description="Custom session name")
+
+class RepoSessionResponse(BaseModel):
+    """Response model for repository session creation"""
+    session_id: str
+    repo_metadata: Dict[str, Any]
+    status: str
+    message: Optional[str] = None
+
+class SessionListResponse(BaseModel):
+    """Response model for listing user sessions"""
+    sessions: List[Dict[str, Any]]
+    total: int

@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from .models import PromptRequest, PromptResponse, ChatMessage, SessionResponse
+from .models import PromptRequest, PromptResponse, ChatMessage, SessionResponse, RepoRequest, RepoSessionResponse, SessionListResponse
 from .github_client import GitHubIssueClient
 from .llm_client import LLMClient
 from .prompt_generator import PromptGenerator
@@ -15,6 +15,7 @@ import os
 from typing import Optional
 import re
 import json
+from datetime import datetime
 
 # Enable nested event loops for Jupyter notebooks
 nest_asyncio.apply()
@@ -577,6 +578,132 @@ async def get_cache_statistics():
             "smart_sizing": settings.ENABLE_SMART_SIZING,
             "repo_summaries": settings.ENABLE_REPO_SUMMARIES
         }
+    }
+
+@app.post("/assistant/sessions", response_model=RepoSessionResponse)
+async def create_assistant_session(request: RepoRequest):
+    """Create a new repository-only chat session"""
+    try:
+        # Validate repository URL
+        if not request.repo_url.startswith(('https://github.com/', 'http://github.com/')):
+            raise HTTPException(status_code=400, detail="Invalid repository URL. Must be a GitHub repository.")
+        
+        # Create new repo session
+        session_id, metadata = session_manager.create_repo_session(
+            request.repo_url,
+            request.initial_file,
+            request.session_name
+        )
+        
+        # Initialize repository context in background
+        background_task = asyncio.create_task(session_manager.initialize_repo_session(session_id))
+        
+        # Wait a bit for initial status update
+        await asyncio.sleep(0.5)
+        
+        # Get updated session
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=500, detail="Failed to create session")
+        
+        return RepoSessionResponse(
+            session_id=session_id,
+            repo_metadata=session["metadata"],
+            status=session["metadata"]["status"],
+            message="Repository session created. Cloning and indexing in progress..."
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/assistant/sessions", response_model=SessionListResponse)
+async def list_assistant_sessions(session_type: Optional[str] = Query(None)):
+    """List all assistant sessions"""
+    try:
+        sessions = session_manager.list_sessions(session_type)
+        return SessionListResponse(
+            sessions=sessions,
+            total=len(sessions)
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/assistant/sessions/{session_id}/status")
+async def get_session_status(session_id: str):
+    """Get the current status of a repository session"""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    return {
+        "session_id": session_id,
+        "status": session.get("metadata", {}).get("status", "unknown"),
+        "error": session.get("metadata", {}).get("error"),
+        "repo_info": session.get("repo_context", {}).get("repo_info") if session.get("repo_context") else None
+    }
+
+@app.delete("/assistant/sessions/{session_id}")
+async def delete_assistant_session(session_id: str):
+    """Delete an assistant session and clean up resources"""
+    if session_manager.delete_session(session_id):
+        return {"message": "Session deleted successfully"}
+    else:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+@app.get("/assistant/sessions/{session_id}/metadata")
+async def get_session_metadata(session_id: str):
+    """Get detailed metadata about a session"""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    return {
+        "session_id": session_id,
+        "type": session.get("type"),
+        "created_at": session["created_at"].isoformat(),
+        "last_accessed": session["last_accessed"].isoformat(),
+        "metadata": session.get("metadata", {}),
+        "message_count": len(session.get("conversation_history", [])),
+        "repo_info": session.get("repo_context", {}).get("repo_info") if session.get("repo_context") else None
+    }
+
+@app.get("/assistant/sessions/{session_id}/messages")
+async def get_session_messages(session_id: str):
+    """Get conversation history for a session"""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    conversation_history = session.get("conversation_history", [])
+    
+    # Convert timestamps to proper format for frontend
+    formatted_history = []
+    for msg in conversation_history:
+        formatted_msg = {
+            "role": msg["role"],
+            "content": msg["content"]
+        }
+        # Handle timestamp conversion
+        if "timestamp" in msg:
+            if isinstance(msg["timestamp"], str):
+                # If it's a string, parse it to datetime then to timestamp
+                try:
+                    dt = datetime.fromisoformat(msg["timestamp"].replace('Z', '+00:00'))
+                    formatted_msg["timestamp"] = int(dt.timestamp() * 1000)  # Convert to milliseconds
+                except:
+                    formatted_msg["timestamp"] = int(datetime.now().timestamp() * 1000)
+            else:
+                # If it's already a datetime or timestamp
+                formatted_msg["timestamp"] = int(msg["timestamp"] * 1000) if msg["timestamp"] < 1e10 else msg["timestamp"]
+        else:
+            formatted_msg["timestamp"] = int(datetime.now().timestamp() * 1000)
+            
+        formatted_history.append(formatted_msg)
+    
+    return {
+        "session_id": session_id,
+        "messages": formatted_history,
+        "total": len(formatted_history)
     }
 
 if __name__ == "__main__":
