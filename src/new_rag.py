@@ -607,6 +607,17 @@ Code:
         if restrict_files:
             complexity += min(5, len(restrict_files) // 10)  # Cap at 5
         
+        # Repository overview questions need more sources
+        overview_patterns = [
+            r'\b(what is this|what does this do|tell me about|overview|summary|introduce|explain this)\b',
+            r'\b(repo|repository|project|codebase)\b',
+            r'\b(never worked|new to|unfamiliar|first time)\b'
+        ]
+        
+        for pattern in overview_patterns:
+            if re.search(pattern, query, re.IGNORECASE):
+                complexity += 5  # Boost overview questions significantly
+        
         # Technical terms and patterns
         technical_patterns = [
             r'\b(implement|algorithm|optimize|refactor|debug|architecture)\b',

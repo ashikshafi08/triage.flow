@@ -60,9 +60,9 @@ class Settings(BaseSettings):
     ENABLE_ASYNC_RAG: bool = os.getenv("ENABLE_ASYNC_RAG", "true").lower() == "true"
     
     # Smart Sizing Configuration
-    MIN_RAG_SOURCES: int = int(os.getenv("MIN_RAG_SOURCES", "3"))
+    MIN_RAG_SOURCES: int = int(os.getenv("MIN_RAG_SOURCES", "10"))
     MAX_RAG_SOURCES: int = int(os.getenv("MAX_RAG_SOURCES", "25"))
-    DEFAULT_RAG_SOURCES: int = int(os.getenv("DEFAULT_RAG_SOURCES", "10"))
+    DEFAULT_RAG_SOURCES: int = int(os.getenv("DEFAULT_RAG_SOURCES", "15"))
     
     # Query Complexity Thresholds
     SIMPLE_QUERY_WORD_LIMIT: int = int(os.getenv("SIMPLE_QUERY_WORD_LIMIT", "10"))
