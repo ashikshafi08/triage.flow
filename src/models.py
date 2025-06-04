@@ -47,6 +47,7 @@ class PromptResponse(BaseModel):
 class ChatMessage(BaseModel):
     role: str  # "system", "user", or "assistant"
     content: str
+    context_files: Optional[List[str]] = Field(None, description="List of file paths mentioned in the message")
 
 class SessionResponse(BaseModel):
     session_id: str

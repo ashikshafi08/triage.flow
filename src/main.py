@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.background import BackgroundTasks
 from .models import PromptRequest, PromptResponse, ChatMessage, SessionResponse, RepoRequest, RepoSessionResponse, SessionListResponse
 from .github_client import GitHubIssueClient
 from .llm_client import LLMClient
@@ -12,7 +13,7 @@ from .config import settings
 import nest_asyncio
 import asyncio
 import os
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 import re
 import json
 from datetime import datetime
@@ -850,62 +851,87 @@ async def agentic_query(
     message: ChatMessage,
     stream: bool = Query(False)
 ):
-    """Process a query using the agentic system"""
     try:
-        session = session_manager.get_session(session_id)
-        if not session:
+        session_info = session_manager.get_session(session_id)
+        if not session_info:
             raise HTTPException(status_code=404, detail="Session not found")
         
-        if not session.get("agentic_enabled", False):
-            raise HTTPException(status_code=400, detail="Agentic mode not enabled for this session")
+        repo_path = session_info["repo_path"]
         
-        if session_id not in agentic_explorers:
-            raise HTTPException(status_code=400, detail="Agentic explorer not initialized")
+        # Initialize agentic explorer
+        explorer = AgenticCodebaseExplorer(session_id, repo_path)
         
-        explorer = agentic_explorers[session_id]
+        # Extract context files from the message content
+        context_files = []
+        if message.context_files:
+            context_files = message.context_files
+        else:
+            # Extract from message content using regex
+            import re
+            mention_pattern = r'@(?:folder\/)?([^\s@]+)'
+            matches = re.findall(mention_pattern, message.content)
+            context_files = matches
         
+        logger.info(f"Agentic query with context files: {context_files}")
+        
+        # Shared data structure for streaming and background save
+        shared_data = {
+            "steps": [],
+            "final_answer": None,
+            "partial": False,
+            "suggestions": [],
+            "error": None
+        }
+
         # Add user message to session history
         session_manager.add_message(session_id, "user", message.content)
-        
-        # Process query with agentic system
+
         if stream:
-            # We need to collect all steps and the final answer during streaming, then save them at the end
-            steps = []
-            final_answer = None
-            partial = None
-            suggestions = None
-            error = None
             async def stream_agentic_steps():
-                nonlocal steps, final_answer, partial, suggestions, error
                 try:
-                    async for step_json in explorer.stream_query(message.content):
+                    # Pass context files to the explorer
+                    query_with_context = message.content
+                    if context_files:
+                        # Add context files information to the query
+                        files_context = f"\n\nContext files mentioned: {', '.join(context_files)}"
+                        query_with_context = message.content + files_context
+                    
+                    async for step_json in explorer.stream_query(query_with_context):
                         # Add proper SSE formatting
                         yield f"data: {step_json}\n\n"
-                        # Parse and collect agentic output
+                        # Parse and collect agentic output for background save
                         try:
                             parsed = json.loads(step_json)
+                            logger.info(f"[DEBUG] Parsed streaming chunk: {parsed.get('type')} - {len(str(parsed))}")
+                            
                             if parsed.get("type") == "step" and parsed.get("step"):
-                                steps.append(parsed["step"])
+                                shared_data["steps"].append(parsed["step"])
+                                logger.info(f"[DEBUG] Added step: {parsed['step']['type']} - Total steps: {len(shared_data['steps'])}")
                             elif parsed.get("type") == "final":
-                                final_answer = parsed.get("final_answer")
-                                partial = parsed.get("partial")
-                                suggestions = parsed.get("suggestions")
-                                if parsed.get("steps"):
-                                    steps = parsed["steps"]
+                                shared_data["steps"] = parsed.get("steps", shared_data["steps"])
+                                shared_data["final_answer"] = parsed.get("final_answer")
+                                shared_data["partial"] = parsed.get("partial", False)
+                                shared_data["suggestions"] = parsed.get("suggestions", [])
+                                logger.info(f"[DEBUG] Final chunk - Answer: {bool(shared_data['final_answer'])}, Steps: {len(shared_data['steps'])}")
                             elif parsed.get("type") == "error":
-                                error = parsed.get("error")
-                        except Exception:
-                            pass
-                    yield "data: [DONE]\n\n"
+                                shared_data["error"] = parsed.get("error")
+                                shared_data["partial"] = True
+                                
+                        except json.JSONDecodeError as e:
+                            logger.error(f"[DEBUG] Failed to parse streaming chunk: {e}")
+                            continue
+                        except Exception as e:
+                            logger.error(f"[DEBUG] Error processing streaming chunk: {e}")
+                            continue
+
+                    logger.info(f"[DEBUG] Streaming completed - Final answer: {bool(shared_data['final_answer'])}, Steps: {len(shared_data['steps'])}")
+
                 except Exception as e:
-                    # Send error as SSE event
-                    error_json = json.dumps({
-                        "type": "error",
-                        "error": str(e),
-                        "final": True
-                    })
-                    yield f"data: {error_json}\n\n"
-                    yield "data: [DONE]\n\n"
+                    logger.error(f"Error in agentic streaming: {e}")
+                    shared_data["error"] = str(e)
+                    shared_data["partial"] = True
+                    yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
             response = StreamingResponse(
                 stream_agentic_steps(),
                 media_type="text/event-stream",
@@ -915,29 +941,114 @@ async def agentic_query(
                     "X-Accel-Buffering": "no"  # Disable proxy buffering
                 }
             )
+            
             # After streaming, save the agentic output to history
-            # (FastAPI doesn't support post-stream hooks, so we use a background task)
             async def save_agentic_message():
-                # Wait a moment to ensure streaming is done
-                await asyncio.sleep(0.1)
-                session_manager.add_message(
-                    session_id,
-                    "assistant",
-                    content="",  # Don't duplicate fallback
-                    steps=steps if steps else None,
-                    final_answer=final_answer,
-                    partial=partial,
-                    suggestions=suggestions,
-                    error=error
-                )
-            asyncio.create_task(save_agentic_message())
+                # Wait longer to ensure streaming is completely done
+                await asyncio.sleep(1.0)  # Increased wait time
+                
+                logger.info(f"[DEBUG] Saving agentic message - Steps: {len(shared_data['steps'])}, Final answer: {bool(shared_data['final_answer'])}")
+                
+                # Extract meaningful content from the shared data
+                content = None
+                
+                # First priority: use final_answer if available
+                if shared_data["final_answer"] and shared_data["final_answer"].strip():
+                    content = shared_data["final_answer"]
+                    logger.info(f"[DEBUG] Using final_answer as content")
+                
+                # Second priority: extract from the last answer step
+                elif shared_data["steps"]:
+                    for step in reversed(shared_data["steps"]):
+                        if step.get('type') == 'answer' and step.get('content') and step.get('content').strip():
+                            content = step['content']
+                            logger.info(f"[DEBUG] Using answer step as content")
+                            break
+                    
+                    # Third priority: combine all answer steps
+                    if not content:
+                        answer_contents = []
+                        for step in shared_data["steps"]:
+                            if step.get('type') == 'answer' and step.get('content'):
+                                answer_contents.append(step['content'])
+                        if answer_contents:
+                            content = '\n\n'.join(answer_contents)
+                            logger.info(f"[DEBUG] Using combined answer steps as content")
+                
+                # Fourth priority: create summary from steps
+                if not content and shared_data["steps"]:
+                    step_summaries = []
+                    for step in shared_data["steps"]:
+                        if step.get('type') and step.get('content'):
+                            step_type = step['type'].title()
+                            content_preview = step['content'][:100] + "..." if len(step['content']) > 100 else step['content']
+                            step_summaries.append(f"**{step_type}**: {content_preview}")
+                    
+                    if step_summaries:
+                        content = "## Analysis Complete\n\n" + '\n\n'.join(step_summaries)
+                        logger.info(f"[DEBUG] Using step summaries as content")
+
+                # Fallback content
+                if not content:
+                    if shared_data["error"]:
+                        content = f"Analysis encountered an error: {shared_data['error']}"
+                        logger.info(f"[DEBUG] Using error as content")
+                    else:
+                        content = "Agentic analysis completed, but no detailed response was captured."
+                        logger.info(f"[DEBUG] Using fallback content - no meaningful data collected")
+
+                logger.info(f"[DEBUG] Final content length: {len(content) if content else 0}")
+
+                try:
+                    session_manager.add_message(
+                        session_id,
+                        role="assistant",
+                        content=content,
+                        agenticSteps=shared_data["steps"],
+                        suggestions=shared_data.get("suggestions", [])
+                    )
+                    logger.info(f"[DEBUG] Successfully saved agentic message to session {session_id}")
+                except Exception as e:
+                    logger.error(f"[DEBUG] Failed to save agentic message: {e}")
+
+            # Create background task
+            background_tasks = BackgroundTasks()
+            background_tasks.add_task(save_agentic_message)
+            response.background = background_tasks
+
             return response
         else:
-            response = await explorer.query(message.content)
+            # Non-streaming response
+            result = await explorer.query(message.content)
+            
+            try:
+                parsed_result = json.loads(result)
+                content = parsed_result.get("final_answer", "Analysis completed")
+                agentic_steps = parsed_result.get("steps", [])
+                suggestions = parsed_result.get("suggestions", [])
+            except json.JSONDecodeError:
+                content = result
+                agentic_steps = []
+                suggestions = []
+            
+            # Add user message to session history
+            session_manager.add_message(session_id, "user", message.content)
+            
             # Add assistant response to session history
-            session_manager.add_message(session_id, "assistant", response)
-            return ChatMessage(role="assistant", content=response)
-        
+            session_manager.add_message(
+                session_id,
+                role="assistant", 
+                content=content,
+                agenticSteps=agentic_steps,
+                suggestions=suggestions
+            )
+            
+            return ChatMessage(
+                role="assistant",
+                content=content,
+                timestamp=datetime.now().isoformat()
+            )
+            
     except Exception as e:
         logger.error(f"Error processing agentic query: {e}")
         raise HTTPException(status_code=500, detail=str(e))
