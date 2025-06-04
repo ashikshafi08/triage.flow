@@ -27,21 +27,15 @@ app = FastAPI(
 )
 
 # Add CORS middleware
-# It's good practice to list specific origins in production.
-# For development, ["*"] is often used, but sometimes explicit origins work better.
-allowed_origins = [
-    "http://localhost:8080", # Your Vite frontend dev port from screenshot
-    "http://localhost:5173", # Common Vite default
-    "http://localhost:3000", # Common React dev port
-    # Add any other origins you might be using
-]
+# Configure CORS origins - make configurable for production
+allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:8080,http://localhost:5173,http://localhost:3000").split(",")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins, # Use the list here
+    allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"], # Allows all standard methods
-    allow_headers=["*"], # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Initialize clients and services
@@ -189,12 +183,9 @@ async def handle_chat_message(session_id: str, message: ChatMessage, stream: boo
         # Log memory statistics for debugging
         print(f"Memory stats for session {session_id}: {memory_stats}")
         
-        # Debug: Log the actual file paths being retrieved from RAG
+        # Log RAG context retrieval for monitoring
         if fresh_rag_context and fresh_rag_context.get("sources"):
-            print(f"RAG retrieved {len(fresh_rag_context['sources'])} sources:")
-            for i, source in enumerate(fresh_rag_context['sources'][:5], 1):
-                file_path = source.get('file', 'UNKNOWN')
-                print(f"  {i}. {file_path}")
+            print(f"RAG retrieved {len(fresh_rag_context['sources'])} sources for query")
             if folder_mentions:
                 print(f"Folder-restricted query for folders: {folder_mentions}")
         else:
@@ -389,14 +380,7 @@ async def get_memory_statistics(session_id: str):
 
 @app.get("/api/files")
 async def list_files(session_id: str = Query(...)):
-    print(f"[DEBUG] /api/files called with session_id: {session_id}")
     session = session_manager.get_session(session_id)
-    print(f"[DEBUG] Session found: {session is not None}")
-    if session:
-        print(f"[DEBUG] Session keys: {session.keys()}")
-        print(f"[DEBUG] repo_path in session: {'repo_path' in session}")
-        if "repo_path" in session:
-            print(f"[DEBUG] repo_path value: {session['repo_path']}")
     
     if not session or "repo_path" not in session:
         raise HTTPException(status_code=404, detail="No repo loaded for this session")
@@ -418,11 +402,23 @@ async def get_file_content(session_id: str = Query(...), file_path: str = Query(
         raise HTTPException(status_code=404, detail="No repo loaded for this session")
     
     repo_path = session["repo_path"]
-    abs_file_path = os.path.join(repo_path, file_path)
     
-    # Security check: ensure the file is within the repo directory
-    if not abs_file_path.startswith(repo_path):
-        raise HTTPException(status_code=403, detail="Access denied: File outside repository")
+    # normalize and validate file path to prevent directory traversal
+    try:
+        # Normalize the path and resolve any .. or . components
+        normalized_file_path = os.path.normpath(file_path)
+        
+        # ensure the path doesn't start with / or contain .. 
+        if normalized_file_path.startswith('/') or '..' in normalized_file_path:
+            raise HTTPException(status_code=403, detail="Invalid file path")
+            
+        abs_file_path = os.path.normpath(os.path.join(repo_path, normalized_file_path))
+        
+        # ensure the resolved path is within the repo directory
+        if not abs_file_path.startswith(os.path.normpath(repo_path)):
+            raise HTTPException(status_code=403, detail="Access denied: File outside repository")
+    except (ValueError, OSError):
+        raise HTTPException(status_code=400, detail="Invalid file path")
     
     if not os.path.exists(abs_file_path):
         raise HTTPException(status_code=404, detail="File not found")
@@ -505,12 +501,8 @@ async def get_file_content(session_id: str = Query(...), file_path: str = Query(
 @app.get("/api/tree")
 async def get_tree_structure(session_id: str = Query(...)):
     """Get the tree structure of the repository"""
-    print(f"[DEBUG] /api/tree called with session_id: {session_id}")
     session = session_manager.get_session(session_id)
-    print(f"[DEBUG] Session found: {session is not None}")
     if not session or "repo_path" not in session:
-        if session:
-            print(f"[DEBUG] Session keys: {session.keys()}")
         raise HTTPException(status_code=404, detail="No repo loaded for this session")
     
     repo_path = session["repo_path"]

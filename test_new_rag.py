@@ -4,18 +4,16 @@ import os
 import sys
 from pathlib import Path
 
-# Add the current directory to the sys.path to allow importing src as a package
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from src.new_rag import LocalRepoContextExtractor # Import from src package
-from src.config import settings # Import from src package  
+from src.config import settings 
 from src.local_repo_loader import clone_repo_to_temp_persistent # Import from src package
 
 async def run_rag_test():
-    # --- Configuration ---
-    # Replace with a public GitHub repository URL for testing
-    test_repo_url = "https://github.com/langchain-ai/langchain.git" # A small, simple repo
-    # test_repo_url = "https://github.com/langchain-ai/langchain.git" # A larger, more complex repo for performance testing
+    
+    test_repo_url = "https://github.com/langchain-ai/langchain.git" 
+    # test_repo_url = "https://github.com/langchain-ai/langchain.git" 
     test_branch = "main"
     test_query_code = "How does the main function work?"
     test_query_general = "What is the purpose of this repository? and how to use it to build an agent for news app?"
@@ -64,9 +62,7 @@ async def run_rag_test():
         else:
             print("No sources found for this query.")
 
-        # --- Test 3: Test with a specific file restriction (if applicable to your test repo) ---
-        # Find a known file in your test_repo_url, e.g., "README.md" or a specific code file
-        # For Spoon-Knife, let's try "README.md"
+
         print(f"\n--- Querying with file restriction: 'README.md' ---")
         context_restricted = await rag_extractor.get_relevant_context(
             "What is this project about?",
@@ -84,7 +80,6 @@ async def run_rag_test():
     except Exception as e:
         print(f"An error occurred during the RAG test: {e}")
     finally:
-        # Clean up the cloned repository if it's persistent
         if hasattr(rag_extractor, 'current_repo_path') and os.path.exists(rag_extractor.current_repo_path):
             print(f"\nCleaning up temporary repository: {rag_extractor.current_repo_path}")
             import shutil
