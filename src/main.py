@@ -576,7 +576,13 @@ async def get_cache_statistics():
             "rag_caching": settings.ENABLE_RAG_CACHING,
             "response_caching": settings.ENABLE_RESPONSE_CACHING,
             "smart_sizing": settings.ENABLE_SMART_SIZING,
-            "repo_summaries": settings.ENABLE_REPO_SUMMARIES
+            "repo_summaries": settings.ENABLE_REPO_SUMMARIES,
+            "prompt_caching": settings.ENABLE_PROMPT_CACHING
+        },
+        "prompt_caching": {
+            "enabled": settings.ENABLE_PROMPT_CACHING,
+            "min_tokens": settings.PROMPT_CACHE_MIN_TOKENS,
+            "provider": settings.llm_provider
         }
     }
 

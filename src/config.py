@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     ENABLE_SMART_SIZING: bool = os.getenv("ENABLE_SMART_SIZING", "true").lower() == "true"
     ENABLE_REPO_SUMMARIES: bool = os.getenv("ENABLE_REPO_SUMMARIES", "true").lower() == "true"
     ENABLE_ASYNC_RAG: bool = os.getenv("ENABLE_ASYNC_RAG", "true").lower() == "true"
+    ENABLE_PROMPT_CACHING: bool = os.getenv("ENABLE_PROMPT_CACHING", "true").lower() == "true"
     
     # Smart Sizing Configuration
     MIN_RAG_SOURCES: int = int(os.getenv("MIN_RAG_SOURCES", "10"))
@@ -73,6 +74,9 @@ class Settings(BaseSettings):
     ASYNC_BATCH_SIZE: int = int(os.getenv("ASYNC_BATCH_SIZE", "10"))
     PARALLEL_FILE_PROCESSING: bool = os.getenv("PARALLEL_FILE_PROCESSING", "true").lower() == "true"
     MAX_CONCURRENT_OPERATIONS: int = int(os.getenv("MAX_CONCURRENT_OPERATIONS", "20"))
+    
+    # Prompt Caching Configuration
+    PROMPT_CACHE_MIN_TOKENS: int = int(os.getenv("PROMPT_CACHE_MIN_TOKENS", "1000"))  # Minimum tokens to enable caching
     
     class Config:
         env_file = ".env"

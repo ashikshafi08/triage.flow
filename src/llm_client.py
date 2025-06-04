@@ -202,12 +202,56 @@ class LLMClient:
             temperature=model_config["temperature"]
         )
 
+    def _format_message_with_cache_control(self, role: str, content: str, rag_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Format message with cache_control for OpenRouter prompt caching."""
+        if not settings.ENABLE_PROMPT_CACHING or not rag_context or not rag_context.get("sources"):
+            # Caching disabled or no RAG context to cache, return simple message
+            return {
+                "role": role,
+                "content": content
+            }
+        
+        # Format RAG context for caching
+        formatted_rag_context = format_rag_context_for_llm(rag_context)
+        
+        # Only cache if RAG context is substantial
+        rag_tokens = estimate_tokens(formatted_rag_context)
+        if rag_tokens < settings.PROMPT_CACHE_MIN_TOKENS:
+            # Small context, don't use caching
+            final_content = f"Relevant Context:\n{formatted_rag_context}\n\n{content}"
+            return {
+                "role": role,
+                "content": final_content
+            }
+        
+        print(f"Using prompt caching for {rag_tokens} tokens of RAG context")
+        
+        # Use multipart content with cache_control for large RAG context
+        return {
+            "role": role,
+            "content": [
+                {
+                    "type": "text",
+                    "text": "You are an AI assistant helping with code repository analysis. Below is the relevant repository context:"
+                },
+                {
+                    "type": "text", 
+                    "text": formatted_rag_context,
+                    "cache_control": {
+                        "type": "ephemeral"
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": f"Based on the repository context above, please respond to the following:\n\n{content}"
+                }
+            ]
+        }
+
     async def process_prompt(self, prompt: str, prompt_type: str, context: Optional[Dict[str, Any]] = None, model: Optional[str] = None) -> PromptResponse:
         try:
             model = model or self.default_model
-            system_prompt = self.system_prompts.get(prompt_type, "") # Base system prompt
-            
-            # The 'context' parameter is our fresh_rag_context from main.py
+            system_prompt = self.system_prompts.get(prompt_type, "")
             
             if settings.llm_provider == "openai":
                 # Format RAG context for OpenAI
@@ -216,16 +260,15 @@ class LLMClient:
                     formatted_dynamic_context_str = format_rag_context_for_llm(context)
                 
                 # Prepend RAG context to the main prompt (conversation history)
-                # The system_prompt from self.system_prompts is handled by PromptTemplate's system_prompt arg
                 final_prompt_for_template = f"Relevant Context:\n{formatted_dynamic_context_str}\n\nConversation History:\n{prompt}"
 
                 template = PromptTemplate(
-                    template=final_prompt_for_template, # Now includes RAG context + conversation
-                    system_prompt=system_prompt 
+                    template=final_prompt_for_template,
+                    system_prompt=system_prompt
                 )
                 
                 llm = self._get_openai_llm(model)
-                response = await llm.acomplete(template.format()) # .format() is for template variables if any
+                response = await llm.acomplete(template.format())
                 
                 return PromptResponse(
                     status="success",
@@ -234,27 +277,8 @@ class LLMClient:
                 )
                 
             elif settings.llm_provider == "openrouter":
-                # Format RAG context for OpenRouter (same as OpenAI approach)
-                formatted_dynamic_context_str = ""
-                if context:
-                    formatted_dynamic_context_str = format_rag_context_for_llm(context)
-                
-                # Prepend RAG context to the main prompt (conversation history)
-                final_prompt_for_template = f"Relevant Context:\n{formatted_dynamic_context_str}\n\nConversation History:\n{prompt}"
-
-                template = PromptTemplate(
-                    template=final_prompt_for_template, # Now includes RAG context + conversation
-                    system_prompt=system_prompt 
-                )
-                
-                llm = self._get_openrouter_llm(model)
-                response = await llm.acomplete(template.format())
-                
-                return PromptResponse(
-                    status="success",
-                    prompt=response.text,
-                    model_used=model
-                )
+                # Use direct OpenRouter API with cache_control support
+                return await self._process_openrouter_with_caching(prompt, system_prompt, context, model)
                 
             else:
                 return PromptResponse(
@@ -270,34 +294,227 @@ class LLMClient:
             )
 
     async def stream_openrouter_response(self, prompt: str, prompt_type: str, context: Optional[Dict[str, Any]] = None, model: Optional[str] = None) -> AsyncGenerator[str, None]:
-        """Stream response from OpenRouter API using LlamaIndex."""
+        """Stream response from OpenRouter API with cache_control support."""
         model = model or self.default_model
         system_prompt = self.system_prompts.get(prompt_type, "")
-
-        # Format RAG context (same logic as non-streaming)
-        formatted_dynamic_context_str = ""
-        if context:
-            formatted_dynamic_context_str = format_rag_context_for_llm(context)
         
-        # Prepend RAG context to the main prompt (conversation history)
-        final_prompt_for_template = f"Relevant Context:\n{formatted_dynamic_context_str}\n\nConversation History:\n{prompt}"
-
-        template = PromptTemplate(
-            template=final_prompt_for_template,
-            system_prompt=system_prompt 
-        )
+        if not settings.openrouter_api_key:
+            yield f"data: {json.dumps({'error': 'OpenRouter API key not configured'})}\n\n"
+            return
+        
+        model_config = self._get_model_config(model)
+        
+        # Prepare messages array with caching support
+        messages = []
+        
+        # Add system message with potential caching
+        if system_prompt:
+            if (settings.ENABLE_PROMPT_CACHING and context and context.get("sources") and 
+                estimate_tokens(format_rag_context_for_llm(context)) >= settings.PROMPT_CACHE_MIN_TOKENS):
+                # Large context - use cache_control in system message
+                formatted_rag_context = format_rag_context_for_llm(context)
+                rag_tokens = estimate_tokens(formatted_rag_context)
+                print(f"Using prompt caching for {rag_tokens} tokens of RAG context in streaming")
+                
+                messages.append({
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"{system_prompt}\n\nBelow is the relevant repository context for this conversation:"
+                        },
+                        {
+                            "type": "text",
+                            "text": formatted_rag_context,
+                            "cache_control": {
+                                "type": "ephemeral"
+                            }
+                        }
+                    ]
+                })
+                # Add user message without RAG context (it's cached in system)
+                messages.append({
+                    "role": "user", 
+                    "content": prompt
+                })
+            else:
+                # Small or no context - traditional format
+                if context:
+                    formatted_rag_context = format_rag_context_for_llm(context)
+                    final_content = f"Relevant Context:\n{formatted_rag_context}\n\nConversation History:\n{prompt}"
+                else:
+                    final_content = prompt
+                    
+                messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": final_content})
+        else:
+            # No system prompt - add context to user message if needed
+            user_message = self._format_message_with_cache_control("user", prompt, context)
+            messages.append(user_message)
+        
+        # Prepare request payload
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": model_config["max_tokens"],
+            "temperature": model_config["temperature"],
+            "stream": True
+        }
         
         try:
-            llm = self._get_openrouter_llm(model)
-            response_stream = await llm.astream_complete(template.format())
-            
-            async for chunk in response_stream:
-                # Format as SSE for frontend consumption
-                yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk.delta}}]})}\n\n"
-                
-            # Send final done message
-            yield "data: [DONE]\n\n"
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST",
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {settings.openrouter_api_key}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://github.com/your-repo",  # Replace with actual repo
+                        "X-Title": "Triage Flow Repository Chat"
+                    },
+                    json=payload,
+                    timeout=120.0
+                ) as response:
+                    
+                    if response.status_code != 200:
+                        error_detail = f"OpenRouter API error: {response.status_code}"
+                        yield f"data: {json.dumps({'error': error_detail})}\n\n"
+                        return
+                    
+                    async for line in response.aiter_lines():
+                        if line.startswith("data: "):
+                            data = line[6:].strip()
+                            if data == "[DONE]":
+                                # Include final usage info if available
+                                yield f"data: [DONE]\n\n"
+                                return
+                            elif data:
+                                try:
+                                    # Parse and potentially log cache usage
+                                    parsed_data = json.loads(data)
+                                    if "usage" in parsed_data:
+                                        usage = parsed_data["usage"]
+                                        cached_tokens = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+                                        if cached_tokens > 0:
+                                            print(f"Cache hit: {cached_tokens} tokens cached")
+                                    
+                                    # Forward the chunk
+                                    yield f"data: {data}\n\n"
+                                except json.JSONDecodeError:
+                                    # Forward non-JSON data as-is
+                                    yield f"data: {data}\n\n"
             
         except Exception as e:
-            error_msg = f"Error in OpenRouter streaming: {str(e)}"
+            error_msg = f"Error in OpenRouter streaming with caching: {str(e)}"
             yield f"data: {json.dumps({'error': error_msg})}\n\n"
+
+    async def _process_openrouter_with_caching(self, prompt: str, system_prompt: str, context: Optional[Dict[str, Any]], model: str) -> PromptResponse:
+        """Process prompt using OpenRouter API with cache_control support."""
+        if not settings.openrouter_api_key:
+            raise ValueError("OpenRouter API key is required")
+        
+        model_config = self._get_model_config(model)
+        
+        # Prepare messages array
+        messages = []
+        
+        # Add system message with potential caching
+        if system_prompt:
+            if (settings.ENABLE_PROMPT_CACHING and context and context.get("sources") and 
+                estimate_tokens(format_rag_context_for_llm(context)) >= settings.PROMPT_CACHE_MIN_TOKENS):
+                # Large context - use cache_control in system message
+                formatted_rag_context = format_rag_context_for_llm(context)
+                rag_tokens = estimate_tokens(formatted_rag_context)
+                print(f"Using prompt caching for {rag_tokens} tokens of RAG context in system message")
+                
+                messages.append({
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"{system_prompt}\n\nBelow is the relevant repository context for this conversation:"
+                        },
+                        {
+                            "type": "text",
+                            "text": formatted_rag_context,
+                            "cache_control": {
+                                "type": "ephemeral"
+                            }
+                        }
+                    ]
+                })
+                # Add user message without RAG context (it's cached in system)
+                messages.append({
+                    "role": "user", 
+                    "content": prompt
+                })
+            else:
+                # Small or no context - traditional format
+                if context:
+                    formatted_rag_context = format_rag_context_for_llm(context)
+                    final_content = f"Relevant Context:\n{formatted_rag_context}\n\nConversation History:\n{prompt}"
+                else:
+                    final_content = prompt
+                    
+                messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": final_content})
+        else:
+            # No system prompt - add context to user message if needed
+            user_message = self._format_message_with_cache_control("user", prompt, context)
+            messages.append(user_message)
+        
+        # Prepare request payload
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": model_config["max_tokens"],
+            "temperature": model_config["temperature"],
+            "stream": False
+        }
+        
+        # Make API request
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {settings.openrouter_api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/your-repo",  # Replace with actual repo
+                    "X-Title": "Triage Flow Repository Chat"
+                },
+                json=payload,
+                timeout=120.0
+            )
+            
+            if response.status_code != 200:
+                error_detail = f"OpenRouter API error: {response.status_code} - {response.text}"
+                print(error_detail)
+                return PromptResponse(
+                    status="error",
+                    error=error_detail
+                )
+            
+            result = response.json()
+            
+            # Extract response content
+            if "choices" in result and len(result["choices"]) > 0:
+                content = result["choices"][0]["message"]["content"]
+                
+                # Log cache usage if available
+                if "usage" in result:
+                    usage = result["usage"]
+                    print(f"Token usage - Prompt: {usage.get('prompt_tokens', 0)}, "
+                          f"Completion: {usage.get('completion_tokens', 0)}, "
+                          f"Cache: {usage.get('prompt_tokens_details', {}).get('cached_tokens', 0)}")
+                
+                return PromptResponse(
+                    status="success",
+                    prompt=content,
+                    model_used=model,
+                    tokens_used=result.get("usage", {})
+                )
+            else:
+                return PromptResponse(
+                    status="error",
+                    error="No response content received from OpenRouter"
+                )
