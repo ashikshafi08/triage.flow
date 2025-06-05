@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.background import BackgroundTasks
-from .models import PromptRequest, PromptResponse, ChatMessage, SessionResponse, RepoRequest, RepoSessionResponse, SessionListResponse
+from .models import PromptRequest, PromptResponse, ChatMessage, SessionResponse, RepoRequest, RepoSessionResponse, SessionListResponse, Issue
 from .github_client import GitHubIssueClient
 from .llm_client import LLMClient
 from .prompt_generator import PromptGenerator
@@ -1071,6 +1071,31 @@ async def reset_agentic_memory(session_id: str):
     except Exception as e:
         logger.error(f"Error resetting agentic memory: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/issues")
+async def list_issues(repo_url: str, state: str = "open"):
+    """List issues for a given repository URL and state (open/closed/all)."""
+    try:
+        issues = await github_client.list_issues(repo_url, state)
+        # Convert Issue objects to dicts for JSON serialization
+        return [issue.model_dump() for issue in issues]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch issues: {str(e)}")
+
+@app.get("/api/issues/{issue_number}")
+async def get_issue_detail(issue_number: int, repo_url: str):
+    """Get details for a single issue by number and repo_url."""
+    try:
+        # Construct the issue URL
+        if repo_url.endswith(".git"):
+            repo_url = repo_url[:-4]
+        issue_url = f"{repo_url}/issues/{issue_number}"
+        issue_response = await github_client.get_issue(issue_url)
+        if issue_response.status != "success" or not issue_response.data:
+            raise HTTPException(status_code=404, detail=issue_response.error or "Issue not found")
+        return issue_response.data.model_dump()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch issue: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

@@ -162,4 +162,52 @@ class GitHubIssueClient:
             else:
                 raise Exception(f"Failed to fetch issue: {response.error}")
         finally:
-            loop.close() 
+            loop.close()
+
+    async def list_issues(self, repo_url: str, state: str = "open", per_page: int = 30, max_pages: int = 5) -> list:
+        """
+        List issues for a given repository URL and state (open/closed/all).
+        Args:
+            repo_url: The GitHub repository URL (e.g., https://github.com/owner/repo)
+            state: 'open', 'closed', or 'all'
+            per_page: Number of issues per page (max 100)
+            max_pages: Maximum number of pages to fetch (to avoid huge requests)
+        Returns:
+            List of Issue objects
+        """
+        # Extract owner and repo
+        from .local_repo_loader import get_repo_info
+        owner, repo = get_repo_info(repo_url)
+        issues = []
+        page = 1
+        fetched = 0
+        while page <= max_pages:
+            url = f"https://api.github.com/repos/{owner}/{repo}/issues?state={state}&per_page={per_page}&page={page}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=self.headers) as response:
+                    if response.status != 200:
+                        break
+                    data = await response.json()
+                    if not data:
+                        break
+                    for issue_data in data:
+                        # Exclude pull requests (GitHub returns PRs in issues API)
+                        if 'pull_request' in issue_data:
+                            continue
+                        issue = Issue(
+                            number=issue_data['number'],
+                            title=issue_data['title'],
+                            body=issue_data.get('body', ""),
+                            state=issue_data['state'],
+                            created_at=datetime.fromisoformat(issue_data['created_at'].replace('Z', '+00:00')),
+                            url=issue_data['html_url'],
+                            labels=[label['name'] for label in issue_data.get('labels', [])],
+                            assignees=[assignee['login'] for assignee in issue_data.get('assignees', [])],
+                            comments=[]  # Comments can be fetched separately if needed
+                        )
+                        issues.append(issue)
+                        fetched += 1
+                    if len(data) < per_page:
+                        break  # No more pages
+            page += 1
+        return issues 
