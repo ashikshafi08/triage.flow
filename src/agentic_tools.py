@@ -148,6 +148,22 @@ class AgenticCodebaseExplorer:
         )
         tools.append(code_gen_tool)
         
+        # GitHub Issue Analysis tool
+        issue_analysis_tool = FunctionTool.from_defaults(
+            fn=self.analyze_github_issue,
+            name="analyze_github_issue",
+            description="Analyze a GitHub issue comprehensively, providing insights on complexity, type, requirements, and suggested approach"
+        )
+        tools.append(issue_analysis_tool)
+        
+        # Find Issue Related Files tool
+        find_issue_files_tool = FunctionTool.from_defaults(
+            fn=self.find_issue_related_files,
+            name="find_issue_related_files",
+            description="Find files in the repository that are relevant to a specific GitHub issue using intelligent search patterns"
+        )
+        tools.append(find_issue_files_tool)
+        
         return tools
     
     def explore_directory(
@@ -2249,3 +2265,521 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
                 capabilities.append(word)
         
         return capabilities 
+
+    def analyze_github_issue(
+        self,
+        issue_identifier: Annotated[str, "Issue number (#123) or full GitHub issue URL to analyze"]
+    ) -> str:
+        """Analyze a GitHub issue comprehensively to understand requirements and complexity"""
+        try:
+            # Import GitHub client here to avoid circular imports
+            from .github_client import GitHubIssueClient
+            
+            # Initialize GitHub client
+            github_client = GitHubIssueClient()
+            
+            # If it's just a number, construct the URL based on repo path
+            if issue_identifier.startswith('#') or issue_identifier.isdigit():
+                issue_number = issue_identifier.lstrip('#')
+                # Try to get repo URL from session or repo path
+                repo_url = self._get_repo_url_from_path()
+                if not repo_url:
+                    return json.dumps({
+                        "error": "Cannot determine repository URL",
+                        "suggestion": "Please provide the full GitHub issue URL instead of just the issue number"
+                    }, indent=2)
+                issue_url = f"{repo_url}/issues/{issue_number}"
+            else:
+                issue_url = issue_identifier
+            
+            # Fetch issue data
+            issue_response = asyncio.run(github_client.get_issue(issue_url))
+            
+            if issue_response.status != "success" or not issue_response.data:
+                return json.dumps({
+                    "error": f"Failed to fetch issue: {issue_response.error}",
+                    "issue_identifier": issue_identifier
+                }, indent=2)
+            
+            issue = issue_response.data
+            
+            # Perform comprehensive analysis
+            analysis = self._perform_issue_analysis(issue)
+            
+            return json.dumps(analysis, indent=2)
+            
+        except Exception as e:
+            logger.error(f"Error analyzing GitHub issue: {e}")
+            return json.dumps({
+                "error": f"Failed to analyze issue: {str(e)}",
+                "issue_identifier": issue_identifier
+            }, indent=2)
+    
+    def find_issue_related_files(
+        self,
+        issue_description: Annotated[str, "Description of the issue or feature to find related files for"],
+        search_depth: Annotated[str, "Search depth: 'surface' for obvious matches, 'deep' for comprehensive analysis"] = "surface"
+    ) -> str:
+        """Find files in the repository that are likely relevant to solving a specific issue"""
+        try:
+            # Extract keywords and technical terms from issue description
+            search_terms = self._extract_issue_keywords(issue_description)
+            
+            # Perform multi-stage search
+            relevant_files = []
+            
+            # Stage 1: Direct keyword search
+            for term in search_terms['primary']:
+                search_results = json.loads(self.search_codebase(term, ['.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.go', '.rs', '.rb']))
+                parsed_results = json.loads(search_results) if isinstance(search_results, str) else search_results
+                
+                for result in parsed_results.get('results', []):
+                    file_path = result['file']
+                    relevance_score = len(result['matches']) * 2  # Base score
+                    
+                    # Boost score for certain file types or locations
+                    if any(keyword in file_path.lower() for keyword in search_terms['primary']):
+                        relevance_score += 5
+                    if file_path.startswith(('src/', 'lib/', 'app/')):
+                        relevance_score += 2
+                    if file_path.endswith(('_test.py', '.test.js', '.spec.js')):
+                        relevance_score -= 1  # Lower priority for test files initially
+                    
+                    relevant_files.append({
+                        "file": file_path,
+                        "relevance_score": relevance_score,
+                        "match_reason": f"Contains '{term}'",
+                        "matches": result['matches'][:3]  # Limit matches
+                    })
+            
+            # Stage 2: Semantic/contextual search if deep analysis requested
+            if search_depth == "deep":
+                for context_term in search_terms['contextual']:
+                    semantic_results = json.loads(self.semantic_content_search(context_term))
+                    parsed_semantic = json.loads(semantic_results) if isinstance(semantic_results, str) else semantic_results
+                    
+                    for result in parsed_semantic.get('results', []):
+                        file_path = result['file']
+                        # Add files that weren't found in direct search
+                        if not any(rf['file'] == file_path for rf in relevant_files):
+                            relevant_files.append({
+                                "file": file_path,
+                                "relevance_score": result['score'],
+                                "match_reason": f"Semantic match for '{context_term}'",
+                                "context": result.get('context', [])[:2]
+                            })
+            
+            # Stage 3: Find related configuration and test files
+            config_files = self._find_configuration_files(search_terms)
+            test_files = self._find_related_test_files([rf['file'] for rf in relevant_files])
+            
+            # Combine and deduplicate
+            all_files = relevant_files + config_files + test_files
+            unique_files = {}
+            for file_info in all_files:
+                file_path = file_info['file']
+                if file_path not in unique_files or file_info['relevance_score'] > unique_files[file_path]['relevance_score']:
+                    unique_files[file_path] = file_info
+            
+            # Sort by relevance score
+            sorted_files = sorted(unique_files.values(), key=lambda x: x['relevance_score'], reverse=True)
+            
+            # Limit results and categorize
+            top_files = sorted_files[:15]
+            
+            analysis = {
+                "issue_description": issue_description,
+                "search_depth": search_depth,
+                "search_terms_used": search_terms,
+                "total_files_found": len(sorted_files),
+                "top_relevant_files": top_files,
+                "file_categories": self._categorize_files(top_files),
+                "recommendations": self._generate_file_recommendations(top_files, search_terms)
+            }
+            
+            return json.dumps(analysis, indent=2)
+            
+        except Exception as e:
+            logger.error(f"Error finding issue-related files: {e}")
+            return json.dumps({
+                "error": f"Failed to find related files: {str(e)}",
+                "issue_description": issue_description
+            }, indent=2)
+    
+    def _get_repo_url_from_path(self) -> Optional[str]:
+        """Try to determine the repository URL from the repo path"""
+        try:
+            # Check if there's a .git directory
+            git_dir = self.repo_path / '.git'
+            if git_dir.exists():
+                # Try to read the origin URL
+                config_file = git_dir / 'config'
+                if config_file.exists():
+                    with open(config_file, 'r') as f:
+                        content = f.read()
+                        # Look for origin URL
+                        import re
+                        match = re.search(r'url = (https://github\.com/[^/]+/[^/\s]+)', content)
+                        if match:
+                            return match.group(1).rstrip('.git')
+            return None
+        except Exception:
+            return None
+    
+    def _perform_issue_analysis(self, issue) -> Dict[str, Any]:
+        """Perform comprehensive analysis of a GitHub issue"""
+        analysis = {
+            "issue_metadata": {
+                "number": issue.number,
+                "title": issue.title,
+                "state": issue.state,
+                "created_at": issue.created_at.isoformat() if hasattr(issue.created_at, 'isoformat') else str(issue.created_at),
+                "labels": issue.labels,
+                "assignees": issue.assignees,
+                "comments_count": len(issue.comments)
+            },
+            "issue_classification": self._classify_issue_type(issue),
+            "complexity_assessment": self._assess_issue_complexity(issue),
+            "technical_requirements": self._extract_technical_requirements(issue),
+            "suggested_approach": self._suggest_approach(issue),
+            "estimated_effort": self._estimate_effort(issue),
+            "related_keywords": self._extract_issue_keywords(issue.body)
+        }
+        
+        # Add comments analysis if there are comments
+        if issue.comments:
+            analysis["comments_analysis"] = self._analyze_comments(issue.comments)
+        
+        return analysis
+    
+    def _classify_issue_type(self, issue) -> Dict[str, Any]:
+        """Classify the type of issue based on title, labels, and content"""
+        issue_types = {
+            "bug": ["bug", "fix", "error", "broken", "issue", "problem", "not working"],
+            "feature": ["feature", "enhancement", "add", "implement", "new", "support"],
+            "documentation": ["documentation", "docs", "readme", "comment", "explain"],
+            "refactor": ["refactor", "cleanup", "improve", "optimize", "restructure"],
+            "test": ["test", "testing", "spec", "coverage", "unit test"],
+            "security": ["security", "vulnerability", "exploit", "auth", "permission"],
+            "performance": ["performance", "slow", "speed", "optimize", "memory", "cpu"]
+        }
+        
+        text_to_analyze = f"{issue.title} {issue.body}".lower()
+        label_text = " ".join(issue.labels).lower()
+        
+        scores = {}
+        for issue_type, keywords in issue_types.items():
+            score = 0
+            for keyword in keywords:
+                score += text_to_analyze.count(keyword) * 2
+                score += label_text.count(keyword) * 5  # Labels are more definitive
+            scores[issue_type] = score
+        
+        primary_type = max(scores, key=scores.get) if max(scores.values()) > 0 else "general"
+        
+        return {
+            "primary_type": primary_type,
+            "confidence_scores": scores,
+            "detected_labels": [label for label in issue.labels if label.lower() in sum(issue_types.values(), [])]
+        }
+    
+    def _assess_issue_complexity(self, issue) -> Dict[str, Any]:
+        """Assess the complexity of an issue"""
+        complexity_indicators = {
+            "high": ["architecture", "refactor", "breaking change", "migration", "multiple", "complex", "system"],
+            "medium": ["feature", "enhancement", "modify", "update", "improve", "several"],
+            "low": ["fix", "simple", "minor", "typo", "documentation", "small"]
+        }
+        
+        text = f"{issue.title} {issue.body}".lower()
+        length_factor = len(issue.body) / 500  # Longer descriptions might indicate complexity
+        comments_factor = len(issue.comments) / 10  # More discussion might indicate complexity
+        
+        complexity_score = 0
+        for level, indicators in complexity_indicators.items():
+            weight = {"high": 3, "medium": 2, "low": 1}[level]
+            for indicator in indicators:
+                complexity_score += text.count(indicator) * weight
+        
+        # Adjust based on length and discussion
+        complexity_score += length_factor + comments_factor
+        
+        if complexity_score >= 6:
+            level = "high"
+        elif complexity_score >= 3:
+            level = "medium"
+        else:
+            level = "low"
+        
+        return {
+            "level": level,
+            "score": complexity_score,
+            "factors": {
+                "description_length": len(issue.body),
+                "comments_count": len(issue.comments),
+                "label_indicators": [label for label in issue.labels if any(label.lower() in indicators for indicators in complexity_indicators.values())]
+            }
+        }
+    
+    def _extract_technical_requirements(self, issue) -> Dict[str, Any]:
+        """Extract technical requirements from issue description"""
+        import re
+        
+        text = f"{issue.title} {issue.body}"
+        
+        # Look for technical patterns
+        tech_patterns = {
+            "programming_languages": re.findall(r'\b(python|javascript|java|go|rust|ruby|php|c\+\+|c#|swift|kotlin)\b', text, re.IGNORECASE),
+            "frameworks": re.findall(r'\b(react|angular|vue|django|flask|spring|rails|laravel|express)\b', text, re.IGNORECASE),
+            "databases": re.findall(r'\b(mysql|postgresql|mongodb|redis|sqlite|oracle)\b', text, re.IGNORECASE),
+            "technologies": re.findall(r'\b(api|rest|graphql|websocket|docker|kubernetes|aws|azure|gcp)\b', text, re.IGNORECASE),
+            "file_extensions": re.findall(r'\.(\w+)\b', text),
+            "file_paths": re.findall(r'[/\w\.-]+\.(py|js|jsx|ts|tsx|java|go|rs|rb|php|html|css)', text),
+            "error_messages": re.findall(r'error[:\s]+(.*?)(?:\n|$)', text, re.IGNORECASE),
+            "version_numbers": re.findall(r'v?\d+\.\d+(?:\.\d+)?', text)
+        }
+        
+        # Clean up and deduplicate
+        requirements = {}
+        for category, items in tech_patterns.items():
+            if items:
+                requirements[category] = list(set([item.lower() for item in items if len(item) > 1]))
+        
+        return requirements
+    
+    def _suggest_approach(self, issue) -> List[str]:
+        """Suggest an approach for tackling the issue"""
+        issue_type = self._classify_issue_type(issue)["primary_type"]
+        complexity = self._assess_issue_complexity(issue)["level"]
+        
+        approaches = {
+            "bug": [
+                "1. Reproduce the issue locally",
+                "2. Identify the root cause through debugging",
+                "3. Write a test case to verify the fix",
+                "4. Implement the fix",
+                "5. Verify the fix doesn't break existing functionality"
+            ],
+            "feature": [
+                "1. Break down the feature into smaller components",
+                "2. Design the API/interface",
+                "3. Implement core functionality",
+                "4. Add comprehensive tests",
+                "5. Update documentation"
+            ],
+            "documentation": [
+                "1. Identify what needs to be documented",
+                "2. Gather technical details",
+                "3. Write clear, concise documentation",
+                "4. Add examples where appropriate",
+                "5. Review for accuracy and completeness"
+            ]
+        }
+        
+        base_approach = approaches.get(issue_type, approaches["feature"])
+        
+        # Modify based on complexity
+        if complexity == "high":
+            base_approach.insert(1, "1.5. Create a detailed design document")
+            base_approach.append("6. Plan for gradual rollout/migration")
+        elif complexity == "low":
+            base_approach = [step for step in base_approach if "design" not in step.lower()]
+        
+        return base_approach
+    
+    def _estimate_effort(self, issue) -> Dict[str, Any]:
+        """Estimate the effort required for the issue"""
+        complexity = self._assess_issue_complexity(issue)
+        issue_type = self._classify_issue_type(issue)["primary_type"]
+        
+        # Base estimates in hours
+        base_estimates = {
+            "bug": {"low": 2, "medium": 8, "high": 24},
+            "feature": {"low": 8, "medium": 24, "high": 80},
+            "documentation": {"low": 2, "medium": 6, "high": 16},
+            "refactor": {"low": 4, "medium": 16, "high": 40},
+            "test": {"low": 2, "medium": 8, "high": 20}
+        }
+        
+        complexity_level = complexity["level"]
+        base_hours = base_estimates.get(issue_type, base_estimates["feature"])[complexity_level]
+        
+        return {
+            "estimated_hours": base_hours,
+            "estimated_days": round(base_hours / 8, 1),
+            "confidence": "medium" if complexity_level == "medium" else "low",
+            "factors_considered": [
+                f"Issue type: {issue_type}",
+                f"Complexity: {complexity_level}",
+                f"Description length: {len(issue.body)} chars",
+                f"Comments: {len(issue.comments)}"
+            ]
+        }
+    
+    def _analyze_comments(self, comments) -> Dict[str, Any]:
+        """Analyze comments for additional insights"""
+        if not comments:
+            return {}
+        
+        total_comments = len(comments)
+        unique_users = len(set(comment.user for comment in comments))
+        
+        # Look for solution indicators in comments
+        solution_indicators = ["fix", "solution", "resolve", "workaround", "patch"]
+        potential_solutions = []
+        
+        for comment in comments:
+            comment_text = comment.body.lower()
+            if any(indicator in comment_text for indicator in solution_indicators):
+                potential_solutions.append({
+                    "user": comment.user,
+                    "snippet": comment.body[:200] + "..." if len(comment.body) > 200 else comment.body
+                })
+        
+        return {
+            "total_comments": total_comments,
+            "unique_participants": unique_users,
+            "potential_solutions_mentioned": len(potential_solutions),
+            "solution_snippets": potential_solutions[:3],  # Limit to top 3
+            "discussion_level": "high" if total_comments > 10 else "medium" if total_comments > 3 else "low"
+        }
+    
+    def _extract_issue_keywords(self, text: str) -> Dict[str, List[str]]:
+        """Extract keywords from issue text for searching"""
+        import re
+        
+        # Remove common stop words
+        stop_words = {"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "must", "can", "this", "that", "these", "those"}
+        
+        # Extract technical terms (camelCase, snake_case, file extensions, etc.)
+        technical_terms = re.findall(r'\b[A-Z][a-z]+(?:[A-Z][a-z]+)*\b|\b\w+_\w+\b|\b\w+\.\w+\b', text)
+        
+        # Extract quoted strings (often error messages or specific values)
+        quoted_terms = re.findall(r'["\']([^"\']+)["\']', text)
+        
+        # Extract individual words, filter stop words
+        words = re.findall(r'\b\w+\b', text.lower())
+        significant_words = [word for word in words if len(word) > 3 and word not in stop_words]
+        
+        # Extract file paths and extensions
+        file_patterns = re.findall(r'[/\w\.-]*\.(?:py|js|jsx|ts|tsx|java|go|rs|rb|php|html|css|json|yaml|yml|md|txt)', text)
+        
+        return {
+            "primary": list(set(technical_terms + quoted_terms))[:10],  # Most important terms
+            "contextual": list(set(significant_words))[:15],  # Supporting context
+            "file_patterns": list(set(file_patterns)),
+            "all_terms": list(set(technical_terms + quoted_terms + significant_words))
+        }
+    
+    def _find_configuration_files(self, search_terms: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+        """Find configuration files that might be relevant"""
+        config_files = []
+        config_patterns = [
+            "package.json", "requirements.txt", "Gemfile", "go.mod", "Cargo.toml",
+            "pom.xml", "build.gradle", "Dockerfile", "docker-compose.yml",
+            "config.py", "settings.py", "config.js", "webpack.config.js",
+            ".env", ".gitignore", "README.md"
+        ]
+        
+        try:
+            for pattern in config_patterns:
+                for file_path in self.repo_path.rglob(pattern):
+                    rel_path = str(file_path.relative_to(self.repo_path))
+                    config_files.append({
+                        "file": rel_path,
+                        "relevance_score": 1,
+                        "match_reason": "Configuration file",
+                        "file_type": "configuration"
+                    })
+                    
+        except Exception as e:
+            logger.error(f"Error finding configuration files: {e}")
+        
+        return config_files[:5]  # Limit results
+    
+    def _find_related_test_files(self, source_files: List[str]) -> List[Dict[str, Any]]:
+        """Find test files related to the source files"""
+        test_files = []
+        
+        for source_file in source_files:
+            # Common test file patterns
+            base_name = Path(source_file).stem
+            test_patterns = [
+                f"test_{base_name}.py",
+                f"{base_name}_test.py",
+                f"{base_name}.test.js",
+                f"{base_name}.spec.js",
+                f"test{base_name.title()}.java"
+            ]
+            
+            for pattern in test_patterns:
+                try:
+                    for test_path in self.repo_path.rglob(pattern):
+                        rel_path = str(test_path.relative_to(self.repo_path))
+                        test_files.append({
+                            "file": rel_path,
+                            "relevance_score": 2,
+                            "match_reason": f"Test file for {source_file}",
+                            "file_type": "test"
+                        })
+                except Exception:
+                    continue
+        
+        return test_files
+    
+    def _categorize_files(self, files: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+        """Categorize files by type"""
+        categories = {
+            "source_code": [],
+            "tests": [],
+            "configuration": [],
+            "documentation": [],
+            "other": []
+        }
+        
+        for file_info in files:
+            file_path = file_info["file"]
+            file_ext = Path(file_path).suffix.lower()
+            
+            if any(test_indicator in file_path.lower() for test_indicator in ["test", "spec", "__test__"]):
+                categories["tests"].append(file_path)
+            elif file_ext in [".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb", ".php"]:
+                categories["source_code"].append(file_path)
+            elif file_ext in [".json", ".yaml", ".yml", ".toml", ".ini", ".env"] or file_path.endswith("Dockerfile"):
+                categories["configuration"].append(file_path)
+            elif file_ext in [".md", ".txt", ".rst"]:
+                categories["documentation"].append(file_path)
+            else:
+                categories["other"].append(file_path)
+        
+        return {k: v for k, v in categories.items() if v}  # Remove empty categories
+    
+    def _generate_file_recommendations(self, files: List[Dict[str, Any]], search_terms: Dict[str, List[str]]) -> List[str]:
+        """Generate recommendations for working with the found files"""
+        recommendations = []
+        
+        if not files:
+            return ["No relevant files found. Consider expanding search terms or checking if the repository structure matches the issue description."]
+        
+        # Analyze file distribution
+        categories = self._categorize_files(files)
+        
+        if "source_code" in categories:
+            recommendations.append(f"🔍 Start by examining {len(categories['source_code'])} source files: {', '.join(categories['source_code'][:3])}")
+        
+        if "tests" in categories:
+            recommendations.append(f"🧪 Review {len(categories['tests'])} test files to understand expected behavior")
+        
+        if "configuration" in categories:
+            recommendations.append(f"⚙️ Check {len(categories['configuration'])} configuration files for environment setup")
+        
+        # High relevance files
+        high_relevance = [f for f in files if f.get("relevance_score", 0) > 5]
+        if high_relevance:
+            recommendations.append(f"⭐ Focus on high-relevance files: {', '.join([f['file'] for f in high_relevance[:3]])}")
+        
+        # Search term specific advice
+        if search_terms.get("file_patterns"):
+            recommendations.append(f"📁 Pay attention to files matching patterns: {', '.join(search_terms['file_patterns'][:3])}")
+        
+        return recommendations[:5]  # Limit recommendations

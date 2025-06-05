@@ -182,6 +182,29 @@ async def handle_chat_message(
                     "content": content[:5000]  # Limit to 5k chars per file
                 })
         
+        # Extract issue references and add to context
+        issue_contexts = []
+        repo_url = session.get("metadata", {}).get("repo_url", "")
+        if repo_url:
+            try:
+                issue_contexts = _extract_issue_references(message.content, repo_url)
+            except Exception as e:
+                print(f"Error extracting issue references: {e}")
+        
+        # IMPORTANT: Add current issue context from session metadata
+        current_issue_context = session.get("metadata", {}).get("currentIssueContext")
+        if current_issue_context:
+            issue_contexts.append({
+                "number": current_issue_context["number"],
+                "title": current_issue_context["title"],
+                "body": current_issue_context["body"][:1000],  # Limit body length
+                "state": current_issue_context["state"],
+                "labels": current_issue_context["labels"],
+                "comments_count": len(current_issue_context.get("comments", [])),
+                "is_current_context": True  # Flag to indicate this is the active issue
+            })
+            print(f"Added current issue context: #{current_issue_context['number']} - {current_issue_context['title']}")
+        
         # Process folder mentions - collect all files in the folder
         restricted_files = []
         for folder_path in folder_mentions:
@@ -208,6 +231,7 @@ async def handle_chat_message(
                         restrict_files=restricted_files
                     )
                     fresh_rag_context["user_selected_files"] = user_file_contexts
+                    fresh_rag_context["issue_references"] = issue_contexts
                 except Exception as e:
                     print(f"Error getting folder-restricted RAG context: {e}")
                     fresh_rag_context = session.get("repo_context", {})
@@ -217,9 +241,11 @@ async def handle_chat_message(
                 try:
                     fresh_rag_context = await rag_instance.get_relevant_context(user_query)
                     fresh_rag_context["user_selected_files"] = user_file_contexts
+                    fresh_rag_context["issue_references"] = issue_contexts
                 except Exception as e:
                     print(f"Error getting fresh RAG context: {e}")
                     fresh_rag_context = session.get("repo_context", {})
+                    fresh_rag_context["issue_references"] = issue_contexts
         # Use production-grade conversation memory instead of simple sliding window
         conversation_context, memory_stats = await conversation_memory.get_conversation_context(
             history, llm_client, use_compression=True
@@ -896,6 +922,21 @@ async def agentic_query(
                         files_context = f"\n\nContext files mentioned: {', '.join(context_files)}"
                         query_with_context = message.content + files_context
                     
+                    # IMPORTANT: Add current issue context to the query if available
+                    current_issue_context = session_info.get("metadata", {}).get("currentIssueContext")
+                    if current_issue_context:
+                        issue_context_text = f"""
+
+Current Issue Context:
+- Issue #{current_issue_context['number']}: {current_issue_context['title']}
+- State: {current_issue_context['state']}
+- Labels: {', '.join(current_issue_context.get('labels', []))}
+- Description: {current_issue_context['body'][:500]}{'...' if len(current_issue_context.get('body', '')) > 500 else ''}
+
+This issue is currently in the conversation context. Please consider it when analyzing the codebase or answering questions."""
+                        query_with_context = message.content + issue_context_text
+                        print(f"Added issue context to agentic query: #{current_issue_context['number']}")
+                    
                     async for step_json in explorer.stream_query(query_with_context):
                         # Add proper SSE formatting
                         yield f"data: {step_json}\n\n"
@@ -1019,7 +1060,24 @@ async def agentic_query(
             return response
         else:
             # Non-streaming response
-            result = await explorer.query(message.content)
+            query_with_context = message.content
+            
+            # Add current issue context if available
+            current_issue_context = session_info.get("metadata", {}).get("currentIssueContext")
+            if current_issue_context:
+                issue_context_text = f"""
+
+Current Issue Context:
+- Issue #{current_issue_context['number']}: {current_issue_context['title']}
+- State: {current_issue_context['state']}
+- Labels: {', '.join(current_issue_context.get('labels', []))}
+- Description: {current_issue_context['body'][:500]}{'...' if len(current_issue_context.get('body', '')) > 500 else ''}
+
+This issue is currently in the conversation context. Please consider it when analyzing the codebase or answering questions."""
+                query_with_context = message.content + issue_context_text
+                print(f"Added issue context to non-streaming agentic query: #{current_issue_context['number']}")
+            
+            result = await explorer.query(query_with_context)
             
             try:
                 parsed_result = json.loads(result)
@@ -1096,6 +1154,80 @@ async def get_issue_detail(issue_number: int, repo_url: str):
         return issue_response.data.model_dump()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch issue: {str(e)}")
+
+def _extract_issue_references(message_content: str, repo_url: str) -> list:
+    """Extract issue references from message content and return issue data"""
+    import re
+    
+    issues_data = []
+    
+    # Pattern to match issue numbers (#1234) or issue URLs
+    issue_patterns = [
+        r'#(\d+)',  # #1234
+        r'github\.com/[^/]+/[^/]+/issues/(\d+)',  # GitHub issue URLs
+    ]
+    
+    issue_numbers = set()
+    for pattern in issue_patterns:
+        matches = re.findall(pattern, message_content)
+        issue_numbers.update([int(num) for num in matches])
+    
+    # Fetch issue details for each referenced issue
+    for issue_num in issue_numbers:
+        try:
+            issue_url = f"{repo_url}/issues/{issue_num}"
+            issue_response = asyncio.run(github_client.get_issue(issue_url))
+            if issue_response.status == "success" and issue_response.data:
+                issues_data.append({
+                    "number": issue_response.data.number,
+                    "title": issue_response.data.title,
+                    "body": issue_response.data.body[:1000],  # Limit body length
+                    "state": issue_response.data.state,
+                    "labels": issue_response.data.labels,
+                    "comments_count": len(issue_response.data.comments)
+                })
+        except Exception as e:
+            print(f"Error fetching issue #{issue_num}: {e}")
+            continue
+    
+    return issues_data
+
+@app.post("/assistant/sessions/{session_id}/add-issue-context")
+async def add_issue_context_to_session(session_id: str, issue_data: Dict[str, Any]):
+    """Add issue context to session metadata for AI memory"""
+    try:
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Update session metadata with issue context
+        if "metadata" not in session:
+            session["metadata"] = {}
+        
+        session["metadata"]["currentIssueContext"] = {
+            "number": issue_data["number"],
+            "title": issue_data["title"],
+            "body": issue_data["body"],
+            "state": issue_data["state"],
+            "labels": issue_data["labels"],
+            "assignees": issue_data.get("assignees", []),
+            "comments": issue_data.get("comments", []),
+            "created_at": issue_data["created_at"],
+            "url": issue_data["url"]
+        }
+        
+        print(f"Added issue #{issue_data['number']} to session {session_id} metadata")
+        
+        return {
+            "session_id": session_id,
+            "issue_context_added": True,
+            "issue_number": issue_data["number"],
+            "issue_title": issue_data["title"]
+        }
+        
+    except Exception as e:
+        logger.error(f"Error adding issue context to session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
