@@ -130,7 +130,7 @@ The UI provides real-time insight into the agent's decision-making:
 ### 1. Backend Setup
 
 ```bash
-git clone https://github.com/yourusername/triage.flow.git
+git clone https://github.com/ashikshafi08/triage.flow.git
 cd triage.flow
 
 # Using uv (recommended)

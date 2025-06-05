@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
+      - ENABLE_PROMPT_CACHING=true
+      - ENABLE_RAG_CACHING=true
+      - ENABLE_RESPONSE_CACHING=true
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data: 
