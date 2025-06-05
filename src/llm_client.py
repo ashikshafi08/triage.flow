@@ -6,6 +6,7 @@ from llama_index.core.prompts import PromptTemplate
 from .config import settings
 from .models import PromptResponse
 import json
+import aiohttp
 
 # Try to import tiktoken for better token estimation
 try:
@@ -57,15 +58,15 @@ def format_rag_context_for_llm(rag_data: Optional[Dict[str, Any]]) -> str:
     search_type = rag_data.get("search_type", "regular")
     
     if sources:
-        # Set max sources without token-based limiting
-        max_sources = 15
+        # Set max sources using configuration
+        max_sources = settings.MAX_RAG_SOURCES
         
         # If file-oriented search, prioritize showing more files
         if search_type == "file_oriented":
-            max_sources = 25
-            content_preview_length = 300
+            max_sources = min(settings.MAX_RAG_SOURCES, 25)  # Keep reasonable limit for file-oriented
+            content_preview_length = settings.MAX_CONTENT_PREVIEW_CHARS
         else:
-            content_preview_length = 500
+            content_preview_length = settings.MAX_CONTENT_PREVIEW_CHARS
         
         if search_type == "file_oriented":
             sources_str = "FILE SEARCH RESULTS:\n"
@@ -132,7 +133,7 @@ def format_rag_context_for_llm(rag_data: Optional[Dict[str, Any]]) -> str:
     if user_files:
         user_files_str = "\nUSER-SELECTED FILES (via @):\n" + "="*50 + "\n"
         for file in user_files:
-            user_files_str += f"\nFILE: {file['file']}\nCONTENT:\n{file['content'][:1000]}...\n" + "-"*30 + "\n"
+            user_files_str += f"\nFILE: {file['file']}\nCONTENT:\n{file['content'][:settings.MAX_CONTENT_PREVIEW_CHARS]}...\n" + "-"*30 + "\n"
         context_parts.append(user_files_str)
     
     if not context_parts:
@@ -309,87 +310,50 @@ class LLMClient:
 
     async def stream_openrouter_response(self, prompt: str, prompt_type: str, context: Optional[Dict[str, Any]] = None, model: Optional[str] = None) -> AsyncGenerator[str, None]:
         """Stream response from OpenRouter API with cache_control support."""
-        model = model or self.default_model
-        system_prompt = self.system_prompts.get(prompt_type, "")
-        
-        if not settings.openrouter_api_key:
-            yield f"data: {json.dumps({'error': 'OpenRouter API key not configured'})}\n\n"
-            return
-        
-        model_config = self._get_model_config(model)
-        
-        # Prepare messages array with caching support
-        messages = []
-        
-        # Add system message with potential caching
-        if system_prompt:
-            if (settings.ENABLE_PROMPT_CACHING and context and context.get("sources") and 
-                estimate_tokens(format_rag_context_for_llm(context)) >= settings.PROMPT_CACHE_MIN_TOKENS):
-                # Large context - use cache_control in system message
-                formatted_rag_context = format_rag_context_for_llm(context)
-                rag_tokens = estimate_tokens(formatted_rag_context)
-                print(f"Using prompt caching for {rag_tokens} tokens of RAG context in streaming")
-                
-                messages.append({
-                    "role": "system",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"{system_prompt}\n\nBelow is the relevant repository context for this conversation:"
-                        },
-                        {
-                            "type": "text",
-                            "text": formatted_rag_context,
-                            "cache_control": {
-                                "type": "ephemeral"
-                            }
-                        }
-                    ]
-                })
-                # Add user message without RAG context (it's cached in system)
-                messages.append({
-                    "role": "user", 
-                    "content": prompt
-                })
-            else:
-                # Small or no context - traditional format
-                if context:
-                    formatted_rag_context = format_rag_context_for_llm(context)
-                    final_content = f"Relevant Context:\n{formatted_rag_context}\n\nConversation History:\n{prompt}"
-                else:
-                    final_content = prompt
-                    
-                messages.append({"role": "system", "content": system_prompt})
-                messages.append({"role": "user", "content": final_content})
-        else:
-            # No system prompt - add context to user message if needed
-            user_message = self._format_message_with_cache_control("user", prompt, context)
-            messages.append(user_message)
-        
-        # Prepare request payload
-        payload = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": model_config["max_tokens"],
-            "temperature": model_config["temperature"],
-            "stream": True
-        }
-        
         try:
-            async with httpx.AsyncClient() as client:
-                async with client.stream(
-                    "POST",
+            # Get model configuration
+            model_config = self._get_model_config(model)
+            
+            # Prepare the request
+            headers = {
+                "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": settings.APP_URL,
+                "X-Title": "GH Issue Prompt"
+            }
+            
+            # Prepare messages with system prompt
+            messages = [
+                {"role": "system", "content": self._get_system_prompt(prompt_type)}
+            ]
+            
+            # Add context if provided
+            if context:
+                context_str = self._format_context(context)
+                messages.append({"role": "system", "content": f"Context:\n{context_str}"})
+            
+            # Add user message
+            messages.append({"role": "user", "content": prompt})
+            
+            # Prepare request body
+            request_body = {
+                "model": model_config["name"],
+                "messages": messages,
+                "stream": True,
+                "temperature": model_config.get("temperature", 0.7),
+                "max_tokens": model_config.get("max_tokens", 2000)
+            }
+            
+            # Add cache control if enabled
+            if settings.ENABLE_CACHE_CONTROL:
+                request_body["cache_control"] = True
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
                     "https://openrouter.ai/api/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {settings.openrouter_api_key}",
-                        "Content-Type": "application/json",
-                        "HTTP-Referer": "https://github.com/your-repo",  # Replace with actual repo
-                        "X-Title": "Triage Flow Repository Chat"
-                    },
-                    json=payload,
-                    timeout=120.0
+                    headers=headers,
+                    json=request_body
                 ) as response:
-                    
                     if response.status_code != 200:
                         error_detail = f"OpenRouter API error: {response.status_code}"
                         yield f"data: {json.dumps({'error': error_detail})}\n\n"
@@ -399,7 +363,6 @@ class LLMClient:
                         if line.startswith("data: "):
                             data = line[6:].strip()
                             if data == "[DONE]":
-                                # Include final usage info if available
                                 yield f"data: [DONE]\n\n"
                                 return
                             elif data:
@@ -412,8 +375,15 @@ class LLMClient:
                                         if cached_tokens > 0:
                                             print(f"Cache hit: {cached_tokens} tokens cached")
                                     
+                                    # Ensure proper UTF-8 encoding
+                                    content = parsed_data.get('choices', [{}])[0].get('delta', {}).get('content', '')
+                                    if content:
+                                        # Encode and decode to ensure proper UTF-8 handling
+                                        content = content.encode('utf-8', errors='ignore').decode('utf-8')
+                                        parsed_data['choices'][0]['delta']['content'] = content
+                                    
                                     # Forward the chunk
-                                    yield f"data: {data}\n\n"
+                                    yield f"data: {json.dumps(parsed_data)}\n\n"
                                 except json.JSONDecodeError:
                                     # Forward non-JSON data as-is
                                     yield f"data: {data}\n\n"

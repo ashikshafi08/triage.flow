@@ -358,7 +358,17 @@ class LocalRepoContextExtractor:
         # Extract imports
         if metadata["import_pattern"]:
             import_matches = re.findall(metadata["import_pattern"], content, re.MULTILINE)
-            imports = "\n".join(import_matches)
+            # Handle tuples from regex patterns with multiple capture groups
+            if import_matches and isinstance(import_matches[0], tuple):
+                # Flatten tuples and filter out empty strings
+                import_list = []
+                for match in import_matches:
+                    for item in match:
+                        if item.strip():  # Only add non-empty strings
+                            import_list.append(item.strip())
+                imports = "\n".join(import_list)
+            else:
+                imports = "\n".join(import_matches)
         else:
             imports = "No import pattern available"
         

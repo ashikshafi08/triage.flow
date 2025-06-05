@@ -130,40 +130,21 @@ async def handle_chat_message(
     stream: bool = Query(False),
     agentic: bool = Query(False, description="Use agentic system for deeper analysis")
 ):
-    """Enhanced message handler with automatic agentic capabilities when beneficial"""
+    """Enhanced message handler with AgenticRAG integration"""
     try:
         session = session_manager.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
         
-        # Auto-enable agentic capabilities for the session if not already enabled
-        if not session.get("agentic_enabled", False):
-            repo_path = session.get("repo_path")
-            if repo_path:
-                try:
-                    agentic_explorer = AgenticCodebaseExplorer(session_id, repo_path)
-                    agentic_explorers[session_id] = agentic_explorer
-                    session["agentic_enabled"] = True
-                    logger.info(f"Auto-enabled agentic capabilities for session {session_id}")
-                except Exception as e:
-                    logger.warning(f"Could not enable agentic capabilities: {e}")
+        # Get the AgenticRAG instance from session
+        agentic_rag = session.get("agentic_rag")
+        if not agentic_rag:
+            raise HTTPException(status_code=400, detail="Session not properly initialized with AgenticRAG")
         
-        # Determine if this query would benefit from agentic capabilities
-        should_use_agentic = agentic or _should_use_agentic_approach(message.content)
-        
-        # If agentic mode is beneficial and available, use it
-        if should_use_agentic and session.get("agentic_enabled", False) and session_id in agentic_explorers:
-            logger.info(f"Using agentic system for query: {message.content[:100]}...")
-            return await agentic_query(session_id, message, stream)
-        
-        # Otherwise, use the enhanced RAG system
+        # Add user message to session
         session_manager.add_message(session_id, "user", message.content)
-        history = session.get("conversation_history", [])
-        user_query = message.content
-        rag_instance = session.get("rag_instance")
-        fresh_rag_context = {}
         
-        # Extract @file_path mentions from message.content
+        # Extract @file_path mentions and folder mentions from message.content
         user_file_contexts = []
         repo_path = session.get("repo_path")
         
@@ -179,7 +160,7 @@ async def handle_chat_message(
                     content = f.read()
                 user_file_contexts.append({
                     "file": rel_path,
-                    "content": content[:5000]  # Limit to 5k chars per file
+                    "content": content[:settings.MAX_USER_FILE_CONTENT_CHARS]  # Use configurable limit
                 })
         
         # Extract issue references and add to context
@@ -191,17 +172,17 @@ async def handle_chat_message(
             except Exception as e:
                 print(f"Error extracting issue references: {e}")
         
-        # IMPORTANT: Add current issue context from session metadata
+        # Add current issue context from session metadata
         current_issue_context = session.get("metadata", {}).get("currentIssueContext")
         if current_issue_context:
             issue_contexts.append({
                 "number": current_issue_context["number"],
                 "title": current_issue_context["title"],
-                "body": current_issue_context["body"][:1000],  # Limit body length
+                "body": current_issue_context["body"][:1000],
                 "state": current_issue_context["state"],
                 "labels": current_issue_context["labels"],
                 "comments_count": len(current_issue_context.get("comments", [])),
-                "is_current_context": True  # Flag to indicate this is the active issue
+                "is_current_context": True
             })
             print(f"Added current issue context: #{current_issue_context['number']} - {current_issue_context['title']}")
         
@@ -210,9 +191,7 @@ async def handle_chat_message(
         for folder_path in folder_mentions:
             abs_folder_path = os.path.join(repo_path, folder_path)
             if os.path.exists(abs_folder_path) and os.path.isdir(abs_folder_path):
-                # Get all files in the folder (recursively)
                 for root, dirs, files in os.walk(abs_folder_path):
-                    # Skip hidden directories
                     dirs[:] = [d for d in dirs if not d.startswith('.')]
                     for file in files:
                         if not file.startswith('.'):
@@ -220,63 +199,62 @@ async def handle_chat_message(
                             file_rel_path = os.path.relpath(file_abs_path, repo_path)
                             restricted_files.append(file_rel_path)
         
-        fresh_rag_context["user_selected_files"] = user_file_contexts
+        # Use AgenticRAG for enhanced context retrieval
+        user_query = message.content
         
-        # If we have folder mentions, restrict RAG to those files
-        if folder_mentions:
-            if rag_instance:
-                try:
-                    fresh_rag_context = await rag_instance.get_relevant_context(
-                        user_query, 
-                        restrict_files=restricted_files
-                    )
-                    fresh_rag_context["user_selected_files"] = user_file_contexts
-                    fresh_rag_context["issue_references"] = issue_contexts
-                except Exception as e:
-                    print(f"Error getting folder-restricted RAG context: {e}")
-                    fresh_rag_context = session.get("repo_context", {})
-        else:
-            # Regular RAG without folder restrictions
-            if rag_instance:
-                try:
-                    fresh_rag_context = await rag_instance.get_relevant_context(user_query)
-                    fresh_rag_context["user_selected_files"] = user_file_contexts
-                    fresh_rag_context["issue_references"] = issue_contexts
-                except Exception as e:
-                    print(f"Error getting fresh RAG context: {e}")
-                    fresh_rag_context = session.get("repo_context", {})
-                    fresh_rag_context["issue_references"] = issue_contexts
-        # Use production-grade conversation memory instead of simple sliding window
+        # Determine if we should force agentic enhancement
+        force_agentic = agentic or _should_use_agentic_approach(message.content)
+        
+        try:
+            # Get enhanced context using AgenticRAG
+            enhanced_context = await agentic_rag.get_enhanced_context(
+                user_query, 
+                restrict_files=restricted_files if folder_mentions else None,
+                use_agentic_tools=force_agentic
+            )
+            
+            # Add user-selected files and issue contexts
+            enhanced_context["user_selected_files"] = user_file_contexts
+            enhanced_context["issue_references"] = issue_contexts
+            
+        except Exception as e:
+            print(f"Error getting enhanced context: {e}")
+            # Fallback to basic context
+            enhanced_context = {
+                "user_selected_files": user_file_contexts,
+                "issue_references": issue_contexts,
+                "error": f"Enhanced context retrieval failed: {str(e)}"
+            }
+        
+        # Use production-grade conversation memory
+        history = session.get("conversation_history", [])
         conversation_context, memory_stats = await conversation_memory.get_conversation_context(
             history, llm_client, use_compression=True
         )
         
-        # Log memory statistics for debugging
-        print(f"Memory stats for session {session_id}: {memory_stats}")
-        
-        # Log RAG context retrieval for monitoring
-        if fresh_rag_context and fresh_rag_context.get("sources"):
-            print(f"RAG retrieved {len(fresh_rag_context['sources'])} sources for query")
+        # Log context retrieval for monitoring
+        if enhanced_context and enhanced_context.get("sources"):
+            sources_count = len(enhanced_context["sources"])
+            query_analysis = enhanced_context.get("query_analysis", {})
+            processing_strategy = query_analysis.get("processing_strategy", "unknown")
+            print(f"AgenticRAG retrieved {sources_count} sources using strategy: {processing_strategy}")
             if folder_mentions:
                 print(f"Folder-restricted query for folders: {folder_mentions}")
         else:
-            print("No RAG sources retrieved for this query")
+            print("No enhanced context sources retrieved")
         
+        # Get model configuration
         session_llm_config = session.get("llm_config", {})
         model_name = session_llm_config.name if session_llm_config and hasattr(session_llm_config, 'name') else settings.default_model
         
         # Query classification and caching
         query_type = _classify_query_type(user_query)
         use_cache = settings.ENABLE_RESPONSE_CACHING and _should_use_cached_response(query_type, user_query)
-        response_cache_key = None  # Initialize to prevent NameError
+        response_cache_key = None
         
         # Generate cache key for response caching
         if use_cache:
-            # Get repo name from RAG instance if available
-            repo_name = ""
-            if rag_instance and hasattr(rag_instance, 'repo_info'):
-                repo_name = rag_instance.repo_info.get("repo", "")
-            
+            repo_name = agentic_rag.get_repo_info().get("repo", "") if agentic_rag.get_repo_info() else ""
             response_cache_key = response_cache._generate_cache_key(
                 user_query, 
                 session["prompt_type"],
@@ -294,31 +272,27 @@ async def handle_chat_message(
                     # Stream the cached response
                     async def stream_cached():
                         words = cached_response.split()
-                        for i in range(0, len(words), 3):  # Stream 3 words at a time
+                        for i in range(0, len(words), 3):
                             chunk = ' '.join(words[i:i+3]) + ' '
                             yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}\n\n"
-                            await asyncio.sleep(0.01)  # Small delay for streaming effect
+                            await asyncio.sleep(0.01)
                         yield "data: [DONE]\n\n"
                     
                     return StreamingResponse(stream_cached(), media_type="text/event-stream")
                 else:
-                    return ChatMessage(
-                        role="assistant",
-                        content=cached_response
-                    )
+                    return ChatMessage(role="assistant", content=cached_response)
 
         if stream:
             full_response_content = ""
             async def generate_stream():
                 nonlocal full_response_content
+                buffer = ""
                 async for chunk in llm_client.stream_openrouter_response(
-                    prompt=conversation_context,  # Use smart context instead of simple history
+                    prompt=conversation_context,
                     prompt_type=session["prompt_type"],
-                    context=fresh_rag_context,
+                    context=enhanced_context,
                     model=model_name
                 ):
-                    # The chunk is already SSE-formatted, don't modify it
-                    # Extract content for session storage
                     if chunk.startswith('data: '):
                         data = chunk[6:].strip()
                         if data and data != '[DONE]':
@@ -326,13 +300,26 @@ async def handle_chat_message(
                                 json_data = json.loads(data)
                                 content = json_data.get('choices', [{}])[0].get('delta', {}).get('content', '')
                                 if content:
+                                    buffer += content
                                     full_response_content += content
-                            except:
-                                pass
+                                    
+                                    # Send chunks of complete words
+                                    if len(buffer) >= 50 or ' ' in buffer:
+                                        words = buffer.split(' ')
+                                        if len(words) > 1:
+                                            chunk_to_send = ' '.join(words[:-1]) + ' '
+                                            yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk_to_send}}]})}\n\n"
+                                            buffer = words[-1]
+                            except json.JSONDecodeError:
+                                yield f"data: {data}\n\n"
                     yield chunk
+                
+                # Send any remaining content in buffer
+                if buffer:
+                    yield f"data: {json.dumps({'choices': [{'delta': {'content': buffer}}]})}\n\n"
+                
                 session_manager.add_message(session_id, "assistant", full_response_content)
                 
-                # Cache the response if appropriate
                 if use_cache and full_response_content and response_cache_key:
                     await response_cache.set(response_cache_key, full_response_content, settings.CACHE_TTL_RESPONSE)
                     print(f"Cached response for query type: {query_type}")
@@ -340,9 +327,9 @@ async def handle_chat_message(
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
         else:
             llm_response = await llm_client.process_prompt(
-                prompt=conversation_context,  # Use smart context instead of simple history
+                prompt=conversation_context,
                 prompt_type=session["prompt_type"],
-                context=fresh_rag_context,
+                context=enhanced_context,  # Use enhanced context
                 model=model_name
             )
             session_manager.add_message(session_id, "assistant", llm_response.prompt)
@@ -352,10 +339,7 @@ async def handle_chat_message(
                 await response_cache.set(response_cache_key, llm_response.prompt, settings.CACHE_TTL_RESPONSE)
                 print(f"Cached response for query type: {query_type}")
             
-            return ChatMessage(
-                role="assistant",
-                content=llm_response.prompt
-            )
+            return ChatMessage(role="assistant", content=llm_response.prompt)
         
     except Exception as e:
         import traceback
@@ -424,14 +408,26 @@ def _should_use_agentic_approach(query: str) -> bool:
     """Determine if a query would benefit from agentic capabilities"""
     query_lower = query.lower()
     
+    # Simple queries that DON'T need agentic approach
+    simple_patterns = [
+        "list files in", "show files in", "what files are in", "files in the",
+        "list all files", "show me files", "what's in", "contents of"
+    ]
+    
+    # If it's a simple file listing query, use RAG instead
+    if any(pattern in query_lower for pattern in simple_patterns):
+        # Unless it's asking for complex analysis along with listing
+        complex_indicators = ["analyze", "explain", "how", "why", "implement", "debug"]
+        if not any(indicator in query_lower for indicator in complex_indicators):
+            return False
+    
     # Agentic approach is beneficial for:
     # 1. Complex exploration queries
     agentic_patterns = [
-        "explore", "analyze", "find all", "search for", "what files", "which files",
-        "how does", "explain how", "trace", "follow", "investigate", "deep dive",
-        "architecture", "structure", "relationship", "dependency", "related to",
-        "implement", "build", "create", "example", "show me how",
-        "debug", "troubleshoot", "fix", "error", "issue", "problem"
+        "explore", "analyze", "find all", "search for", "trace", "follow", 
+        "investigate", "deep dive", "architecture", "structure", "relationship", 
+        "dependency", "related to", "implement", "build", "create", "example", 
+        "show me how", "debug", "troubleshoot", "fix", "error", "issue", "problem"
     ]
     
     # 2. Multi-step reasoning queries
@@ -461,8 +457,8 @@ def _should_use_agentic_approach(query: str) -> bool:
         if any(term in query_lower for term in specific_terms):
             return True
     
-    # Long queries (>15 words) might benefit from agentic approach, but be more conservative
-    if len(query.split()) > 15 and any(pattern in query_lower for pattern in agentic_patterns):
+    # Long queries (>20 words) might benefit from agentic approach, but be more conservative
+    if len(query.split()) > 20 and any(pattern in query_lower for pattern in agentic_patterns):
         return True
     
     return False
@@ -514,107 +510,52 @@ async def list_files(session_id: str = Query(...)):
 
 @app.get("/api/file-content")
 async def get_file_content(session_id: str = Query(...), file_path: str = Query(...)):
-    """Get the content of a specific file from the repository"""
-    session = session_manager.get_session(session_id)
-    if not session or "repo_path" not in session:
-        raise HTTPException(status_code=404, detail="No repo loaded for this session")
-    
-    repo_path = session["repo_path"]
-    
-    # normalize and validate file path to prevent directory traversal
+    """Get file content with dynamic content handling"""
     try:
-        # Normalize the path and resolve any .. or . components
-        normalized_file_path = os.path.normpath(file_path)
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
         
-        # ensure the path doesn't start with / or contain .. 
-        if normalized_file_path.startswith('/') or '..' in normalized_file_path:
-            raise HTTPException(status_code=403, detail="Invalid file path")
-            
-        abs_file_path = os.path.normpath(os.path.join(repo_path, normalized_file_path))
+        agentic_rag = session.get("agentic_rag")
+        if not agentic_rag:
+            raise HTTPException(status_code=400, detail="AgenticRAG not initialized")
         
-        # ensure the resolved path is within the repo directory
-        if not abs_file_path.startswith(os.path.normpath(repo_path)):
-            raise HTTPException(status_code=403, detail="Access denied: File outside repository")
-    except (ValueError, OSError):
-        raise HTTPException(status_code=400, detail="Invalid file path")
-    
-    if not os.path.exists(abs_file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    if not os.path.isfile(abs_file_path):
-        raise HTTPException(status_code=400, detail="Path is not a file")
-    
-    try:
-        # Get file size
-        file_size = os.path.getsize(abs_file_path)
+        # Use the agentic explorer to read the file
+        content = agentic_rag.explorer.read_file(file_path)
         
-        # Check if file is likely binary
-        def is_binary_file(file_path):
-            """Check if a file is binary by reading the first chunk"""
-            try:
-                with open(file_path, 'rb') as f:
-                    chunk = f.read(1024)
-                    # If there are null bytes, it's likely binary
-                    return b'\x00' in chunk
-            except:
-                return True
-        
-        # Determine file type
-        file_ext = os.path.splitext(file_path)[1].lower()
-        image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp', '.bmp'}
-        text_extensions = {
-            '.txt', '.md', '.py', '.js', '.jsx', '.ts', '.tsx', '.json', '.yaml', '.yml',
-            '.xml', '.html', '.css', '.scss', '.sass', '.less', '.php', '.rb', '.go',
-            '.rs', '.java', '.cpp', '.c', '.h', '.hpp', '.cs', '.swift', '.kt', '.scala',
-            '.sh', '.bash', '.zsh', '.fish', '.ps1', '.sql', '.r', '.dockerfile', '.env',
-            '.gitignore', '.gitattributes', '.log', '.conf', '.config', '.ini', '.toml'
-        }
-        
-        if file_ext in image_extensions:
-            # Handle image files
-            try:
-                import base64
-                with open(abs_file_path, 'rb') as f:
-                    content = base64.b64encode(f.read()).decode('utf-8')
-                return {
-                    "content": content,
-                    "size": file_size,
-                    "type": "image",
-                    "encoding": "base64"
-                }
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Error reading image file: {str(e)}")
-        
-        elif file_ext in text_extensions or not is_binary_file(abs_file_path):
-            # Handle text files
-            try:
-                with open(abs_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                
-                # Limit content size for very large files (>1MB)
-                if len(content) > 1024 * 1024:  # 1MB
-                    content = content[:1024 * 1024] + "\n\n... (File truncated due to size)"
-                
-                return {
-                    "content": content,
-                    "size": file_size,
-                    "type": "text",
-                    "encoding": "utf-8"
-                }
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Error reading text file: {str(e)}")
-        
-        else:
-            # Handle binary files
-            return {
-                "content": "",
-                "size": file_size,
-                "type": "binary",
-                "encoding": None
-            }
+        # If content is JSON string (from chunked reading), parse it
+        try:
+            content_data = json.loads(content)
+            return content_data
+        except json.JSONDecodeError:
+            # Regular string response (error or small file)
+            return {"content": content}
             
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error accessing file: {str(e)}")
+        logger.error(f"Error getting file content: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/file-content/stream")
+async def stream_file_content(session_id: str = Query(...), file_path: str = Query(...)):
+    """Stream large file content in chunks"""
+    try:
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        agentic_rag = session.get("agentic_rag")
+        if not agentic_rag:
+            raise HTTPException(status_code=400, detail="AgenticRAG not initialized")
+        
+        # Use streaming response
+        return StreamingResponse(
+            agentic_rag.explorer.stream_large_file(file_path),
+            media_type="application/x-ndjson"
+        )
+            
+    except Exception as e:
+        logger.error(f"Error streaming file content: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/tree")
 async def get_tree_structure(session_id: str = Query(...)):
@@ -808,63 +749,61 @@ async def get_session_messages(session_id: str):
 
 @app.post("/assistant/sessions/{session_id}/enable-agentic")
 async def enable_agentic_mode(session_id: str):
-    """Enable agentic capabilities for a session"""
+    """Check agentic capabilities for a session (now integrated by default)"""
     try:
         session = session_manager.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
         
-        repo_path = session.get("repo_path")
-        if not repo_path:
-            raise HTTPException(status_code=400, detail="No repository path found for session")
-        
-        # Initialize agentic explorer for this session
-        agentic_explorer = AgenticCodebaseExplorer(session_id, repo_path)
-        agentic_explorers[session_id] = agentic_explorer
-        
-        # Mark session as agentic-enabled
-        session["agentic_enabled"] = True
+        agentic_rag = session.get("agentic_rag")
+        if not agentic_rag:
+            raise HTTPException(status_code=400, detail="Session not properly initialized with AgenticRAG")
         
         return {
             "session_id": session_id,
             "agentic_enabled": True,
+            "integrated_system": "AgenticRAG",
             "tools_available": [
-                "explore_directory",
-                "search_codebase", 
-                "read_file",
-                "analyze_file_structure",
-                "rag_query",
-                "find_related_files"
+                "enhanced_context_retrieval",
+                "query_analysis",
+                "technical_requirements_extraction",
+                "code_references_detection",
+                "semantic_search",
+                "file_structure_analysis",
+                "related_files_discovery",
+                "code_example_generation"
             ]
         }
         
     except Exception as e:
-        logger.error(f"Error enabling agentic mode: {e}")
+        logger.error(f"Error checking agentic mode: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/assistant/sessions/{session_id}/agentic-status")
 async def get_agentic_status(session_id: str):
-    """Check if agentic mode is enabled for a session"""
+    """Check if AgenticRAG is enabled and initialized for a session"""
     try:
         session = session_manager.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
         
-        is_agentic = session.get("agentic_enabled", False)
-        has_explorer = session_id in agentic_explorers
+        agentic_rag = session.get("agentic_rag")
+        is_initialized = agentic_rag is not None
         
         return {
             "session_id": session_id,
-            "agentic_enabled": is_agentic,
-            "explorer_initialized": has_explorer,
-            "tools_available": [
-                "explore_directory",
-                "search_codebase", 
-                "read_file",
-                "analyze_file_structure",
-                "rag_query",
-                "find_related_files"
-            ] if is_agentic else []
+            "agentic_enabled": session.get("agentic_enabled", False),
+            "agentic_rag_initialized": is_initialized,
+            "system_type": "AgenticRAG" if is_initialized else "None",
+            "capabilities": [
+                "Smart query analysis",
+                "Enhanced context retrieval", 
+                "Multi-strategy processing",
+                "Technical requirements extraction",
+                "Code references detection",
+                "Semantic enhancement",
+                "File relationship analysis"
+            ] if is_initialized else []
         }
         
     except Exception as e:
@@ -877,15 +816,15 @@ async def agentic_query(
     message: ChatMessage,
     stream: bool = Query(False)
 ):
+    """Advanced query processing using AgenticRAG's agentic tools"""
     try:
         session_info = session_manager.get_session(session_id)
         if not session_info:
             raise HTTPException(status_code=404, detail="Session not found")
         
-        repo_path = session_info["repo_path"]
-        
-        # Initialize agentic explorer
-        explorer = AgenticCodebaseExplorer(session_id, repo_path)
+        agentic_rag = session_info.get("agentic_rag")
+        if not agentic_rag or not agentic_rag.agentic_explorer:
+            raise HTTPException(status_code=400, detail="AgenticRAG not properly initialized")
         
         # Extract context files from the message content
         context_files = []
@@ -898,7 +837,7 @@ async def agentic_query(
             matches = re.findall(mention_pattern, message.content)
             context_files = matches
         
-        logger.info(f"Agentic query with context files: {context_files}")
+        logger.info(f"Advanced agentic query with context files: {context_files}")
         
         # Shared data structure for streaming and background save
         shared_data = {
@@ -912,20 +851,16 @@ async def agentic_query(
         # Add user message to session history
         session_manager.add_message(session_id, "user", message.content)
 
-        if stream:
-            async def stream_agentic_steps():
-                try:
-                    # Pass context files to the explorer
-                    query_with_context = message.content
-                    if context_files:
-                        # Add context files information to the query
-                        files_context = f"\n\nContext files mentioned: {', '.join(context_files)}"
-                        query_with_context = message.content + files_context
-                    
-                    # IMPORTANT: Add current issue context to the query if available
-                    current_issue_context = session_info.get("metadata", {}).get("currentIssueContext")
-                    if current_issue_context:
-                        issue_context_text = f"""
+        # Prepare query with enhanced context
+        query_with_context = message.content
+        if context_files:
+            files_context = f"\n\nContext files mentioned: {', '.join(context_files)}"
+            query_with_context = message.content + files_context
+        
+        # Add current issue context if available
+        current_issue_context = session_info.get("metadata", {}).get("currentIssueContext")
+        if current_issue_context:
+            issue_context_text = f"""
 
 Current Issue Context:
 - Issue #{current_issue_context['number']}: {current_issue_context['title']}
@@ -934,11 +869,14 @@ Current Issue Context:
 - Description: {current_issue_context['body'][:500]}{'...' if len(current_issue_context.get('body', '')) > 500 else ''}
 
 This issue is currently in the conversation context. Please consider it when analyzing the codebase or answering questions."""
-                        query_with_context = message.content + issue_context_text
-                        print(f"Added issue context to agentic query: #{current_issue_context['number']}")
-                    
-                    async for step_json in explorer.stream_query(query_with_context):
-                        # Add proper SSE formatting
+            query_with_context = message.content + issue_context_text
+            print(f"Added issue context to agentic query: #{current_issue_context['number']}")
+
+        if stream:
+            async def stream_agentic_steps():
+                try:
+                    # Use the agentic explorer from AgenticRAG for deep analysis
+                    async for step_json in agentic_rag.agentic_explorer.stream_query(query_with_context):
                         yield f"data: {step_json}\n\n"
                         # Parse and collect agentic output for background save
                         try:
@@ -979,26 +917,22 @@ This issue is currently in the conversation context. Please consider it when ana
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no"  # Disable proxy buffering
+                    "X-Accel-Buffering": "no"
                 }
             )
             
             # After streaming, save the agentic output to history
             async def save_agentic_message():
-                # Wait longer to ensure streaming is completely done
-                await asyncio.sleep(1.0)  # Increased wait time
+                await asyncio.sleep(1.0)
                 
                 logger.info(f"[DEBUG] Saving agentic message - Steps: {len(shared_data['steps'])}, Final answer: {bool(shared_data['final_answer'])}")
                 
                 # Extract meaningful content from the shared data
                 content = None
                 
-                # First priority: use final_answer if available
                 if shared_data["final_answer"] and shared_data["final_answer"].strip():
                     content = shared_data["final_answer"]
                     logger.info(f"[DEBUG] Using final_answer as content")
-                
-                # Second priority: extract from the last answer step
                 elif shared_data["steps"]:
                     for step in reversed(shared_data["steps"]):
                         if step.get('type') == 'answer' and step.get('content') and step.get('content').strip():
@@ -1006,7 +940,6 @@ This issue is currently in the conversation context. Please consider it when ana
                             logger.info(f"[DEBUG] Using answer step as content")
                             break
                     
-                    # Third priority: combine all answer steps
                     if not content:
                         answer_contents = []
                         for step in shared_data["steps"]:
@@ -1016,7 +949,6 @@ This issue is currently in the conversation context. Please consider it when ana
                             content = '\n\n'.join(answer_contents)
                             logger.info(f"[DEBUG] Using combined answer steps as content")
                 
-                # Fourth priority: create summary from steps
                 if not content and shared_data["steps"]:
                     step_summaries = []
                     for step in shared_data["steps"]:
@@ -1026,17 +958,16 @@ This issue is currently in the conversation context. Please consider it when ana
                             step_summaries.append(f"**{step_type}**: {content_preview}")
                     
                     if step_summaries:
-                        content = "## Analysis Complete\n\n" + '\n\n'.join(step_summaries)
+                        content = "## Advanced Analysis Complete\n\n" + '\n\n'.join(step_summaries)
                         logger.info(f"[DEBUG] Using step summaries as content")
 
-                # Fallback content
                 if not content:
                     if shared_data["error"]:
-                        content = f"Analysis encountered an error: {shared_data['error']}"
+                        content = f"Advanced analysis encountered an error: {shared_data['error']}"
                         logger.info(f"[DEBUG] Using error as content")
                     else:
-                        content = "Agentic analysis completed, but no detailed response was captured."
-                        logger.info(f"[DEBUG] Using fallback content - no meaningful data collected")
+                        content = "Advanced agentic analysis completed."
+                        logger.info(f"[DEBUG] Using fallback content")
 
                 logger.info(f"[DEBUG] Final content length: {len(content) if content else 0}")
 
@@ -1046,42 +977,25 @@ This issue is currently in the conversation context. Please consider it when ana
                         role="assistant",
                         content=content,
                         agenticSteps=shared_data["steps"],
-                        suggestions=shared_data.get("suggestions", [])
+                        suggestions=shared_data.get("suggestions", []),
+                        processingType="advanced_agentic"
                     )
-                    logger.info(f"[DEBUG] Successfully saved agentic message to session {session_id}")
+                    logger.info(f"[DEBUG] Successfully saved advanced agentic message to session {session_id}")
                 except Exception as e:
                     logger.error(f"[DEBUG] Failed to save agentic message: {e}")
 
-            # Create background task
             background_tasks = BackgroundTasks()
             background_tasks.add_task(save_agentic_message)
             response.background = background_tasks
 
             return response
         else:
-            # Non-streaming response
-            query_with_context = message.content
-            
-            # Add current issue context if available
-            current_issue_context = session_info.get("metadata", {}).get("currentIssueContext")
-            if current_issue_context:
-                issue_context_text = f"""
-
-Current Issue Context:
-- Issue #{current_issue_context['number']}: {current_issue_context['title']}
-- State: {current_issue_context['state']}
-- Labels: {', '.join(current_issue_context.get('labels', []))}
-- Description: {current_issue_context['body'][:500]}{'...' if len(current_issue_context.get('body', '')) > 500 else ''}
-
-This issue is currently in the conversation context. Please consider it when analyzing the codebase or answering questions."""
-                query_with_context = message.content + issue_context_text
-                print(f"Added issue context to non-streaming agentic query: #{current_issue_context['number']}")
-            
-            result = await explorer.query(query_with_context)
+            # Non-streaming response using agentic explorer
+            result = await agentic_rag.agentic_explorer.query(query_with_context)
             
             try:
                 parsed_result = json.loads(result)
-                content = parsed_result.get("final_answer", "Analysis completed")
+                content = parsed_result.get("final_answer", "Advanced analysis completed")
                 agentic_steps = parsed_result.get("steps", [])
                 suggestions = parsed_result.get("suggestions", [])
             except json.JSONDecodeError:
@@ -1089,16 +1003,14 @@ This issue is currently in the conversation context. Please consider it when ana
                 agentic_steps = []
                 suggestions = []
             
-            # Add user message to session history
-            session_manager.add_message(session_id, "user", message.content)
-            
             # Add assistant response to session history
             session_manager.add_message(
                 session_id,
                 role="assistant", 
                 content=content,
                 agenticSteps=agentic_steps,
-                suggestions=suggestions
+                suggestions=suggestions,
+                processingType="advanced_agentic"
             )
             
             return ChatMessage(
@@ -1108,22 +1020,27 @@ This issue is currently in the conversation context. Please consider it when ana
             )
             
     except Exception as e:
-        logger.error(f"Error processing agentic query: {e}")
+        logger.error(f"Error processing advanced agentic query: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/assistant/sessions/{session_id}/reset-agentic-memory")
 async def reset_agentic_memory(session_id: str):
     """Reset the agentic system's memory for a session"""
     try:
-        if session_id not in agentic_explorers:
-            raise HTTPException(status_code=404, detail="Agentic explorer not found")
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
         
-        explorer = agentic_explorers[session_id]
-        explorer.reset_memory()
+        agentic_rag = session.get("agentic_rag")
+        if not agentic_rag or not agentic_rag.agentic_explorer:
+            raise HTTPException(status_code=400, detail="AgenticRAG not properly initialized")
+        
+        agentic_rag.agentic_explorer.reset_memory()
         
         return {
             "session_id": session_id,
-            "memory_reset": True
+            "memory_reset": True,
+            "system": "AgenticRAG"
         }
         
     except Exception as e:
@@ -1228,6 +1145,160 @@ async def add_issue_context_to_session(session_id: str, issue_data: Dict[str, An
     except Exception as e:
         logger.error(f"Error adding issue context to session: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/assistant/sessions/{session_id}/agentic-rag-info")
+async def get_agentic_rag_info(session_id: str):
+    """Get detailed information about the AgenticRAG system for a session"""
+    try:
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        agentic_rag = session.get("agentic_rag")
+        if not agentic_rag:
+            return {
+                "session_id": session_id,
+                "agentic_rag_enabled": False,
+                "message": "AgenticRAG not initialized for this session"
+            }
+        
+        repo_info = agentic_rag.get_repo_info()
+        
+        return {
+            "session_id": session_id,
+            "agentic_rag_enabled": True,
+            "repo_info": repo_info,
+            "capabilities": {
+                "query_analysis": True,
+                "enhanced_context_retrieval": True,
+                "multi_strategy_processing": True,
+                "technical_requirements_extraction": True,
+                "code_references_detection": True,
+                "semantic_enhancement": True,
+                "file_relationship_analysis": True,
+                "agentic_tool_integration": True
+            },
+            "processing_strategies": [
+                "agentic_deep - for complex exploration and architecture queries",
+                "agentic_focused - for implementation and analysis queries", 
+                "agentic_light - for simple queries with minimal enhancement",
+                "rag_only - for basic queries without agentic enhancement"
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting AgenticRAG info: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/assistant/sessions/{session_id}/analyze-query")
+async def analyze_query_endpoint(session_id: str, query: dict):
+    """Analyze a query to understand how AgenticRAG would process it"""
+    try:
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        agentic_rag = session.get("agentic_rag")
+        if not agentic_rag:
+            raise HTTPException(status_code=400, detail="AgenticRAG not initialized")
+        
+        user_query = query.get("text", "")
+        if not user_query:
+            raise HTTPException(status_code=400, detail="Query text is required")
+        
+        # Analyze the query
+        analysis = await agentic_rag._analyze_query(user_query)
+        
+        return {
+            "session_id": session_id,
+            "query": user_query,
+            "analysis": analysis,
+            "recommendations": {
+                "suggested_processing": analysis.get("processing_strategy", "unknown"),
+                "expected_enhancement": "Yes" if analysis.get("should_use_agentic", False) else "No",
+                "complexity_level": "High" if analysis.get("complexity_score", 0) > 6 else "Medium" if analysis.get("complexity_score", 0) > 3 else "Low"
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error analyzing query: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/assistant/sessions/{session_id}/context-preview")
+async def get_context_preview(session_id: str, query: str = Query(...), max_sources: int = Query(5)):
+    """Get a preview of what context AgenticRAG would retrieve for a query"""
+    try:
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        agentic_rag = session.get("agentic_rag")
+        if not agentic_rag:
+            raise HTTPException(status_code=400, detail="AgenticRAG not initialized")
+        
+        # Get enhanced context but limit sources for preview
+        enhanced_context = await agentic_rag.get_enhanced_context(
+            query, 
+            restrict_files=None,
+            use_agentic_tools=True
+        )
+        
+        # Limit sources for preview
+        if enhanced_context.get("sources"):
+            enhanced_context["sources"] = enhanced_context["sources"][:max_sources]
+        
+        # Remove large content for preview
+        preview_context = enhanced_context.copy()
+        for source in preview_context.get("sources", []):
+            if len(source.get("content", "")) > 500:
+                source["content"] = source["content"][:500] + "... [truncated for preview]"
+        
+        return {
+            "session_id": session_id,
+            "query": query,
+            "context_preview": preview_context,
+            "total_sources_available": len(enhanced_context.get("sources", [])),
+            "sources_in_preview": len(preview_context.get("sources", []))
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting context preview: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/agentic-rag-features")
+async def get_agentic_rag_features():
+    """Get information about AgenticRAG features and capabilities"""
+    return {
+        "system_name": "AgenticRAG",
+        "description": "Enhanced RAG system combining semantic retrieval with agentic tool capabilities",
+        "features": {
+            "intelligent_query_analysis": {
+                "description": "Automatically analyzes queries to determine optimal processing approach",
+                "capabilities": ["query classification", "complexity assessment", "technical requirements extraction"]
+            },
+            "multi_strategy_processing": {
+                "description": "Uses different processing strategies based on query type and complexity",
+                "strategies": ["agentic_deep", "agentic_focused", "agentic_light", "rag_only"]
+            },
+            "enhanced_context_retrieval": {
+                "description": "Combines traditional RAG with agentic tools for richer context",
+                "enhancements": ["semantic search", "file relationship analysis", "code structure analysis"]
+            },
+            "code_intelligence": {
+                "description": "Advanced understanding of code structure and relationships",
+                "capabilities": ["code reference detection", "file dependency analysis", "example generation"]
+            },
+            "adaptive_enhancement": {
+                "description": "Automatically determines when agentic tools would improve responses",
+                "benefits": ["performance optimization", "quality improvement", "resource efficiency"]
+            }
+        },
+        "integration": {
+            "rag_system": "LocalRepoContextExtractor",
+            "agentic_tools": "AgenticCodebaseExplorer", 
+            "combined_benefits": ["better context quality", "smarter processing", "enhanced user experience"]
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,6 +1,6 @@
 import asyncio
 from src.github_client import GitHubIssueClient
-from src.new_rag import LocalRepoContextExtractor
+from src.agentic_rag import AgenticRAGSystem  # Use the new integrated system
 from src.prompt_generator import PromptGenerator
 from src.llm_client import LLMClient
 from src.models import IssueResponse, PromptRequest, LLMConfig
@@ -92,11 +92,10 @@ def detect_language(code_content: str) -> str:
 
 async def process_issue(job_id: str, issue_url: str, prompt_type: str):
     try:
-        update_progress(job_id, "Starting analysis...")
+        update_progress(job_id, "Starting enhanced analysis...")
 
         # Initialize clients
         github_client = GitHubIssueClient()
-        repo_extractor = LocalRepoContextExtractor()
         prompt_generator = PromptGenerator()
         llm_client = LLMClient()
         
@@ -117,25 +116,33 @@ async def process_issue(job_id: str, issue_url: str, prompt_type: str):
         repo = url_parts[4]
         repo_url = f"https://github.com/{owner}/{repo}.git"
         
-        update_progress(job_id, f"Cloning and processing repository: {owner}/{repo}...")
-        # Load repository context
-        await repo_extractor.load_repository(repo_url)
+        update_progress(job_id, f"Initializing AgenticRAG system for: {owner}/{repo}...")
+        # Initialize AgenticRAG system instead of separate RAG
+        agentic_rag = AgenticRAGSystem(job_id)
+        await agentic_rag.initialize_repository(repo_url)
         
-        update_progress(job_id, "Extracting relevant context from code and documentation...")
-        context = await repo_extractor.get_issue_context(
+        update_progress(job_id, "Extracting enhanced context using agentic capabilities...")
+        # Get enhanced issue context using AgenticRAG
+        context = await agentic_rag.get_issue_context(
             issue_response.data.title,
             issue_response.data.body
         )
+        
+        # Add query analysis information
+        issue_query = f"{issue_response.data.title}\n\n{issue_response.data.body}"
+        query_analysis = await agentic_rag._analyze_query(issue_query)
+        context["query_analysis"] = query_analysis
+        
+        update_progress(job_id, f"Processing strategy: {query_analysis.get('processing_strategy', 'standard')}")
         
         # Configure LLM (using OpenRouter by default)
         llm_config = LLMConfig(
             provider="openrouter",
             name="google/gemini-2.5-flash-preview-05-20", 
-
         )
         
-        update_progress(job_id, "Generating prompt for LLM...")
-        # Generate prompt
+        update_progress(job_id, "Generating enhanced prompt for LLM...")
+        # Generate prompt with enhanced context
         request = PromptRequest(
             issue_url=issue_url,
             prompt_type=prompt_type,
@@ -152,32 +159,49 @@ async def process_issue(job_id: str, issue_url: str, prompt_type: str):
             }
             return
         
-        update_progress(job_id, "Calling LLM for response...")
-        # Get LLM response
+        update_progress(job_id, "Calling LLM for enhanced response...")
+        # Get LLM response with enhanced context
         llm_response = await llm_client.process_prompt(
             prompt=prompt_response.prompt,
             prompt_type=prompt_type,
+            context=context,  # Pass the enhanced context
             model=llm_config.name
         )
         
-        update_progress(job_id, "Finalizing results...")
+        update_progress(job_id, "Finalizing enhanced results...")
         
         # Process the LLM response to ensure proper code block formatting
         processed_response = ensure_proper_code_formatting(llm_response.prompt)
         
-        # Update job status with results
+        # Clean up AgenticRAG resources
+        await agentic_rag.cleanup()
+        
+        # Update job status with enhanced results
         jobs[job_id] = {
             "status": "completed",
             "prompt": prompt_response.prompt,
             "result": processed_response,
             "tokens_used": getattr(llm_response, "tokens_used", 0),
-            "progress_log": jobs[job_id]["progress_log"]
+            "progress_log": jobs[job_id]["progress_log"],
+            "enhancement_info": {
+                "processing_strategy": query_analysis.get("processing_strategy", "unknown"),
+                "query_type": query_analysis.get("query_type", "unknown"),
+                "complexity_score": query_analysis.get("complexity_score", 0),
+                "sources_count": len(context.get("sources", []))
+            }
         }
         
     except Exception as e:
-        update_progress(job_id, f"Processing failed: {str(e)}")
+        update_progress(job_id, f"Enhanced processing failed: {str(e)}")
+        # Clean up resources on error
+        try:
+            if 'agentic_rag' in locals():
+                await agentic_rag.cleanup()
+        except:
+            pass
+        
         jobs[job_id] = {
             "status": "error",
-            "error": f"Processing error: {str(e)}",
+            "error": f"Enhanced processing error: {str(e)}",
             "progress_log": jobs[job_id]["progress_log"]
         }

@@ -6,7 +6,7 @@ Provides directory exploration, codebase search, and file analysis capabilities
 import os
 import json
 import asyncio
-from typing import List, Dict, Any, Optional, Annotated
+from typing import List, Dict, Any, Optional, Annotated, AsyncGenerator
 from pathlib import Path
 import logging
 import io
@@ -302,18 +302,21 @@ class AgenticCodebaseExplorer:
         self, 
         file_path: Annotated[str, "Path to the file to read, relative to repository root"]
     ) -> str:
-        """Read complete file contents"""
+        """Read complete file contents with dynamic chunking"""
         try:
             full_path = self.repo_path / file_path
             
             if not full_path.exists() or not full_path.is_file():
                 return f"File {file_path} does not exist or is not a file"
             
-            # Check file size to avoid reading huge files
+            # Get file stats
             stat = full_path.stat()
-            if stat.st_size > 100000:  # 100KB limit
-                return f"File {file_path} is too large ({stat.st_size} bytes). Use explore_directory for file info."
             
+            # If file is too large, use chunked reading
+            if stat.st_size > settings.MAX_AGENTIC_FILE_SIZE_BYTES and settings.ENABLE_DYNAMIC_CONTENT:
+                return self._read_large_file(full_path, file_path)
+            
+            # Regular file reading for smaller files
             with open(full_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             
@@ -329,6 +332,115 @@ class AgenticCodebaseExplorer:
         except Exception as e:
             logger.error(f"Error reading file {file_path}: {e}")
             return f"Error reading file: {str(e)}"
+
+    def _read_large_file(self, file_path: Path, relative_path: str) -> str:
+        """Read large files in chunks with smart content handling"""
+        try:
+            chunks = []
+            total_lines = 0
+            current_chunk = []
+            current_chunk_size = 0
+            
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    total_lines += 1
+                    line_size = len(line.encode('utf-8'))
+                    
+                    # If adding this line would exceed chunk size, save current chunk
+                    if current_chunk_size + line_size > settings.CONTENT_CHUNK_SIZE:
+                        chunks.append(''.join(current_chunk))
+                        current_chunk = []
+                        current_chunk_size = 0
+                        
+                        # If we've reached max chunks, stop
+                        if len(chunks) >= settings.MAX_CHUNKS_PER_REQUEST:
+                            break
+                    
+                    current_chunk.append(line)
+                    current_chunk_size += line_size
+            
+            # Add final chunk if any
+            if current_chunk:
+                chunks.append(''.join(current_chunk))
+            
+            # If file was truncated, add note
+            truncated_note = ""
+            if len(chunks) >= settings.MAX_CHUNKS_PER_REQUEST:
+                truncated_note = f"\n\nNote: File was truncated after {settings.MAX_CHUNKS_PER_REQUEST} chunks. Total lines: {total_lines}"
+            
+            return json.dumps({
+                "file": relative_path,
+                "size": file_path.stat().st_size,
+                "total_lines": total_lines,
+                "chunks": len(chunks),
+                "content": chunks,
+                "truncated": len(chunks) >= settings.MAX_CHUNKS_PER_REQUEST,
+                "truncated_note": truncated_note
+            }, indent=2)
+            
+        except Exception as e:
+            logger.error(f"Error reading large file {file_path}: {e}")
+            return f"Error reading large file: {str(e)}"
+
+    async def stream_large_file(self, file_path: str) -> AsyncGenerator[str, None]:
+        """Stream large file content in chunks"""
+        try:
+            full_path = self.repo_path / file_path
+            
+            if not full_path.exists() or not full_path.is_file():
+                yield json.dumps({"error": f"File {file_path} does not exist or is not a file"})
+                return
+            
+            # Get file stats
+            stat = full_path.stat()
+            
+            # Send initial metadata
+            yield json.dumps({
+                "type": "metadata",
+                "file": file_path,
+                "size": stat.st_size,
+                "chunk_size": settings.STREAM_CHUNK_SIZE
+            })
+            
+            # Stream file content
+            with open(full_path, 'r', encoding='utf-8') as f:
+                buffer = []
+                current_size = 0
+                
+                for line in f:
+                    line_size = len(line.encode('utf-8'))
+                    
+                    # If adding this line would exceed chunk size, send current buffer
+                    if current_size + line_size > settings.STREAM_CHUNK_SIZE:
+                        yield json.dumps({
+                            "type": "chunk",
+                            "content": ''.join(buffer)
+                        })
+                        buffer = []
+                        current_size = 0
+                    
+                    buffer.append(line)
+                    current_size += line_size
+                
+                # Send final buffer if any
+                if buffer:
+                    yield json.dumps({
+                        "type": "chunk",
+                        "content": ''.join(buffer)
+                    })
+                
+                # Send completion message
+                yield json.dumps({
+                    "type": "complete",
+                    "message": "File streaming completed"
+                })
+                
+        except Exception as e:
+            logger.error(f"Error streaming file {file_path}: {e}")
+            yield json.dumps({
+                "type": "error",
+                "error": str(e)
+            })
     
     def analyze_file_structure(
         self, 
@@ -517,7 +629,7 @@ class AgenticCodebaseExplorer:
                 # Skip binary files and large files
                 try:
                     stat = file_path.stat()
-                    if stat.st_size > 100000:  # 100KB limit
+                    if stat.st_size > settings.MAX_AGENTIC_FILE_SIZE_BYTES:  # Use configurable limit
                         continue
                     
                     # Only search text files
@@ -1409,6 +1521,38 @@ print(result)
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Error in agentic query: {error_msg}")
+            
+            # Handle specific "max iterations" error more gracefully
+            if "max iterations" in error_msg.lower() or "reached max" in error_msg.lower():
+                logger.warning(f"Agent hit max iterations, providing partial result")
+                # Try to extract any partial work from the agent's memory
+                partial_steps = []
+                try:
+                    chat_history = self.agent.memory.get_all()
+                    if chat_history:
+                        for msg in reversed(chat_history):
+                            if hasattr(msg, 'role') and msg.role.value == "assistant":
+                                partial_content = msg.content
+                                partial_steps, partial_answer = self._parse_react_steps(partial_content)
+                                if partial_steps or partial_answer:
+                                    return self._format_agentic_response(
+                                        partial_steps, 
+                                        partial_answer or "Analysis was complex and hit iteration limits. Here's what I found so far.",
+                                        partial=True, 
+                                        suggestions=["Try a more specific question", "Break down your request into smaller parts", "Ask about specific files or directories"]
+                                    )
+                                break
+                except:
+                    pass
+                
+                # Fallback for max iterations
+                return self._format_agentic_response(
+                    [], 
+                    final_answer="This analysis required more steps than allowed. Try asking a more specific question, like 'Show me files in src/' or 'What's in the main directory?'",
+                    partial=True, 
+                    suggestions=["Ask about specific directories", "Request file listings", "Break down complex queries"]
+                )
+            
             # Fallback: return partial/structured error
             return self._format_agentic_response([], final_answer=None, partial=True, suggestions=["Try a more specific question", "Explore a directory", "Ask about a file"])
     
@@ -1659,6 +1803,42 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
         except Exception as e:
             error_msg = str(e)
             logger.error(f"[stream] Error in agentic stream_query: {error_msg}")
+            
+            # Handle specific "max iterations" error more gracefully
+            if "max iterations" in error_msg.lower() or "reached max" in error_msg.lower():
+                logger.warning(f"[stream] Agent hit max iterations, providing partial result")
+                # Try to extract any partial work from the agent's memory
+                try:
+                    chat_history = self.agent.memory.get_all()
+                    partial_steps = []
+                    partial_answer = None
+                    
+                    if chat_history:
+                        for msg in reversed(chat_history):
+                            if hasattr(msg, 'role') and msg.role.value == "assistant":
+                                partial_content = msg.content
+                                partial_steps, partial_answer = self._parse_react_steps(partial_content)
+                                break
+                    
+                    # Yield partial steps if found
+                    if partial_steps:
+                        for step in partial_steps:
+                            yield json.dumps({"type": "step", "step": step})
+                    
+                    # Yield max iterations error with helpful message
+                    yield json.dumps({
+                        "type": "error",
+                        "final": True,
+                        "steps": partial_steps,
+                        "final_answer": partial_answer or "Analysis hit complexity limits. Try a more specific question.",
+                        "partial": True,
+                        "suggestions": ["Ask about specific directories", "Request file listings", "Break down complex queries"],
+                        "error": "Analysis required too many reasoning steps. Please try a more focused question."
+                    })
+                    return
+                except:
+                    pass
+            
             # Yield a structured error/partial result
             yield json.dumps({
                 "type": "error",
@@ -1668,7 +1848,7 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
                 "partial": True,
                 "suggestions": ["Try a more specific question", "Explore a directory", "Ask about a file"],
                 "error": error_msg
-            }) 
+            })
 
     def _clean_captured_output(self, captured_output: str) -> str:
         """Clean captured output to only include ReAct steps with proper formatting"""
@@ -1712,8 +1892,6 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
                 'Step prepare_chat_history produced event',
                 'Step handle_llm_input produced event',
                 '⚡',  # Remove lightning emoji
-                'action',  # Remove standalone 'action' text
-                'Observation:',  # Remove duplicate observation markers
             ]
             
             # Check if this line should be skipped
@@ -1726,12 +1904,12 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
             if should_skip:
                 continue
             
-            # Skip lines that look like terminal formatting artifacts
-            if re.match(r'^[\[\]0-9;m\s]+$', line):
+            # Skip lines that look like terminal formatting artifacts (but be more careful)
+            if re.match(r'^[\[\]0-9;m\s]*$', line):
                 continue
             
             # Detect start of JSON blocks and skip them
-            if line.startswith('{') or ('{' in line and '"' in line):
+            if line.startswith('{') or ('{' in line and '"' in line and ':' in line):
                 skip_json_block = True
                 brace_count = line.count('{') - line.count('}')
                 continue
@@ -1780,9 +1958,12 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
                 
             elif current_step_type and not skip_json_block:
                 # Continue accumulating content for current step, but filter out JSON-like content
-                if not (line.startswith('{') or line.startswith('}') or '"' in line and ':' in line):
-                    # Clean the line of any remaining artifacts
-                    cleaned_line = re.sub(r'[\[\]0-9;m]', '', line).strip()
+                if not (line.startswith('{') or line.startswith('}') or ('"' in line and ':' in line and '{' in line)):
+                    # Remove ANSI escape sequences more carefully without destroying words
+                    cleaned_line = re.sub(r'\x1B\[[0-9;]*[mK]', '', line)
+                    cleaned_line = re.sub(r'\033\[[0-9;]*m', '', cleaned_line)
+                    cleaned_line = cleaned_line.strip()
+                    
                     if cleaned_line:  # Only add non-empty lines
                         # For Answer steps, don't limit length as users expect full responses
                         if current_step_type == "Answer":
@@ -1824,8 +2005,8 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
             '.ml': 'ocaml',
             '.hs': 'haskell',
             '.clj': 'clojure',
-            '.dart': 'dart',
-            '.lua': 'lua',
+                '.dart': 'dart',
+                '.lua': 'lua',
             '.r': 'r',
             '.jl': 'julia'
         }

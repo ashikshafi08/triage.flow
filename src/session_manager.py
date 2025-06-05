@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 from .github_client import GitHubIssueClient
 from .new_rag import LocalRepoContextExtractor
+from .agentic_rag import AgenticRAGSystem  # Import the new integrated system
 from .repo_summarizer import RepositorySummarizer
 from .config import settings
 from .models import Issue, IssueComment  # Import the models
@@ -77,7 +78,7 @@ class SessionManager:
         return session_id, metadata
     
     async def initialize_repo_session(self, session_id: str) -> None:
-        """Initialize repository context for a repo-only session"""
+        """Initialize repository context for a repo-only session using AgenticRAG"""
         session = self.sessions.get(session_id)
         if not session or session["type"] != "repo_chat":
             return
@@ -86,27 +87,23 @@ class SessionManager:
             # Update status
             session["metadata"]["status"] = "cloning"
             
-            # Initialize RAG extractor
-            rag_extractor = LocalRepoContextExtractor()
+            # Initialize AgenticRAG system instead of separate systems
+            agentic_rag = AgenticRAGSystem(session_id)
+            await agentic_rag.initialize_repository(session["repo_url"])
             
-            # Load repository
-            await rag_extractor.load_repository(session["repo_url"])
-            
-            # Update session with RAG instance and repo path
-            session["rag_instance"] = rag_extractor
-            session["repo_path"] = rag_extractor.current_repo_path
+            # Update session with AgenticRAG instance and repo path
+            session["agentic_rag"] = agentic_rag
+            session["repo_path"] = agentic_rag.get_repo_path()
             session["repo_context"] = {
-                "repo_info": {
-                    "owner": session["metadata"]["owner"],
-                    "repo": session["metadata"]["repo"],
-                    "url": session["repo_url"],
-                    "languages": rag_extractor.repo_info.get("languages", {}) if hasattr(rag_extractor, 'repo_info') else {}
-                }
+                "repo_info": agentic_rag.get_repo_info()
             }
+            
+            # Mark session as agentic-enabled by default
+            session["agentic_enabled"] = True
             
             # Update metadata
             session["metadata"]["status"] = "ready"
-            session["metadata"]["repo_path"] = rag_extractor.current_repo_path
+            session["metadata"]["repo_path"] = agentic_rag.get_repo_path()
             
             # Save metadata to disk for persistence
             metadata_path = os.path.join(session["metadata"]["storage_path"], "metadata.json")
@@ -127,7 +124,7 @@ class SessionManager:
         if session["type"] == "repo_chat":
             await self.initialize_repo_session(session_id)
         else:
-            # Original issue-based initialization
+            # Original issue-based initialization with AgenticRAG
             try:
                 # Get issue data
                 issue_response = await self.github_client.get_issue(session["issue_url"])
@@ -140,19 +137,20 @@ class SessionManager:
                     repo = url_parts[4]
                     repo_url = f"https://github.com/{owner}/{repo}.git"
                     
-                    # Initialize RAG extractor
-                    rag_extractor = LocalRepoContextExtractor()
-                    await rag_extractor.load_repository(repo_url)
+                    # Initialize AgenticRAG system
+                    agentic_rag = AgenticRAGSystem(session_id)
+                    await agentic_rag.initialize_repository(repo_url)
                     
-                    # Get issue context
-                    context = await rag_extractor.get_issue_context(
+                    # Get issue context using the enhanced system
+                    context = await agentic_rag.get_issue_context(
                         issue_response.data.title,
                         issue_response.data.body
                     )
                     
-                    session["rag_instance"] = rag_extractor
+                    session["agentic_rag"] = agentic_rag
                     session["repo_context"] = context
-                    session["repo_path"] = rag_extractor.current_repo_path
+                    session["repo_path"] = agentic_rag.get_repo_path()
+                    session["agentic_enabled"] = True  # Auto-enable for issue sessions
                     
             except Exception as e:
                 print(f"Error initializing session context: {e}")
@@ -199,6 +197,13 @@ class SessionManager:
         session = self.sessions.get(session_id)
         if not session:
             return False
+        
+        # Clean up AgenticRAG resources
+        if "agentic_rag" in session:
+            try:
+                asyncio.create_task(session["agentic_rag"].cleanup())
+            except Exception as e:
+                print(f"Error cleaning up AgenticRAG: {e}")
         
         # Clean up storage for repo sessions
         if session.get("type") == "repo_chat":
