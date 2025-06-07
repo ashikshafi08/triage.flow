@@ -149,6 +149,8 @@ venv.bak/
 .mypy_cache/
 
 # FAISS index files
+.faiss*
+
 .faiss_index_*
 storage/
 
