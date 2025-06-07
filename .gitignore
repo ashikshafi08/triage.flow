@@ -190,3 +190,8 @@ htmlcov/
 
 # Embedding cache
 .embedding_cache/
+
+# Index files/folders
+index*
+
+

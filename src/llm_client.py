@@ -54,6 +54,58 @@ def format_rag_context_for_llm(rag_data: Optional[Dict[str, Any]]) -> str:
     if rag_summary:
         context_parts.append(f"Retrieved Context Summary:\n{rag_summary}")
 
+    # Add related issues context if available
+    related_issues = rag_data.get("related_issues")
+    if related_issues and related_issues.get("issues"):
+        issues_str = f"\nRELATED GITHUB ISSUES ({len(related_issues['issues'])} found):\n"
+        issues_str += "=" * 60 + "\n"
+        
+        for i, issue in enumerate(related_issues["issues"], 1):
+            issues_str += f"\n{i}. Issue #{issue['number']}: {issue['title']}\n"
+            issues_str += f"   State: {issue['state']} | Similarity: {issue.get('similarity', 'N/A')}\n"
+            issues_str += f"   URL: {issue['url']}\n"
+            
+            if issue.get('labels'):
+                issues_str += f"   Labels: {', '.join(issue['labels'])}\n"
+            
+            if issue.get('body_preview'):
+                issues_str += f"   Description: {issue['body_preview']}\n"
+            
+            if issue.get('patch_url'):
+                issues_str += f"   Patch/Solution: {issue['patch_url']}\n"
+            
+            issues_str += "   " + "-" * 50 + "\n"
+        
+        issues_str += f"\nIMPORTANT: These are similar past issues from the same repository.\n"
+        issues_str += "Use them as context for understanding common problems, solutions, and patterns.\n"
+        issues_str += "When relevant, reference these issues and their solutions in your response.\n"
+        
+        context_parts.append(issues_str)
+
+    # Add related patches context if available
+    related_patches = rag_data.get("patches")
+    if related_patches:
+        patches_str = f"\nRELATED CODE PATCHES ({len(related_patches)} found):\n"
+        patches_str += "=" * 60 + "\n"
+        
+        for i, patch_result in enumerate(related_patches, 1):
+            patch = patch_result.patch
+            patches_str += f"\n{i}. Patch for Issue #{patch.issue_id} (PR #{patch.pr_number})\n"
+            patches_str += f"   Similarity: {patch_result.similarity:.3f}\n"
+            patches_str += f"   Files Changed: {', '.join(patch.files_changed)}\n"
+            
+            # Truncate long patch summaries for context
+            summary_preview = patch.diff_summary
+            if len(summary_preview) > 1500:
+                summary_preview = summary_preview[:1500] + "\n... [summary truncated] ..."
+            patches_str += f"   Patch Summary:\n{summary_preview}\n"
+            patches_str += "   " + "-" * 50 + "\n"
+        
+        patches_str += f"\nIMPORTANT: These are code patches that fixed similar past issues.\n"
+        patches_str += "Use them as concrete examples of how to solve problems in this codebase.\n"
+        
+        context_parts.append(patches_str)
+
     sources = rag_data.get("sources")
     search_type = rag_data.get("search_type", "regular")
     
@@ -399,6 +451,15 @@ class LLMClient:
         
         model_config = self._get_model_config(model)
         
+        # Ensure model_config is not None
+        if not model_config:
+            print(f"Warning: Could not get model config for {model}, using defaults")
+            model_config = {
+                "max_tokens": 4096,
+                "temperature": 0.7,
+                "context_window": 32000
+            }
+        
         # Prepare messages array
         messages = []
         
@@ -451,8 +512,8 @@ class LLMClient:
         payload = {
             "model": model,
             "messages": messages,
-            "max_tokens": model_config["max_tokens"],
-            "temperature": model_config["temperature"],
+            "max_tokens": model_config.get("max_tokens", 4096),
+            "temperature": model_config.get("temperature", 0.7),
             "stream": False
         }
         

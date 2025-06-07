@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, BackgroundTasks
+from pydantic import BaseModel # Added for IssueContextRequest
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.background import BackgroundTasks
-from .models import PromptRequest, PromptResponse, ChatMessage, SessionResponse, RepoRequest, RepoSessionResponse, SessionListResponse, Issue
+from .models import PromptRequest, PromptResponse, ChatMessage, SessionResponse, RepoRequest, RepoSessionResponse, SessionListResponse, Issue, IssueContextResponse, PullRequestInfo # Added IssueContextResponse and PullRequestInfo
 from .github_client import GitHubIssueClient
 from .llm_client import LLMClient
 from .prompt_generator import PromptGenerator
@@ -11,6 +12,7 @@ from .conversation_memory import ConversationContextManager
 from .cache_manager import response_cache, cleanup_caches_periodically
 from .config import settings
 import nest_asyncio
+from typing import List
 import asyncio
 import os
 from typing import Optional, Dict, Any
@@ -26,6 +28,10 @@ import shutil
 from pathlib import Path
 from .new_rag import LocalRepoContextExtractor
 from .agentic_tools import AgenticCodebaseExplorer
+from .issue_rag import IssueAwareRAG # Added for the new endpoint
+from .local_repo_loader import get_repo_info # Added for the new endpoint
+from .chunk_store import ChunkStoreFactory, RedisChunkStore
+from .founding_member_agent import FoundingMemberAgent
 
 # Enable nested event loops for Jupyter notebooks
 nest_asyncio.apply()
@@ -72,6 +78,52 @@ async def cleanup_sessions_periodically():
 async def startup_event():
     asyncio.create_task(cleanup_sessions_periodically())
     asyncio.create_task(cleanup_caches_periodically())  # Add cache cleanup
+    # Initialize chunk store
+    ChunkStoreFactory.get_instance()
+
+# Pydantic model for the new endpoint's request body
+class IssueContextRequest(BaseModel):
+    query: str
+    repo_url: str
+    max_issues: Optional[int] = 5
+    include_patches: Optional[bool] = True
+
+@app.post("/api/v1/issue_context", response_model=IssueContextResponse)
+async def get_issue_context_api(request: IssueContextRequest):
+    """
+    Get issue context including related issues and patches for a given query and repository.
+    Initializes IssueAwareRAG for the repo on each call for this spike.
+    """
+    try:
+        if not request.repo_url.startswith(('https://github.com/', 'http://github.com/')):
+            raise HTTPException(status_code=400, detail="Invalid repository URL. Must be a GitHub repository.")
+
+        owner, repo_name_from_url = get_repo_info(request.repo_url)
+
+        issue_rag_system = IssueAwareRAG(owner, repo_name_from_url)
+        
+        # For this spike, we use force_rebuild=False to leverage caching if the index exists.
+        # max_issues_for_patch_linkage is set to a small number for potentially faster cold starts
+        # if the index needs to be built.
+        await issue_rag_system.initialize(force_rebuild=False, max_issues_for_patch_linkage=50)
+
+        if not issue_rag_system.is_initialized():
+            # This case should ideally be handled by initialize() raising an error,
+            # but as a safeguard:
+            raise HTTPException(status_code=500, detail="Failed to initialize RAG system for the repository.")
+
+        context_response = await issue_rag_system.get_issue_context(
+            query=request.query,
+            max_issues=request.max_issues,
+            include_patches=request.include_patches
+        )
+        # Ensure the response is a Pydantic model or can be converted to one by FastAPI
+        return context_response
+    except Exception as e:
+        logger.error(f"Error in /api/v1/issue_context: {e}")
+        import traceback
+        traceback.print_exc() # Log full traceback for debugging
+        raise HTTPException(status_code=500, detail=f"An internal server error occurred: {str(e)}")
 
 @app.get("/")
 async def root():
@@ -512,28 +564,89 @@ async def list_files(session_id: str = Query(...)):
 async def get_file_content(session_id: str = Query(...), file_path: str = Query(...)):
     """Get file content with dynamic content handling"""
     try:
+        logger.info(f"Getting file content for session {session_id}, file: {file_path}")
+        
         session = session_manager.get_session(session_id)
         if not session:
+            logger.error(f"Session {session_id} not found")
             raise HTTPException(status_code=404, detail="Session not found")
         
         agentic_rag = session.get("agentic_rag")
         if not agentic_rag:
+            logger.error(f"AgenticRAG not initialized for session {session_id}")
             raise HTTPException(status_code=400, detail="AgenticRAG not initialized")
         
-        # Use the agentic explorer to read the file
-        content = agentic_rag.explorer.read_file(file_path)
+        if not hasattr(agentic_rag, 'agentic_explorer') or not agentic_rag.agentic_explorer:
+            logger.error(f"agentic_explorer not available for session {session_id}")
+            raise HTTPException(status_code=400, detail="Agentic explorer not available")
         
-        # If content is JSON string (from chunked reading), parse it
+        # Use the agentic_explorer to read the file
+        logger.debug(f"Reading file {file_path} using agentic_explorer")
+        content_response = agentic_rag.agentic_explorer.read_file(file_path)
+        logger.debug(f"Got response from agentic_explorer: {type(content_response)}")
+        
+        # Handle different response types from agentic_explorer
         try:
-            content_data = json.loads(content)
-            return content_data
-        except json.JSONDecodeError:
-            # Regular string response (error or small file)
-            return {"content": content}
+            # Try to parse as JSON (normal case)
+            content_data = json.loads(content_response)
+            logger.debug(f"Successfully parsed JSON response")
             
+            # Check if it's an error message (plain string)
+            if isinstance(content_data, dict) and "content" in content_data:
+                # Normal successful response
+                return {
+                    "content": content_data["content"],
+                    "size": content_data.get("size", 0),
+                    "type": "text",
+                    "encoding": "utf-8"
+                }
+            elif isinstance(content_data, dict) and "chunks" in content_data:
+                # Large file with chunks - combine them
+                if isinstance(content_data["content"], list):
+                    combined_content = ''.join(content_data["content"])
+                else:
+                    combined_content = content_data["content"]
+                
+                return {
+                    "content": combined_content,
+                    "size": content_data.get("size", 0),
+                    "type": "text",
+                    "encoding": "utf-8"
+                }
+            else:
+                # Unexpected JSON structure
+                logger.warning(f"Unexpected JSON structure: {content_data}")
+                return {"content": str(content_data), "size": len(str(content_data)), "type": "text"}
+                
+        except json.JSONDecodeError:
+            logger.debug(f"Content is not JSON, treating as plain text")
+            # Plain string response (likely an error message or simple content)
+            if "appears to be binary" in content_response or "cannot be read as text" in content_response:
+                return {
+                    "content": "",
+                    "size": 0,
+                    "type": "binary",
+                    "error": content_response
+                }
+            elif "does not exist" in content_response or "Error" in content_response:
+                logger.error(f"File error: {content_response}")
+                raise HTTPException(status_code=404, detail=content_response)
+            else:
+                # Plain text content
+                return {
+                    "content": content_response,
+                    "size": len(content_response.encode('utf-8')),
+                    "type": "text",
+                    "encoding": "utf-8"
+                }
+            
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error getting file content: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error getting file content for session {session_id}, file {file_path}: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/api/file-content/stream")
 async def stream_file_content(session_id: str = Query(...), file_path: str = Query(...)):
@@ -547,9 +660,9 @@ async def stream_file_content(session_id: str = Query(...), file_path: str = Que
         if not agentic_rag:
             raise HTTPException(status_code=400, detail="AgenticRAG not initialized")
         
-        # Use streaming response
+        # Use agentic_explorer for streaming
         return StreamingResponse(
-            agentic_rag.explorer.stream_large_file(file_path),
+            agentic_rag.agentic_explorer.stream_large_file(file_path),
             media_type="application/x-ndjson"
         )
             
@@ -692,11 +805,14 @@ async def get_session_status(session_id: str):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
+    metadata = session.get("metadata", {})
+    
     return {
         "session_id": session_id,
-        "status": session.get("metadata", {}).get("status", "unknown"),
-        "error": session.get("metadata", {}).get("error"),
-        "repo_info": session.get("repo_context", {}).get("repo_info") if session.get("repo_context") else None
+        "status": metadata.get("status", "unknown"),
+        "error": metadata.get("error"),
+        "repo_info": session.get("repo_context", {}).get("repo_info") if session.get("repo_context") else None,
+        "metadata": metadata  # progress fields
     }
 
 @app.delete("/assistant/sessions/{session_id}")
@@ -1072,6 +1188,23 @@ async def get_issue_detail(issue_number: int, repo_url: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch issue: {str(e)}")
 
+@app.get("/api/prs", response_model=List[PullRequestInfo])
+async def list_pull_requests(
+    repo_url: str = Query(..., description="Repository URL to fetch pull requests from"),
+    state: str = Query("merged", description="State of the pull requests (e.g., open, closed, merged, all)"),
+    session_id: Optional[str] = Query(None, description="Optional session ID for context")
+):
+    """List pull requests for a given repository URL and state."""
+    try:
+        logger.info(f"Received request for PRs: repo_url={repo_url}, state={state}, session_id={session_id}")
+        # Fetch PRs using the github_client
+        pr_list = await github_client.list_pull_requests(repo_url, state)
+        # The list_pull_requests method in github_client already returns a list of PullRequestInfo Pydantic models.
+        return pr_list
+    except Exception as e:
+        logger.error(f"Failed to fetch pull requests for {repo_url} with state {state}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch pull requests: {str(e)}")
+
 def _extract_issue_references(message_content: str, repo_url: str) -> list:
     """Extract issue references from message content and return issue data"""
     import re
@@ -1265,6 +1398,162 @@ async def get_context_preview(session_id: str, query: str = Query(...), max_sour
         logger.error(f"Error getting context preview: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/assistant/sessions/{session_id}/related-issues")
+async def get_related_issues(
+    session_id: str, 
+    query: str = Query(..., description="Query to find similar issues for"),
+    max_issues: int = Query(5, description="Maximum number of issues to return"),
+    state: str = Query("all", description="Issue state filter: open, closed, all"),
+    similarity_threshold: float = Query(0.7, description="Minimum similarity threshold")
+):
+    """Get related GitHub issues for a query"""
+    try:
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        agentic_rag = session.get("agentic_rag")
+        if not agentic_rag:
+            raise HTTPException(status_code=400, detail="AgenticRAG not initialized")
+        
+        # Check if issue RAG is available
+        if not agentic_rag.issue_rag or not agentic_rag.issue_rag.is_initialized():
+            return {
+                "session_id": session_id,
+                "query": query,
+                "related_issues": [],
+                "total_found": 0,
+                "message": "Issue history not available or still indexing",
+                "processing_time": 0.0
+            }
+        
+        # Get issue context
+        issue_context = await agentic_rag.issue_rag.get_issue_context(
+            query, 
+            max_issues=max_issues
+        )
+        
+        # Format response
+        formatted_issues = []
+        for result in issue_context.related_issues:
+            if result.similarity >= similarity_threshold:
+                issue = result.issue
+                formatted_issue = {
+                    "number": issue.id,
+                    "title": issue.title,
+                    "state": issue.state,
+                    "url": f"https://github.com/{agentic_rag.repo_info.get('owner')}/{agentic_rag.repo_info.get('repo')}/issues/{issue.id}",
+                    "similarity": round(result.similarity, 3),
+                    "labels": issue.labels,
+                    "created_at": issue.created_at,
+                    "closed_at": issue.closed_at,
+                    "body_preview": issue.body[:300] + "..." if len(issue.body) > 300 else issue.body,
+                    "match_reasons": result.match_reasons,
+                    "comments_count": len(issue.comments)
+                }
+                
+                if issue.patch_url:
+                    formatted_issue["patch_url"] = issue.patch_url
+                
+                formatted_issues.append(formatted_issue)
+        
+        return {
+            "session_id": session_id,
+            "query": query,
+            "related_issues": formatted_issues,
+            "total_found": len(formatted_issues),
+            "processing_time": issue_context.processing_time,
+            "query_analysis": issue_context.query_analysis
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting related issues: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/assistant/sessions/{session_id}/index-issues")
+async def index_repository_issues(
+    session_id: str,
+    force_rebuild: bool = Query(False, description="Force rebuild of issue index"),
+    max_issues: int = Query(1000, description="Maximum number of issues to index"),
+    max_prs: int = Query(1000, description="Maximum number of PRs to index")
+):
+    """Index repository issues and PRs for RAG"""
+    try:
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Get repo info from session
+        repo_url = session.get("repo_url")
+        if not repo_url:
+            raise HTTPException(status_code=400, detail="No repository URL found in session")
+        
+        # Parse repo owner/name from URL
+        owner, repo = parse_repo_url(repo_url)
+        
+        # Initialize RAG with new parameters
+        rag = IssueAwareRAG(owner, repo)
+        await rag.initialize(
+            force_rebuild=force_rebuild,
+            max_issues_for_patch_linkage=max_issues,
+            max_prs_for_patch_linkage=max_prs
+        )
+        
+        return {
+            "status": "success",
+            "message": f"Indexed issues and PRs for {owner}/{repo}",
+            "max_issues": max_issues,
+            "max_prs": max_prs
+        }
+        
+    except Exception as e:
+        logger.error(f"Error indexing repository: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/assistant/sessions/{session_id}/issue-index-status")
+async def get_issue_index_status(session_id: str):
+    """Get the status of issue indexing for a session"""
+    try:
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        agentic_rag = session.get("agentic_rag")
+        if not agentic_rag:
+            raise HTTPException(status_code=400, detail="AgenticRAG not initialized")
+        
+        status = {
+            "session_id": session_id,
+            "issue_rag_available": agentic_rag.issue_rag is not None,
+            "issue_rag_initialized": False,
+            "repository": None,
+            "total_issues": 0,
+            "last_updated": None
+        }
+        
+        if agentic_rag.repo_info:
+            status["repository"] = f"{agentic_rag.repo_info.get('owner')}/{agentic_rag.repo_info.get('repo')}"
+        
+        if agentic_rag.issue_rag:
+            status["issue_rag_initialized"] = agentic_rag.issue_rag.is_initialized()
+            
+            # Try to get metadata if available
+            try:
+                metadata_file = agentic_rag.issue_rag.indexer.metadata_file
+                if metadata_file.exists():
+                    with open(metadata_file, 'r') as f:
+                        metadata = json.load(f)
+                        status["total_issues"] = metadata.get("total_issues", 0)
+                        status["last_updated"] = metadata.get("last_updated")
+            except Exception:
+                pass
+        
+        return status
+        
+    except Exception as e:
+        logger.error(f"Error getting issue index status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/agentic-rag-features")
 async def get_agentic_rag_features():
     """Get information about AgenticRAG features and capabilities"""
@@ -1299,6 +1588,215 @@ async def get_agentic_rag_features():
             "combined_benefits": ["better context quality", "smarter processing", "enhanced user experience"]
         }
     }
+
+# Chunk API endpoints
+@app.get("/api/agentic/chunk/{chunk_id}")
+async def get_chunk(chunk_id: str):
+    """Retrieve a chunk by ID"""
+    chunk_store = ChunkStoreFactory.get_instance()
+    content = chunk_store.retrieve(chunk_id)
+    if not content:
+        raise HTTPException(status_code=404, detail="Chunk not found")
+    return {"content": content}
+
+@app.delete("/api/agentic/chunk/{chunk_id}")
+async def delete_chunk(chunk_id: str):
+    """Delete a chunk by ID"""
+    chunk_store = ChunkStoreFactory.get_instance()
+    if chunk_store.delete(chunk_id):
+        return {"status": "success"}
+    raise HTTPException(status_code=404, detail="Chunk not found")
+
+@app.get("/api/agentic/redis-health")
+async def check_redis_health():
+    """Check Redis connection health"""
+    try:
+        chunk_store = ChunkStoreFactory.get_instance()
+        if isinstance(chunk_store, RedisChunkStore):
+            # Test Redis connection
+            chunk_store.redis.ping()
+            return {
+                "status": "healthy",
+                "store_type": "redis",
+                "message": "Redis connection is working"
+            }
+        else:
+            return {
+                "status": "degraded",
+                "store_type": "memory",
+                "message": "Using in-memory store (Redis not available)"
+            }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "store_type": "memory",
+            "message": f"Redis error: {str(e)}"
+        }
+
+class FounderSessionRequest(BaseModel):
+    repo_url: str
+    session_name: Optional[str] = None
+
+@app.post("/founder/sessions", response_model=SessionResponse)
+async def create_founding_session(request: FounderSessionRequest, background_tasks: BackgroundTasks):
+    """Create a new session with FoundingMemberAgent for a given repo (async patch linkage)."""
+    try:
+        # Validate repository URL format
+        if not request.repo_url.startswith(('https://github.com/', 'http://github.com/')):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid repository URL. Must be a GitHub repository URL starting with https://github.com/ or http://github.com/"
+            )
+
+        # 1. Create a repo session (gets session_id, metadata)
+        session_id, metadata = session_manager.create_repo_session(request.repo_url, session_name=request.session_name)
+        session = session_manager.get_session(session_id)
+        session["metadata"]["status"] = "cloning"
+        session["metadata"]["progress"] = 0.1
+        session["metadata"]["message"] = "Cloning repository..."
+        session["metadata"]["tools_ready"] = []
+        try:
+            # 2. Load the repo (cloning)
+            code_rag = LocalRepoContextExtractor()
+            await code_rag.load_repository(request.repo_url)
+            session["metadata"]["status"] = "indexing"
+            session["metadata"]["progress"] = 0.4
+            session["metadata"]["message"] = "Indexing codebase..."
+            owner = metadata["owner"]
+            repo = metadata["repo"]
+            # 3. Issue RAG (fast)
+            issue_rag = IssueAwareRAG(owner, repo)
+            await issue_rag.initialize(force_rebuild=False, max_issues_for_patch_linkage=10)  # Small number for fast init
+            session["metadata"]["status"] = "patch_linkage_pending"
+            session["metadata"]["progress"] = 0.7
+            session["metadata"]["message"] = "Patch linkage building in background..."
+            session["metadata"]["tools_ready"] = ["code_rag", "issue_rag"]
+            # Store code_rag and issue_rag for later use
+            session["_code_rag"] = code_rag
+            session["_issue_rag"] = issue_rag
+            # 4. Start patch linkage and agent setup in background
+            def finish_patch_linkage_and_agent():
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                    # Reuse code_rag and issue_rag
+                    # Re-initialize issue_rag with full patch linkage
+                    loop.run_until_complete(issue_rag.initialize(force_rebuild=False))
+                    session = session_manager.get_session(session_id)
+                    # Create the agent and store in session
+                    agent = FoundingMemberAgent(session_id, code_rag, issue_rag)
+                    session["founding_member_agent"] = agent
+                    session["has_founding_member"] = True
+                    session["metadata"]["session_subtype"] = "founding_member"
+                    session["metadata"]["status"] = "ready"
+                    session["metadata"]["progress"] = 1.0
+                    session["metadata"]["message"] = f"FoundingMemberAgent session for {owner}/{repo} is ready."
+                    session["metadata"]["tools_ready"] = ["code_rag", "issue_rag", "patch_linkage", "founding_member_agent"]
+                except Exception as e:
+                    session = session_manager.get_session(session_id)
+                    session["metadata"]["status"] = "error"
+                    session["metadata"]["progress"] = 1.0
+                    session["metadata"]["message"] = f"Failed to initialize: {str(e)}"
+                    session["metadata"]["error"] = str(e)
+            background_tasks.add_task(finish_patch_linkage_and_agent)
+            return {"session_id": session_id, "initial_message": f"FoundingMemberAgent session for {owner}/{repo} is initializing. Patch linkage and advanced tools will be available soon."}
+        except Exception as e:
+            session["metadata"]["status"] = "error"
+            session["metadata"]["progress"] = 1.0
+            session["metadata"]["message"] = f"Failed to initialize: {str(e)}"
+            session["metadata"]["error"] = str(e)
+            session_manager.delete_session(session_id)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to initialize repository session: {str(e)}"
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/founder/sessions/{session_id}/status")
+async def get_founding_session_status(session_id: str):
+    """Get the current status and progress of a founding member session."""
+    session = session_manager.get_session(session_id)
+    if not session or "metadata" not in session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    metadata = session["metadata"]
+    return {
+        "session_id": session_id,
+        "status": metadata.get("status", "unknown"),
+        "progress": metadata.get("progress", 0.0),
+        "message": metadata.get("message", ""),
+        "error": metadata.get("error"),
+        "session_subtype": metadata.get("session_subtype"),
+        "tools_ready": metadata.get("tools_ready", []),
+    }
+
+@app.post("/assistant/sessions/{session_id}/sync-repository")
+async def sync_repository_data(session_id: str, background_tasks: BackgroundTasks):
+    """
+    Triggers a re-sync of the repository's issue and patch data.
+    This involves re-running patch linkage and issue indexing.
+    """
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    agentic_rag = session.get("agentic_rag")
+    if not agentic_rag:
+        raise HTTPException(status_code=400, detail="AgenticRAG system not initialized for this session.")
+    
+    if not agentic_rag.issue_rag:
+        # This can happen if issue_rag failed to initialize initially or is not part of this session type
+        # For repo_chat sessions, initialize_issue_rag_async is called.
+        # We might need to re-trigger that if issue_rag is None.
+        # For simplicity now, assume issue_rag should exist if sync is meaningful.
+        logger.warning(f"Attempted to sync repo for session {session_id} but issue_rag is not available. Attempting to initialize.")
+        # Potentially, we could try to kick off agentic_rag.initialize_issue_rag_async(session) here
+        # if it's None, but that might complicate status management.
+        # For now, let's assume it should have been initialized.
+        # A more robust solution might re-run the full initialize_issue_rag_async if issue_rag is None.
+        # However, a "sync" usually implies refreshing existing data.
+        # If issue_rag is None due to prior init failure, a sync might also fail.
+        # The frontend should ideally guide user if initial setup had issues.
+        # For now, let's proceed assuming issue_rag should be there for a sync operation.
+        # If it's not, it implies a deeper issue with the session's setup.
+        raise HTTPException(status_code=400, detail="Issue RAG system not available for this session. Sync cannot proceed.")
+
+
+    # Update session status to indicate syncing
+    if "metadata" not in session: # Should always exist for repo_chat type
+        session["metadata"] = {}
+    session["metadata"]["status"] = "syncing_issues"
+    session["metadata"]["message"] = "Re-syncing repository issues, PRs, and patches..."
+    # TODO: Consider a mechanism to persist this status update immediately if needed by polling clients.
+    # For now, it's in-memory until the task completes or next status poll.
+
+    async def _sync_task():
+        try:
+            logger.info(f"Starting repository data sync for session {session_id}...")
+            # Calling initialize with force_rebuild=True will re-trigger
+            # patch linkage and issue indexing.
+            await agentic_rag.issue_rag.initialize(
+                force_rebuild=True, 
+                max_issues_for_patch_linkage=settings.MAX_ISSUES_TO_PROCESS, # Use configured defaults
+                max_prs_for_patch_linkage=settings.MAX_PR_TO_PROCESS
+            )
+            session["metadata"]["status"] = "ready" 
+            session["metadata"]["message"] = "Repository data sync complete. Full context updated."
+            logger.info(f"Repository data sync complete for session {session_id}.")
+        except Exception as e:
+            logger.error(f"Error during repository data sync for session {session_id}: {e}", exc_info=True)
+            session["metadata"]["status"] = "error_syncing"
+            session["metadata"]["message"] = f"Error during repository data sync: {str(e)}"
+            session["metadata"]["error"] = str(e) # Store the error message
+        # TODO: Persist final status / notify client more proactively if needed.
+
+    background_tasks.add_task(_sync_task)
+    
+    return {"message": "Repository data sync process started in the background."}
 
 if __name__ == "__main__":
     import uvicorn

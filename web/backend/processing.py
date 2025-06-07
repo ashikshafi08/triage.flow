@@ -7,6 +7,7 @@ from src.models import IssueResponse, PromptRequest, LLMConfig
 from store import jobs  # Import job store from store.py
 import re
 from datetime import datetime
+from typing import Dict, Any
 
 def update_progress(job_id: str, message: str):
     """Helper function to update the progress log for a given job."""
@@ -204,4 +205,56 @@ async def process_issue(job_id: str, issue_url: str, prompt_type: str):
             "status": "error",
             "error": f"Enhanced processing error: {str(e)}",
             "progress_log": jobs[job_id]["progress_log"]
+        }
+
+async def get_indexing_status(session_id: str) -> Dict[str, Any]:
+    """Get the status of issue and PR indexing for a session"""
+    try:
+        session = session_manager.get_session(session_id)
+        if not session:
+            return {
+                "status": "error",
+                "message": "Session not found"
+            }
+        
+        metadata = session.get("metadata", {})
+        indexing_status = metadata.get("indexing_status", "not_started")
+        
+        if indexing_status == "error":
+            return {
+                "status": "error",
+                "message": metadata.get("indexing_error", "Unknown error during indexing"),
+                "details": {
+                    "issues_indexed": False,
+                    "prs_indexed": False
+                }
+            }
+        
+        if indexing_status == "success":
+            return {
+                "status": "success",
+                "message": "Indexing completed successfully",
+                "details": {
+                    "issues_indexed": True,
+                    "prs_indexed": True,
+                    "total_issues": metadata.get("total_issues", 0),
+                    "total_prs": metadata.get("total_prs", 0),
+                    "last_updated": metadata.get("last_updated")
+                }
+            }
+        
+        return {
+            "status": "in_progress",
+            "message": "Indexing in progress",
+            "details": {
+                "issues_indexed": False,
+                "prs_indexed": False
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting indexing status: {e}")
+        return {
+            "status": "error",
+            "message": str(e)
         }

@@ -1,0 +1,19 @@
+query_text,expected_issue_number
+"""[BUG] o4-mini and o3 don't support stop_sequences parameter""",1210
+"""Add Brave search engine to smolagents deafult_tools [Free 2,000 search queries/month]""",1395
+"""[BUG] Cannot use @tool decorator with remote Python executor""",1345
+"""[BUG] When model API provider doesn't support `tool_choice=""""required""""`, OpenAIServerModel breaks at requesting response""",1391
+"""[BUG] Custom FinalAnswerTool with multiple inputs raises unexpected keyword argument error""",1382
+"""Support Streamable stateless MCP Servers""",1354
+"""Rendering LaTeX in GradioUI""",1020
+"""WebSearchTool example from Guide Tour does not work""",1386
+"""LaTeX expressions are corrupted in final_answer""",1369
+"""flatten_messages_as_text=True raises error when images are present""",1370
+"""[BUG] Unexpected keyword argument error in CodeAgent constructor within the gradio_ux.py example""",1372
+"""Incorrect Method Name in MCPClient Docstring Example (stop() should be disconnect())""",1365
+"""[BUG] while using CodeAgent with local ollama getting Error in code parsing""",1251
+"""pip install smolagents not working""",351
+"""OpenRouter API Support Request""",1341
+"""[BUG] Exporting Agents fails if the agent has MCP Tools""",1361
+"""[Feature Request] Remote MCP tools""",350
+"""[DOCS] Broken link in agentic RAG examples page""",1362

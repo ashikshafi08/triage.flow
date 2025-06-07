@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, ClassVar
 import os
 from dotenv import load_dotenv
 
@@ -46,6 +46,11 @@ class Settings(BaseSettings):
             "max_tokens": 4096,
             "temperature": 0.7,
             "context_window": 131072
+        },
+        "deepseek/deepseek-r1-0528-qwen3-8b": {
+            "max_tokens": 4096,
+            "temperature": 0.5,
+            "context_window": 32768  # DeepSeek R1 context window
         }
     }
     
@@ -94,6 +99,10 @@ class Settings(BaseSettings):
     MAX_CONTENT_PREVIEW_CHARS: int = int(os.getenv("MAX_CONTENT_PREVIEW_CHARS", "5000"))  # 5KB default (up from 2KB)
     MAX_AGENTIC_FILE_SIZE_BYTES: int = int(os.getenv("MAX_AGENTIC_FILE_SIZE_BYTES", "5242880"))  # 5MB for agentic tools (up from 1MB)
 
+    # Issue Processing Configuration
+    MAX_ISSUES_TO_PROCESS: Optional[int] = int(os.getenv("MAX_ISSUES_TO_PROCESS", "1000"))  # None means process all issues
+    MAX_PR_TO_PROCESS: Optional[int] = int(os.getenv("MAX_PR_TO_PROCESS", "1000"))  # None means process all PRs
+
     # Token-based limits (more intelligent)
     ENABLE_SMART_TRUNCATION: bool = os.getenv("ENABLE_SMART_TRUNCATION", "true").lower() == "true"
     MAX_CONTEXT_TOKENS: int = int(os.getenv("MAX_CONTEXT_TOKENS", "200000"))  # Increased context window
@@ -105,6 +114,23 @@ class Settings(BaseSettings):
     MAX_CHUNKS_PER_REQUEST: int = int(os.getenv("MAX_CHUNKS_PER_REQUEST", "10"))  # Maximum chunks to process at once
     ENABLE_CONTENT_STREAMING: bool = os.getenv("ENABLE_CONTENT_STREAMING", "true").lower() == "true"
     STREAM_CHUNK_SIZE: int = int(os.getenv("STREAM_CHUNK_SIZE", "1000"))  # Size of streaming chunks
+    
+    # Redis Configuration
+    REDIS_CONFIG: ClassVar[Dict[str, Any]] = {
+        "host": "localhost",  # or your Redis host
+        "port": 6379,
+        "db": 0,
+        "password": None,  # if needed
+        "ssl": False,      # if using SSL
+        "decode_responses": True,  # automatically decode responses to strings
+    }
+
+    # Chunk Store Configuration
+    CHUNK_STORE_CONFIG: ClassVar[Dict[str, Any]] = {
+        "store_type": "redis",  # or "memory"
+        "chunk_ttl": 3600,  # 1 hour expiry for chunks
+        "max_chunk_size": 8192,  # 8KB max chunk size
+    }
     
     class Config:
         env_file = ".env"

@@ -1,6 +1,8 @@
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime
+from dataclasses import dataclass, field
+from .patch_linkage import DiffDoc
 
 class IssueComment(BaseModel):
     body: str
@@ -13,6 +15,7 @@ class Issue(BaseModel):
     body: str
     state: str
     created_at: datetime
+    closed_at: Optional[datetime] = None # Add closed_at field
     url: str
     labels: List[str] = []
     assignees: List[str] = []
@@ -33,8 +36,8 @@ class LLMConfig(BaseModel):
 class PromptRequest(BaseModel):
     issue_url: str
     prompt_type: str
-    llm_config: LLMConfig
-    context: Dict[str, Any] = {}
+    context: Optional[Dict[str, Any]] = None
+    llm_config: Optional[Any] = None
 
 class PromptResponse(BaseModel):
     status: str
@@ -42,7 +45,7 @@ class PromptResponse(BaseModel):
     response: Optional[str] = None
     error: Optional[str] = None
     model_used: Optional[str] = None
-    tokens_used: Optional[int] = None
+    tokens_used: Optional[Dict[str, Any]] = None
 
 class ChatMessage(BaseModel):
     role: str  # "system", "user", or "assistant"
@@ -70,3 +73,51 @@ class SessionListResponse(BaseModel):
     """Response model for listing user sessions"""
     sessions: List[Dict[str, Any]]
     total: int
+
+class IssueDoc(BaseModel):
+    """Document model for issue indexing and retrieval"""
+    id: int                    # issue number 
+    state: str                 # open or closed
+    title: str
+    body: str                  # truncated to 8k chars
+    comments: List[str]        # first + last comment, or summary 
+    labels: List[str]
+    created_at: str
+    closed_at: Optional[str] = None
+    patch_url: Optional[str] = None  # link to merge commit/PR
+    repo: str                  # owner/repo
+    similarity_score: Optional[float] = None  # for search results
+
+class IssueSearchResult(BaseModel):
+    """Result from issue similarity search"""
+    issue: IssueDoc
+    similarity: float
+    match_reasons: List[str]
+
+@dataclass
+class IssueContextResponse:
+    related_issues: List[IssueSearchResult]
+    total_found: int
+    query_analysis: Dict[str, Any]
+    processing_time: float
+    patches: Optional[List['PatchSearchResult']] = None
+
+@dataclass
+class PatchSearchResult:
+    """Represents a search result for a diff/patch"""
+    patch: DiffDoc
+    similarity: float
+    match_reasons: List[str] = field(default_factory=list)
+
+class PullRequestUser(BaseModel):
+    login: str
+
+class PullRequestInfo(BaseModel):
+    number: int
+    title: str
+    merged_at: Optional[str] = None
+    files_changed: List[str] = []
+    issue_id: Optional[int] = None
+    url: Optional[str] = None
+    user: Optional[PullRequestUser] = None
+    body: Optional[str] = None

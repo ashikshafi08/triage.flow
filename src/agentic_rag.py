@@ -14,6 +14,7 @@ import re
 from .new_rag import LocalRepoContextExtractor
 from .agentic_tools import AgenticCodebaseExplorer
 from .config import settings
+from .issue_rag import IssueAwareRAG
 
 logger = logging.getLogger(__name__)
 
@@ -27,38 +28,132 @@ class AgenticRAGSystem:
         self.session_id = session_id
         self.rag_extractor = None
         self.agentic_explorer = None
+        self.issue_rag = None  # Add issue-aware RAG
         self.repo_path = None
         self.repo_info = None
         self._query_cache = {}  # Cache for repeated queries
-        
-    async def initialize_repository(self, repo_url: str, branch: str = "main") -> None:
-        """Initialize both RAG and agentic systems with the repository"""
+
+    async def initialize_core_systems(self, repo_url: str, branch: str = "main") -> None:
+        """Initializes the core RAG (LocalRepoContextExtractor) and basic agentic explorer."""
         try:
-            # Initialize RAG system
+            # Initialize RAG system (core code RAG)
             self.rag_extractor = LocalRepoContextExtractor()
             await self.rag_extractor.load_repository(repo_url, branch)
             
-            # Store repo info
             self.repo_path = self.rag_extractor.current_repo_path
             self.repo_info = self.rag_extractor.repo_info
             
-            # Initialize agentic system
-            self.agentic_explorer = AgenticCodebaseExplorer(self.session_id, self.repo_path)
+            # Initialize agentic explorer (can function with just code RAG initially)
+            # Issue RAG will be linked later if successfully initialized.
+            self.agentic_explorer = AgenticCodebaseExplorer(self.session_id, self.repo_path, issue_rag_system=None)
             
-            logger.info(f"AgenticRAG initialized for session {self.session_id}")
+            logger.info(f"AgenticRAG core systems initialized for session {self.session_id}.")
             
         except Exception as e:
-            logger.error(f"Failed to initialize AgenticRAG: {e}")
+            logger.error(f"Failed to initialize AgenticRAG core systems: {e}")
             raise
+
+    async def initialize_issue_rag_async(self, session: Dict[str, Any]) -> None:
+        """Initializes the IssueAwareRAG system asynchronously and updates session status."""
+        from .patch_linkage import ProgressUpdate
+        
+        if not self.repo_info:
+            logger.error(f"Session {self.session_id}: Cannot initialize IssueAwareRAG: repo_info is missing.")
+            session["metadata"]["status"] = "error_repo_info_missing"
+            session["metadata"]["message"] = "Error: Repository information missing, cannot load issue context."
+            return
+
+        owner = self.repo_info.get("owner")
+        repo_name = self.repo_info.get("repo") # Renamed to avoid conflict with 'repo' module
+
+        if not (owner and repo_name):
+            logger.error(f"Session {self.session_id}: Cannot initialize IssueAwareRAG: owner or repo name is missing from repo_info.")
+            session["metadata"]["status"] = "error_repo_details_missing"
+            session["metadata"]["message"] = "Error: Repository owner/name missing, cannot load issue context."
+            return
+
+        def progress_callback(update: ProgressUpdate):
+            """Update session metadata with detailed progress information"""
+            try:
+                # Update session metadata with detailed progress
+                session["metadata"]["status"] = "issue_linking"
+                session["metadata"]["progress_stage"] = update.stage
+                session["metadata"]["progress_step"] = update.current_step
+                session["metadata"]["progress_percentage"] = update.progress_percentage
+                session["metadata"]["progress_items_processed"] = update.items_processed
+                session["metadata"]["progress_total_items"] = update.total_items
+                session["metadata"]["progress_current_item"] = update.current_item
+                session["metadata"]["progress_estimated_time"] = update.estimated_time_remaining
+                session["metadata"]["progress_details"] = update.details
+                
+                # Create user-friendly message
+                if update.current_item:
+                    message = f"{update.current_step}: {update.current_item}"
+                else:
+                    message = f"{update.current_step} ({update.items_processed}/{update.total_items})"
+                
+                if update.estimated_time_remaining:
+                    minutes = update.estimated_time_remaining // 60
+                    seconds = update.estimated_time_remaining % 60
+                    if minutes > 0:
+                        message += f" - ~{minutes}m {seconds}s remaining"
+                    else:
+                        message += f" - ~{seconds}s remaining"
+                
+                session["metadata"]["message"] = message
+                
+                logger.info(f"Progress: {update.stage} - {update.current_step} ({update.progress_percentage:.1f}%)")
+                
+            except Exception as e:
+                logger.error(f"Error in progress callback: {e}")
+
+        try:
+            logger.info(f"Session {self.session_id}: Starting IssueAwareRAG initialization for {owner}/{repo_name}.")
+            session["metadata"]["status"] = "issue_linking" 
+            session["metadata"]["message"] = f"Starting issue linking and indexing for {owner}/{repo_name}..."
+            
+            # Create IssueAwareRAG with progress callback
+            self.issue_rag = IssueAwareRAG(owner, repo_name, progress_callback)
+            await self.issue_rag.initialize(force_rebuild=False) 
+            
+            if self.agentic_explorer: 
+                self.agentic_explorer.issue_rag = self.issue_rag
+            
+            logger.info(f"Session {self.session_id}: IssueAwareRAG for {owner}/{repo_name} initialized successfully.")
+            session["metadata"]["issue_rag_ready"] = True
+            session["metadata"]["status"] = "ready" 
+            session["metadata"]["message"] = "All systems ready. Full repository context available."
+            
+            # Clear progress fields since we're done
+            for key in ["progress_stage", "progress_step", "progress_percentage", "progress_items_processed", 
+                       "progress_total_items", "progress_current_item", "progress_estimated_time", "progress_details"]:
+                session["metadata"].pop(key, None)
+
+        except Exception as e:
+            logger.error(f"Session {self.session_id}: Failed to initialize IssueAwareRAG for {owner}/{repo_name}: {e}")
+            self.issue_rag = None # Ensure it's None if init failed
+            session["metadata"]["issue_rag_ready"] = False
+            session["metadata"]["status"] = "warning_issue_rag_failed"
+            session["metadata"]["message"] = f"Core chat is ready. Issue context for {owner}/{repo_name} failed to load: {str(e)}"
+            session["metadata"]["error_details_issue_rag"] = str(e) # Store specific error
+            
+            # Clear progress fields on error
+            for key in ["progress_stage", "progress_step", "progress_percentage", "progress_items_processed", 
+                       "progress_total_items", "progress_current_item", "progress_estimated_time", "progress_details"]:
+                session["metadata"].pop(key, None)
+
+        # NOTE: The 'session' dict is modified here. The caller (SessionManager)
+        # is responsible for persisting these changes if needed (e.g., to disk or notifying UI).
     
     async def get_enhanced_context(
         self, 
         query: str, 
         restrict_files: Optional[List[str]] = None,
-        use_agentic_tools: bool = True
+        use_agentic_tools: bool = True,
+        include_issue_context: bool = True
     ) -> Dict[str, Any]:
         """
-        Get enhanced context using both RAG and agentic capabilities
+        Get enhanced context using both RAG and agentic capabilities with issue awareness
         """
         if not self.rag_extractor or not self.agentic_explorer:
             raise ValueError("AgenticRAG not properly initialized")
@@ -69,6 +164,31 @@ class AgenticRAGSystem:
             
             # Get base RAG context
             base_context = await self.rag_extractor.get_relevant_context(query, restrict_files)
+            
+            # Get issue context if enabled and available
+            if include_issue_context and self.issue_rag and self.issue_rag.is_initialized():
+                try:
+                    issue_context = await self.issue_rag.get_issue_context(query, max_issues=3)
+                    if issue_context.related_issues:
+                        base_context["related_issues"] = {
+                            "issues": [
+                                {
+                                    "number": result.issue.id,
+                                    "title": result.issue.title,
+                                    "state": result.issue.state,
+                                    "url": f"https://github.com/{self.repo_info.get('owner')}/{self.repo_info.get('repo')}/issues/{result.issue.id}",
+                                    "similarity": result.similarity,
+                                    "labels": result.issue.labels,
+                                    "body_preview": result.issue.body[:150] + "..." if len(result.issue.body) > 150 else result.issue.body
+                                }
+                                for result in issue_context.related_issues
+                            ],
+                            "total_found": issue_context.total_found,
+                            "processing_time": issue_context.processing_time
+                        }
+                        logger.info(f"Added {len(issue_context.related_issues)} related issues to context")
+                except Exception as e:
+                    logger.warning(f"Failed to get issue context: {e}")
             
             # Enhance with agentic tools if beneficial
             if use_agentic_tools and query_analysis["should_use_agentic"]:
@@ -487,4 +607,4 @@ class AgenticRAGSystem:
             logger.info(f"AgenticRAG cleaned up for session {self.session_id}")
             
         except Exception as e:
-            logger.warning(f"Error during AgenticRAG cleanup: {e}") 
+            logger.warning(f"Error during AgenticRAG cleanup: {e}")

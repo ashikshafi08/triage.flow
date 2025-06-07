@@ -45,9 +45,10 @@ class AgenticCodebaseExplorer:
     Agentic system for exploring and analyzing codebases using LlamaIndex tools
     """
     
-    def __init__(self, session_id: str, repo_path: str):
+    def __init__(self, session_id: str, repo_path: str, issue_rag_system: Optional['IssueAwareRAG'] = None):
         self.session_id = session_id
         self.repo_path = Path(repo_path)
+        self.issue_rag = issue_rag_system
         
         # Initialize LLM based on settings
         self.llm = self._get_llm()
@@ -89,81 +90,99 @@ class AgenticCodebaseExplorer:
             )
     
     def _create_tools(self) -> List[FunctionTool]:
-        """Create all the tools for the agent"""
-        tools = []
-        
-        # Directory exploration tool
-        explore_dir_tool = FunctionTool.from_defaults(
-            fn=self.explore_directory,
-            name="explore_directory",
-            description="Explore the contents of a directory, showing files and subdirectories with metadata"
-        )
-        tools.append(explore_dir_tool)
-        
-        # Codebase search tool
-        search_tool = FunctionTool.from_defaults(
-            fn=self.search_codebase,
-            name="search_codebase", 
-            description="Search through the entire codebase for specific terms, patterns, or concepts"
-        )
-        tools.append(search_tool)
-        
-        # File reading tool
-        read_file_tool = FunctionTool.from_defaults(
-            fn=self.read_file,
-            name="read_file",
-            description="Read and analyze the complete contents of a specific file"
-        )
-        tools.append(read_file_tool)
-        
-        # File analysis tool
-        analyze_file_tool = FunctionTool.from_defaults(
-            fn=self.analyze_file_structure,
-            name="analyze_file_structure",
-            description="Analyze file structure, dependencies, and relationships in the codebase"
-        )
-        tools.append(analyze_file_tool)
-        
-        # Find related files tool
-        find_related_tool = FunctionTool.from_defaults(
-            fn=self.find_related_files,
-            name="find_related_files",
-            description="Find files related to a given file based on imports, references, or naming patterns"
-        )
-        tools.append(find_related_tool)
-        
-        # Simple content search tool (replaces RAG for now)
-        content_search_tool = FunctionTool.from_defaults(
-            fn=self.semantic_content_search,
-            name="semantic_content_search",
-            description="Search for content semantically across files using keyword and context matching"
-        )
-        tools.append(content_search_tool)
-        
-        # Code generation tool
-        code_gen_tool = FunctionTool.from_defaults(
-            fn=self.generate_code_example,
-            name="generate_code_example",
-            description="Generate practical, runnable code examples based on the codebase analysis. Creates complete working examples that users can execute."
-        )
-        tools.append(code_gen_tool)
-        
-        # GitHub Issue Analysis tool
-        issue_analysis_tool = FunctionTool.from_defaults(
-            fn=self.analyze_github_issue,
-            name="analyze_github_issue",
-            description="Analyze a GitHub issue comprehensively, providing insights on complexity, type, requirements, and suggested approach"
-        )
-        tools.append(issue_analysis_tool)
-        
-        # Find Issue Related Files tool
-        find_issue_files_tool = FunctionTool.from_defaults(
-            fn=self.find_issue_related_files,
-            name="find_issue_related_files",
-            description="Find files in the repository that are relevant to a specific GitHub issue using intelligent search patterns"
-        )
-        tools.append(find_issue_files_tool)
-        
+        """Create the tools available to the agent"""
+        tools = [
+            FunctionTool.from_defaults(
+                fn=self.explore_directory,
+                name="explore_directory",
+                description="Explore the contents of a directory in the repository to understand its structure and files"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.search_codebase,
+                name="search_codebase", 
+                description="Search through the codebase for specific patterns, functions, classes, or concepts"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.read_file,
+                name="read_file",
+                description="Read the complete contents of a specific file in the repository"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.analyze_file_structure,
+                name="analyze_file_structure",
+                description="Analyze the structure and components of a file or directory"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.find_related_files,
+                name="find_related_files",
+                description="Find files related to a specific file based on imports, references, and patterns"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.semantic_content_search,
+                name="semantic_content_search",
+                description="Search for content semantically across all files in the repository"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.generate_code_example,
+                name="generate_code_example",
+                description="Generate code examples based on repository patterns and context"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.analyze_github_issue,
+                name="analyze_github_issue",
+                description="Analyze a GitHub issue to understand the problem and provide solution approaches"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.find_issue_related_files,
+                name="find_issue_related_files",
+                description="Find files in the codebase that are related to a specific issue or problem description"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.related_issues,
+                name="related_issues",
+                description="Find similar past GitHub issues in the current repository that might provide context or solutions"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.get_pr_for_issue,
+                name="get_pr_for_issue",
+                description="Find the pull request associated with a given issue number"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.get_pr_diff,
+                name="get_pr_diff",
+                description="Retrieve the diff for a given pull request number"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.get_files_changed_in_pr,
+                name="get_files_changed_in_pr",
+                description="Lists all files that were modified, added, or deleted in a given pull request."
+            ),
+            FunctionTool.from_defaults(
+                fn=self.get_pr_summary,
+                name="get_pr_summary",
+                description="Provides a concise summary of the changes made in a specific pull request, based on its diff."
+            ),
+            FunctionTool.from_defaults(
+                fn=self.find_issues_related_to_file,
+                name="find_issues_related_to_file",
+                description="Finds issues whose resolution involved changes to the specified file path."
+            ),
+            FunctionTool.from_defaults(
+                fn=self.get_issue_resolution_summary,
+                name="get_issue_resolution_summary",
+                description="Summarizes how a specific issue was resolved, including linked PRs and a summary of changes."
+            ),
+            FunctionTool.from_defaults(
+                fn=self.check_issue_status_and_linked_pr,
+                name="check_issue_status_and_linked_pr",
+                description="Checks the current status (open/closed) of a GitHub issue and lists any directly linked Pull Requests."
+            ),
+            FunctionTool.from_defaults(
+                fn=self.write_complete_code,
+                name="write_complete_code",
+                description="Write complete, untruncated code files based on specifications and reference files"
+            )
+        ]
         return tools
     
     def explore_directory(
@@ -1502,6 +1521,64 @@ print(result)
             # Parse steps from the full ReAct trace
             steps, final_answer = self._parse_react_steps(full_react_trace)
             
+            # Fallback: If no answer, but a tool was called, try to get its output directly
+            if not final_answer:
+                import re
+                # Check for get_pr_summary tool usage
+                pr_summary_match = re.search(r'Action: get_pr_summary\\s*(\\d+)', full_react_trace)
+                if pr_summary_match:
+                    pr_number = int(pr_summary_match.group(1))
+                    logger.info(f"[DEBUG] Fallback: Directly calling get_pr_summary({pr_number})")
+                    try:
+                        tool_output = self.get_pr_summary(pr_number)
+                        final_answer = tool_output
+                        # Add a synthetic answer step for UI consistency
+                        steps.append({
+                            "type": "answer",
+                            "content": tool_output,
+                            "step": len(steps)
+                        })
+                    except Exception as e:
+                        logger.error(f"[DEBUG] Fallback get_pr_summary failed: {e}")
+                
+                # Check for get_pr_diff tool usage
+                pr_diff_match = re.search(r'(?:Action: get_pr_diff|get_pr_diff|diff.*pr.*#?(\d+)|pr.*#?(\d+).*diff)', full_react_trace, re.IGNORECASE)
+                if pr_diff_match:
+                    # Extract PR number from the match
+                    pr_number = None
+                    for group in pr_diff_match.groups():
+                        if group and group.isdigit():
+                            pr_number = int(group)
+                            break
+                    
+                    # If no number found in the action, try to extract from the user message
+                    if not pr_number:
+                        # Look for PR number in the original user message
+                        user_pr_match = re.search(r'pr.*#?(\d+)|#(\d+)', user_message, re.IGNORECASE)
+                        if user_pr_match:
+                            for group in user_pr_match.groups():
+                                if group and group.isdigit():
+                                    pr_number = int(group)
+                                    break
+                    
+                    if pr_number:
+                        logger.info(f"[DEBUG] Fallback: Directly calling get_pr_diff({pr_number})")
+                        try:
+                            tool_output = self.get_pr_diff(pr_number)
+                            final_answer = tool_output
+                            # Add a synthetic answer step for UI consistency
+                            steps.append({
+                                "type": "answer",
+                                "content": tool_output,
+                                "step": len(steps)
+                            })
+                        except Exception as e:
+                            logger.error(f"[DEBUG] Fallback get_pr_diff failed: {e}")
+                    else:
+                        logger.warning(f"[DEBUG] get_pr_diff action detected but no PR number found")
+                
+                # Add more tool-specific fallbacks here if needed
+            
             # If no steps found and no final answer, try using the original response as final answer
             if len(steps) == 0 and not final_answer:
                 response_str = str(response).strip()
@@ -1767,6 +1844,62 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
             # Parse steps from the full ReAct trace
             steps, final_answer = self._parse_react_steps(full_react_trace)
             
+            # Fallback: If no answer, but a tool was called, try to get its output directly
+            if not final_answer:
+                import re
+                # Check for get_pr_summary tool usage
+                pr_summary_match = re.search(r'Action: get_pr_summary\\s*(\\d+)', full_react_trace)
+                if pr_summary_match:
+                    pr_number = int(pr_summary_match.group(1))
+                    logger.info(f"[DEBUG] Stream fallback: Directly calling get_pr_summary({pr_number})")
+                    try:
+                        tool_output = self.get_pr_summary(pr_number)
+                        final_answer = tool_output
+                        # Add a synthetic answer step for UI consistency
+                        steps.append({
+                            "type": "answer",
+                            "content": tool_output,
+                            "step": len(steps)
+                        })
+                    except Exception as e:
+                        logger.error(f"[DEBUG] Stream fallback get_pr_summary failed: {e}")
+                
+                # Check for get_pr_diff tool usage
+                pr_diff_match = re.search(r'(?:Action: get_pr_diff|get_pr_diff|diff.*pr.*#?(\d+)|pr.*#?(\d+).*diff)', full_react_trace, re.IGNORECASE)
+                if pr_diff_match:
+                    # Extract PR number from the match
+                    pr_number = None
+                    for group in pr_diff_match.groups():
+                        if group and group.isdigit():
+                            pr_number = int(group)
+                            break
+                    
+                    # If no number found in the action, try to extract from the user message
+                    if not pr_number:
+                        # Look for PR number in the original user message
+                        user_pr_match = re.search(r'pr.*#?(\d+)|#(\d+)', user_message, re.IGNORECASE)
+                        if user_pr_match:
+                            for group in user_pr_match.groups():
+                                if group and group.isdigit():
+                                    pr_number = int(group)
+                                    break
+                    
+                    if pr_number:
+                        logger.info(f"[DEBUG] Stream fallback: Directly calling get_pr_diff({pr_number})")
+                        try:
+                            tool_output = self.get_pr_diff(pr_number)
+                            final_answer = tool_output
+                            # Add a synthetic answer step for UI consistency
+                            steps.append({
+                                "type": "answer",
+                                "content": tool_output,
+                                "step": len(steps)
+                            })
+                        except Exception as e:
+                            logger.error(f"[DEBUG] Stream fallback get_pr_diff failed: {e}")
+                    else:
+                        logger.warning(f"[DEBUG] get_pr_diff action detected but no PR number found")
+            
             # If no steps found and no final answer, try using the original response as final answer
             if len(steps) == 0 and not final_answer:
                 response_str = str(response).strip()
@@ -1784,22 +1917,49 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
 
             # Yield each step incrementally
             for i, step in enumerate(steps):
-                logger.info(f"[DEBUG] Yielding step {i}: type={step['type']}, content_len={len(step['content'])}")
-                yield json.dumps({"type": "step", "step": step})
-                await asyncio.sleep(0.01)  # Small delay for streaming effect
+                try:
+                    # Ensure step has content field for logging
+                    content_len = len(step.get('content', '')) if step.get('content') else 0
+                    logger.info(f"[DEBUG] Yielding step {i}: type={step.get('type', 'unknown')}, content_len={content_len}")
+                    yield json.dumps({"type": "step", "step": step})
+                    await asyncio.sleep(0.01)  # Small delay for streaming effect
+                except Exception as step_error:
+                    logger.error(f"[DEBUG] Error yielding step {i}: {step_error}")
+                    # Yield a safe fallback step
+                    safe_step = {
+                        "type": step.get("type", "unknown"),
+                        "content": f"Step {i}: {step.get('type', 'unknown')} (error in serialization)",
+                        "step": i
+                    }
+                    yield json.dumps({"type": "step", "step": safe_step})
 
             # Yield a final event with all steps, final answer, and suggestions
-            final_payload = {
-                "type": "final",
-                "final": True,
-                "steps": steps,
-                "final_answer": final_answer,
-                "partial": False,
-                "suggestions": suggestions or [],
-                "total_steps": len(steps)
-            }
-            logger.info(f"[DEBUG] Yielding final payload with {len(steps)} steps and final_answer: {bool(final_answer)}")
-            yield json.dumps(final_payload)
+            try:
+                final_payload = {
+                    "type": "final",
+                    "final": True,
+                    "steps": steps,
+                    "final_answer": final_answer,
+                    "partial": False,
+                    "suggestions": suggestions or [],
+                    "total_steps": len(steps)
+                }
+                logger.info(f"[DEBUG] Yielding final payload with {len(steps)} steps and final_answer: {bool(final_answer)}")
+                yield json.dumps(final_payload)
+            except Exception as final_error:
+                logger.error(f"[DEBUG] Error yielding final payload: {final_error}")
+                # Yield a safe fallback final payload
+                safe_final_payload = {
+                    "type": "final",
+                    "final": True,
+                    "steps": [],
+                    "final_answer": str(final_answer) if final_answer else "Analysis completed with errors",
+                    "partial": True,
+                    "suggestions": [],
+                    "total_steps": len(steps),
+                    "error": "Error in final payload serialization"
+                }
+                yield json.dumps(safe_final_payload)
         except Exception as e:
             error_msg = str(e)
             logger.error(f"[stream] Error in agentic stream_query: {error_msg}")
@@ -1851,132 +2011,229 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
             })
 
     def _clean_captured_output(self, captured_output: str) -> str:
-        """Clean captured output to only include ReAct steps with proper formatting"""
+        """Clean captured output to remove logging noise but preserve ReAct trace."""
         if not captured_output:
             return ""
         
-        # First, remove all ANSI color codes and terminal formatting
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
         cleaned_output = ansi_escape.sub('', captured_output)
         
-        # Also remove common escape sequences
+        # Remove common escape sequences
         cleaned_output = re.sub(r'\033\[[0-9;]*m', '', cleaned_output)
-        cleaned_output = re.sub(r'\[0m', '', cleaned_output)
-        cleaned_output = re.sub(r'\[1;3;[0-9]+m', '', cleaned_output)
-        
+        cleaned_output = re.sub(r'\[0m', '', cleaned_output) # Common reset sequence
+        cleaned_output = re.sub(r'\[1;3;[0-9]+m', '', cleaned_output) # Example colored output
+
         lines = cleaned_output.split('\n')
-        cleaned_lines = []
-        current_step_type = None
-        current_step_content = []
-        skip_json_block = False
-        brace_count = 0
+        preserved_lines = []
         
+        # More specific patterns for LlamaIndex and httpx logging
+        skip_log_patterns = [
+            re.compile(r'^\s*DEBUG:'),
+            re.compile(r'^\s*INFO:'),
+            re.compile(r'^\s*WARNING:'),
+            re.compile(r'^\s*ERROR:'),
+            re.compile(r'^\s*INFO:httpx:HTTP Request:'),
+            re.compile(r'^\s*⚡'), # LlamaIndex lightning bolt
+            re.compile(r'^\s*> Running step'), # LlamaIndex step execution log
+            re.compile(r'^\s*Step \w+ produced event'), # LlamaIndex event log
+        ]
+
         for line in lines:
-            line = line.strip()
+            # Don't strip lines globally yet, preserve original form for parsing
             
-            # Skip empty lines
-            if not line:
+            # Skip specific logging patterns
+            if any(pattern.search(line) for pattern in skip_log_patterns):
                 continue
             
-            # Skip common logging/debug patterns
-            skip_patterns = [
-                'Running step',
-                'Step input:',
-                'INFO:httpx:',
-                'HTTP Request:',
-                'DEBUG:',
-                'INFO:',
-                'WARNING:',
-                'ERROR:',
-                'Step new_user_msg produced event',
-                'Step prepare_chat_history produced event',
-                'Step handle_llm_input produced event',
-                '⚡',  # Remove lightning emoji
-            ]
-            
-            # Check if this line should be skipped
-            should_skip = False
-            for pattern in skip_patterns:
-                if pattern in line:
-                    should_skip = True
-                    break
-            
-            if should_skip:
+            # Skip lines that are purely terminal formatting artifacts after initial cleaning
+            if re.match(r'^[\[\]0-9;m\s]*$', line.strip()): 
                 continue
             
-            # Skip lines that look like terminal formatting artifacts (but be more careful)
-            if re.match(r'^[\[\]0-9;m\s]*$', line):
-                continue
+            preserved_lines.append(line) # Keep the original line, not stripped
+        
+        return '\n'.join(preserved_lines)
+    
+    def _parse_react_steps(self, raw_response: str):
+        """Parse ReAct steps from raw agent response into a structured format."""
+        logger.info(f"[DEBUG] Parsing ReAct trace (length: {len(raw_response)}): {raw_response[:500]}")
+        
+        steps = []
+        lines = raw_response.split('\n')
+        i = 0
+        step_counter = 0
+
+        while i < len(lines):
+            line_content_stripped = lines[i].strip() # For prefix checking
+            original_line = lines[i] # Keep original for content extraction
             
-            # Detect start of JSON blocks and skip them
-            if line.startswith('{') or ('{' in line and '"' in line and ':' in line):
-                skip_json_block = True
-                brace_count = line.count('{') - line.count('}')
+            if not line_content_stripped: # Skip empty lines
+                i += 1
                 continue
+
+            current_step_data = {"step": step_counter}
+
+            if line_content_stripped.startswith("Thought:"):
+                current_step_data["type"] = "thought"
+                # Content starts after "Thought:"
+                content_lines = [original_line.split("Thought:", 1)[1].strip()]
+                i += 1
+                # Collect subsequent lines until a new ReAct keyword or end of lines
+                while i < len(lines) and not re.match(r"^(Thought:|Action:|Action Input:|Observation:|Answer:|Final Answer:)", lines[i].strip()):
+                    content_lines.append(lines[i]) # Keep original spacing/indentation
+                    i += 1
+                current_step_data["content"] = "\n".join(content_lines).strip()
+                steps.append(current_step_data)
+                step_counter += 1
             
-            # Continue skipping JSON content
-            if skip_json_block:
-                brace_count += line.count('{') - line.count('}')
-                if brace_count <= 0:
-                    skip_json_block = False
-                continue
-            
-            # Detect ReAct control tokens (case insensitive)
-            line_lower = line.lower()
-            if line_lower.startswith('thought:'):
-                # Save previous step if exists
-                if current_step_type and current_step_content:
-                    cleaned_lines.append(f"{current_step_type}: {' '.join(current_step_content)}")
-                current_step_type = "Thought"
-                current_step_content = [line.split(':', 1)[1].strip() if ':' in line else line]
-                
-            elif line_lower.startswith('action:'):
-                # Save previous step if exists
-                if current_step_type and current_step_content:
-                    cleaned_lines.append(f"{current_step_type}: {' '.join(current_step_content)}")
-                current_step_type = "Action"
-                current_step_content = [line.split(':', 1)[1].strip() if ':' in line else line]
-                
-            elif line_lower.startswith('action input:'):
-                # Skip Action Input as it's usually verbose JSON
-                continue
-                
-            elif line_lower.startswith('observation:'):
-                # Save previous step if exists
-                if current_step_type and current_step_content:
-                    cleaned_lines.append(f"{current_step_type}: {' '.join(current_step_content)}")
-                current_step_type = "Observation"
-                # For observations, just add a summary instead of full content
-                current_step_content = ["Tool executed successfully with results."]
-                
-            elif line_lower.startswith('answer:'):
-                # Save previous step if exists
-                if current_step_type and current_step_content:
-                    cleaned_lines.append(f"{current_step_type}: {' '.join(current_step_content)}")
-                current_step_type = "Answer"
-                current_step_content = [line.split(':', 1)[1].strip() if ':' in line else line]
-                
-            elif current_step_type and not skip_json_block:
-                # Continue accumulating content for current step, but filter out JSON-like content
-                if not (line.startswith('{') or line.startswith('}') or ('"' in line and ':' in line and '{' in line)):
-                    # Remove ANSI escape sequences more carefully without destroying words
-                    cleaned_line = re.sub(r'\x1B\[[0-9;]*[mK]', '', line)
-                    cleaned_line = re.sub(r'\033\[[0-9;]*m', '', cleaned_line)
-                    cleaned_line = cleaned_line.strip()
+            elif line_content_stripped.startswith("Action:"):
+                current_step_data["type"] = "action"
+                current_step_data["tool_name"] = original_line.split("Action:", 1)[1].strip()
+                current_step_data["content"] = f"Calling tool: {current_step_data['tool_name']}"  # Ensure content exists
+                i += 1
+                # Look for Action Input immediately following
+                if i < len(lines) and lines[i].strip().startswith("Action Input:"):
+                    action_input_header = lines[i].strip()
+                    action_input_content_start_index = i
                     
-                    if cleaned_line:  # Only add non-empty lines
-                        # For Answer steps, don't limit length as users expect full responses
-                        if current_step_type == "Answer":
-                            current_step_content.append(cleaned_line)
-                        # For other steps, use a more generous limit
-                        elif len(' '.join(current_step_content + [cleaned_line])) < 2000:
-                            current_step_content.append(cleaned_line)
+                    # The content of Action Input is everything after "Action Input:"
+                    # It might be single-line or multi-line JSON.
+                    input_json_lines = [lines[i].split("Action Input:", 1)[1].strip()]
+                    i += 1
+                    
+                    # Heuristic to capture multi-line JSON:
+                    # Continue if line doesn't start with another ReAct keyword
+                    # and we haven't hit a balanced JSON structure (if it looks like JSON)
+                    # This is tricky because Action Input might not always be JSON.
+                    
+                    # Try to detect if it's JSON
+                    first_input_line_stripped = input_json_lines[0]
+                    is_likely_json = first_input_line_stripped.startswith('{') or first_input_line_stripped.startswith('[')
+
+                    if is_likely_json:
+                        open_braces = first_input_line_stripped.count('{') + first_input_line_stripped.count('[')
+                        close_braces = first_input_line_stripped.count('}') + first_input_line_stripped.count(']')
+                        
+                        while i < len(lines) and not re.match(r"^(Thought:|Action:|Observation:|Answer:|Final Answer:)", lines[i].strip()):
+                            current_input_line = lines[i] # Keep original
+                            input_json_lines.append(current_input_line)
+                            open_braces += current_input_line.count('{') + current_input_line.count('[')
+                            close_braces += current_input_line.count('}') + current_input_line.count(']')
+                            i += 1
+                            if open_braces > 0 and open_braces == close_braces: # Balanced braces/brackets
+                                break
+                    else: # Not starting like JSON, assume single line or simple multi-line text
+                         while i < len(lines) and not re.match(r"^(Thought:|Action:|Observation:|Answer:|Final Answer:)", lines[i].strip()):
+                            input_json_lines.append(lines[i])
+                            i += 1
+                    
+                    action_input_str = "\n".join(input_json_lines).strip()
+                    try:
+                        current_step_data["tool_input"] = json.loads(action_input_str)
+                    except json.JSONDecodeError:
+                        logger.debug(f"Action Input for {current_step_data['tool_name']} not JSON: {action_input_str[:100]}")
+                        current_step_data["tool_input"] = action_input_str 
+                else: # No "Action Input:" line found, tool might not take input or input is implicit
+                    current_step_data["tool_input"] = None 
+                    # Do not increment i here, let the main loop handle the next line
+
+                steps.append(current_step_data)
+                step_counter += 1
+
+            elif line_content_stripped.startswith("Observation:"):
+                current_step_data["type"] = "observation"
+                if steps and steps[-1]["type"] == "action": # Associate with the last action
+                    current_step_data["observed_tool_name"] = steps[-1].get("tool_name", "unknown_tool")
+
+                obs_content_lines = [original_line.split("Observation:", 1)[1].strip()]
+                i += 1
+                
+                first_obs_line_stripped = obs_content_lines[0]
+                is_likely_json_obs = first_obs_line_stripped.startswith('{') or first_obs_line_stripped.startswith('[')
+
+                if is_likely_json_obs:
+                    open_braces_obs = first_obs_line_stripped.count('{') + first_obs_line_stripped.count('[')
+                    close_braces_obs = first_obs_line_stripped.count('}') + first_obs_line_stripped.count(']')
+                    while i < len(lines) and not re.match(r"^(Thought:|Action:|Answer:|Final Answer:|Observation:)", lines[i].strip()):
+                        current_obs_line = lines[i]
+                        obs_content_lines.append(current_obs_line)
+                        open_braces_obs += current_obs_line.count('{') + current_obs_line.count('[')
+                        close_braces_obs += current_obs_line.count('}') + current_obs_line.count(']')
+                        i += 1
+                        if open_braces_obs > 0 and open_braces_obs == close_braces_obs:
+                            break
+                else: # Not JSON, just text
+                    while i < len(lines) and not re.match(r"^(Thought:|Action:|Answer:|Final Answer:|Observation:)", lines[i].strip()):
+                        obs_content_lines.append(lines[i])
+                        i += 1
+                
+                observation_str = "\n".join(obs_content_lines).strip()
+                try:
+                    parsed_observation = json.loads(observation_str)
+                    current_step_data["content"] = parsed_observation
+                    if isinstance(parsed_observation, dict):
+                        current_step_data["tool_output_preview"] = f"JSON data (Keys: {list(parsed_observation.keys())[:3]}...)"
+                    elif isinstance(parsed_observation, list):
+                        current_step_data["tool_output_preview"] = f"JSON array (Length: {len(parsed_observation)}, First item: {str(parsed_observation[0])[:50]}...)" if parsed_observation else "Empty JSON array"
+                    else:
+                        current_step_data["tool_output_preview"] = observation_str[:200] + "..." if len(observation_str) > 200 else observation_str
+                except json.JSONDecodeError:
+                    current_step_data["content"] = observation_str
+                    current_step_data["tool_output_preview"] = observation_str[:200] + "..." if len(observation_str) > 200 else observation_str
+                
+                steps.append(current_step_data)
+                step_counter += 1
+
+            elif line_content_stripped.startswith("Answer:") or line_content_stripped.startswith("Final Answer:"):
+                current_step_data["type"] = "answer"
+                if line_content_stripped.startswith("Final Answer:"):
+                    content_lines = [original_line.split("Final Answer:", 1)[1].strip()]
+                else:
+                    content_lines = [original_line.split("Answer:", 1)[1].strip()]
+                i += 1
+                while i < len(lines) and not re.match(r"^(Thought:|Action:|Observation:)", lines[i].strip()):
+                    content_lines.append(lines[i]) # Keep original spacing
+                    i += 1
+                current_step_data["content"] = "\n".join(content_lines).strip()
+                steps.append(current_step_data)
+                step_counter += 1
+            else:
+                # Line doesn't match known ReAct prefixes.
+                # It could be part of a multi-line thought or answer, or an unexpected line.
+                # If the last step was a thought or answer, append to it.
+                if steps and steps[-1]["type"] in ["thought", "answer"] and isinstance(steps[-1]["content"], str):
+                    logger.debug(f"Appending to previous {steps[-1]['type']}: {original_line.strip()}")
+                    steps[-1]["content"] += "\n" + original_line # Append with original spacing
+                    steps[-1]["content"] = steps[-1]["content"].strip() # Strip at the end
+                else:
+                    logger.debug(f"Skipping unexpected line: {original_line.strip()}")
+                i += 1 # Move to next line
+
+        final_answer_obj = next((step for step in reversed(steps) if step["type"] == "answer"), None)
+        final_answer_content = final_answer_obj["content"] if final_answer_obj else None
+
+        # If no specific "Answer:" step, but the agent produced a raw response (not ReAct like)
+        if not final_answer_content and not steps and raw_response.strip():
+            # Check if it's not just leftover logging
+            if not any(pattern.search(raw_response) for pattern in [
+                re.compile(r'^\s*(DEBUG|INFO|WARNING|ERROR)'), 
+                re.compile(r'HTTP Request:'),
+                re.compile(r'> Running step')
+            ]):
+                logger.info(f"[DEBUG] No ReAct steps, using raw_response as final answer.")
+                final_answer_content = raw_response.strip()
+                steps.append({"type": "answer", "content": final_answer_content, "step": 0})
+
+        # Ensure all steps have required fields
+        for step in steps:
+            if 'content' not in step:
+                step['content'] = f"Step {step.get('step', 0)}: {step.get('type', 'unknown')} executed"
+            if 'type' not in step:
+                step['type'] = 'unknown'
+            if 'step' not in step:
+                step['step'] = 0
         
-        # Add final step if present
-        if current_step_type and current_step_content:
-            cleaned_lines.append(f"{current_step_type}: {' '.join(current_step_content)}")
-        
-        return '\n'.join(cleaned_lines)
+        logger.info(f"[DEBUG] Parsed {len(steps)} steps. Final answer derived: {bool(final_answer_content)}")
+        return steps, final_answer_content
     
     def _detect_repository_languages(self) -> Dict[str, str]:
         """Detect languages in the repository by analyzing file extensions"""
@@ -2964,3 +3221,697 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
             recommendations.append(f"📁 Pay attention to files matching patterns: {', '.join(search_terms['file_patterns'][:3])}")
         
         return recommendations[:5]  # Limit recommendations
+
+    def related_issues(
+        self,
+        query: Annotated[str, "Issue title, bug description, or error message to find similar past issues for"],
+        k: Annotated[int, "Number of similar issues to return (default: 5)"] = 5,
+        state: Annotated[str, "Issue state filter: 'open', 'closed', or 'all' (default: 'all')"] = "all",
+        similarity: Annotated[float, "Minimum similarity threshold from 0.0 to 1.0 (default: 0.75)"] = 0.75
+    ) -> str:
+        """
+        Find similar past GitHub issues in the current repository.
+        
+        This tool searches through the repository's issue history to find similar problems,
+        bug reports, or feature requests that might provide context, solutions, or patches.
+        
+        Args:
+            query: The issue description, bug report, or feature request to search for
+            k: Number of similar issues to return (1-10)
+            state: Filter by issue state ('open', 'closed', 'all')
+            similarity: Minimum similarity score (0.0-1.0, higher = more similar)
+        
+        Returns:
+            JSON string with similar issues including titles, URLs, states, and patch links
+        """
+        try:
+            # Use the existing issue RAG instance instead of creating a new one
+            if not self.issue_rag or not self.issue_rag.is_initialized():
+                return json.dumps({
+                    "error": "Issue RAG system not available or not initialized for this session",
+                    "related_issues": [],
+                    "suggestion": "The issue search system is still loading. Please try again in a moment."
+                })
+            
+            # Use asyncio to run async function
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Get issue context using the existing, already-initialized instance
+                issue_context = loop.run_until_complete(
+                    self.issue_rag.get_issue_context(query, max_issues=k)
+                )
+                
+                # Get repo info from the existing instance
+                repo_info = self.issue_rag.indexer.repo_owner, self.issue_rag.indexer.repo_name
+                owner, repo = repo_info
+                
+                # Format results
+                results = {
+                    "query": query,
+                    "total_found": issue_context.total_found,
+                    "processing_time": issue_context.processing_time,
+                    "related_issues": []
+                }
+                
+                for search_result in issue_context.related_issues:
+                    issue = search_result.issue
+                    issue_info = {
+                        "number": issue.id,
+                        "title": issue.title,
+                        "state": issue.state,
+                        "url": f"https://github.com/{owner}/{repo}/issues/{issue.id}",
+                        "similarity": round(search_result.similarity, 3),
+                        "labels": issue.labels,
+                        "created_at": issue.created_at,
+                        "body_preview": issue.body[:200] + "..." if len(issue.body) > 200 else issue.body,
+                        "match_reasons": search_result.match_reasons
+                    }
+                    
+                    # Add patch URL if available
+                    if issue.patch_url:
+                        issue_info["patch_url"] = issue.patch_url
+                    
+                    results["related_issues"].append(issue_info)
+                
+                return json.dumps(results, indent=2)
+                
+            finally:
+                loop.close()
+                
+        except Exception as e:
+            logger.error(f"Error in related_issues tool: {e}")
+            return json.dumps({
+                "error": f"Failed to search related issues: {str(e)}",
+                "related_issues": []
+            })
+
+    def get_pr_for_issue(
+        self,
+        issue_number: Annotated[int, "The issue number to find the corresponding pull request for."]
+    ) -> str:
+        """
+        Finds the pull request (PR) associated with a given issue number.
+        This tool looks at the pre-built patch linkage data to find the PR that closed or fixed the issue.
+        """
+        if not self.issue_rag or not self.issue_rag.indexer.patch_builder:
+            return json.dumps({"error": "Issue RAG system or PatchLinkageBuilder not available."})
+
+        patch_builder = self.issue_rag.indexer.patch_builder
+        links_by_issue = patch_builder.load_patch_links()
+
+        if issue_number not in links_by_issue:
+            return json.dumps({
+                "error": f"No associated PR found for issue #{issue_number} in the patch linkage data."
+            })
+
+        pr_links = links_by_issue[issue_number]
+        
+        results = []
+        for link in pr_links:
+            results.append({
+                "pr_number": link.pr_number,
+                "pr_title": link.pr_title,
+                "pr_url": link.pr_url,
+                "merged_at": link.merged_at
+            })
+            
+        return json.dumps({
+            "issue_number": issue_number,
+            "found_prs": results
+        })
+
+    def get_pr_diff(
+        self,
+        pr_number: Annotated[int, "The pull request number to get the diff for."]
+    ) -> str:
+        """
+        Retrieves the diff for a given pull request (PR) number.
+        This tool reads the cached diff file that was downloaded during the patch linkage build process.
+        """
+        if not self.issue_rag or not self.issue_rag.indexer.diff_docs:
+            return json.dumps({"error": "Issue RAG system or diff documents not available."})
+
+        diff_docs = self.issue_rag.indexer.diff_docs
+        
+        if pr_number not in diff_docs:
+            return json.dumps({
+                "error": f"No cached diff found for PR #{pr_number}. The diff may not have been downloaded or linked."
+            })
+            
+        diff_doc = diff_docs[pr_number]
+        
+        diff_path = Path(diff_doc.diff_path)
+        if not diff_path.exists():
+            return json.dumps({
+                "error": f"Diff file not found at {diff_doc.diff_path}, although metadata exists."
+            })
+            
+        try:
+            diff_text = diff_path.read_text(encoding='utf-8', errors='ignore')
+            return json.dumps({
+                "pr_number": pr_number,
+                "issue_id": diff_doc.issue_id,
+                "files_changed": diff_doc.files_changed,
+                "diff_summary": diff_doc.diff_summary,
+                "full_diff": diff_text
+            })
+        except Exception as e:
+            return json.dumps({"error": f"Error reading diff file for PR #{pr_number}: {e}"})
+
+    def get_files_changed_in_pr(
+        self,
+        pr_number: Annotated[int, "The pull request number to list changed files for."]
+    ) -> str:
+        """
+        Lists all files that were modified, added, or deleted in a given pull request.
+        This tool accesses the cached diff information.
+        """
+        if not self.issue_rag or not self.issue_rag.indexer.diff_docs:
+            return json.dumps({"error": "Issue RAG system or diff documents not available."})
+
+        diff_docs = self.issue_rag.indexer.diff_docs
+        
+        if pr_number not in diff_docs:
+            return json.dumps({
+                "error": f"No cached diff information found for PR #{pr_number}."
+            })
+            
+        diff_doc = diff_docs[pr_number]
+        
+        return json.dumps({
+            "pr_number": pr_number,
+            "issue_id": diff_doc.issue_id,
+            "files_changed": diff_doc.files_changed,
+            "total_files_changed": len(diff_doc.files_changed)
+        })
+
+    def get_pr_summary(
+        self,
+        pr_number: Annotated[int, "The pull request number to summarize."]
+    ) -> str:
+        """
+        Provides a concise summary of the changes made in a specific pull request, based on its diff.
+        Uses an LLM to generate the summary.
+        """
+        if not self.issue_rag or not self.issue_rag.indexer.diff_docs:
+            return json.dumps({"error": "Issue RAG system or diff documents not available."})
+
+        diff_docs = self.issue_rag.indexer.diff_docs
+        
+        if pr_number not in diff_docs:
+            return json.dumps({
+                "error": f"No cached diff information found for PR #{pr_number}."
+            })
+            
+        diff_doc = diff_docs[pr_number]
+        diff_path = Path(diff_doc.diff_path)
+
+        if not diff_path.exists():
+            return json.dumps({
+                "error": f"Diff file not found at {diff_doc.diff_path} for PR #{pr_number}, although metadata exists."
+            })
+
+        try:
+            diff_text = diff_path.read_text(encoding='utf-8', errors='ignore')
+            
+            # Truncate diff if too long for the LLM prompt
+            max_diff_length = 15000  # Max characters for the diff in the prompt
+            if len(diff_text) > max_diff_length:
+                diff_text_for_summary = diff_text[:max_diff_length] + "\n... [diff truncated for summary] ..."
+            else:
+                diff_text_for_summary = diff_text
+
+            prompt = f"""Please summarize the following pull request diff. 
+Focus on the main purpose of the changes, key files affected, and the overall impact.
+Be concise and aim for a 2-3 sentence summary.
+
+Diff for PR #{pr_number}:
+---
+{diff_text_for_summary}
+---
+
+Summary:"""
+
+            # Use a smaller, faster LLM for summarization if possible, or the default agent LLM
+            try:
+                # Attempt to use a specific summarization model if configured, else default
+                summary_llm = OpenRouter(
+                    api_key=settings.openrouter_api_key,
+                    model=settings.summarization_model or "mistralai/mistral-7b-instruct", # Default to a small model
+                    max_tokens=200,
+                    temperature=0.5
+                )
+                response = summary_llm.complete(prompt)
+                summary = response.text.strip()
+            except Exception as llm_error:
+                logger.warning(f"Failed to use specific summarization LLM for PR #{pr_number} ({llm_error}), falling back to agent's LLM.")
+                response = self.llm.complete(prompt) # Fallback to the main agent LLM
+                summary = response.text.strip()
+            
+            return json.dumps({
+                "pr_number": pr_number,
+                "issue_id": diff_doc.issue_id,
+                "summary": summary,
+                "files_changed": diff_doc.files_changed,
+                "diff_preview": diff_doc.diff_summary # The pre-extracted summary for quick view
+            })
+
+        except Exception as e:
+            logger.error(f"Error summarizing PR #{pr_number}: {e}")
+            return json.dumps({"error": f"Error summarizing PR #{pr_number}: {str(e)}"})
+
+    def find_issues_related_to_file(
+        self,
+        file_path: Annotated[str, "The file path to find related issues for."]
+    ) -> str:
+        """
+        Finds issues whose resolution involved changes to the specified file path.
+        This tool uses the cached patch linkage and diff information.
+        """
+        if not self.issue_rag or not self.issue_rag.indexer.patch_builder or not self.issue_rag.indexer.diff_docs:
+            return json.dumps({"error": "Issue RAG system, PatchLinkageBuilder, or diff documents not available."})
+
+        patch_builder = self.issue_rag.indexer.patch_builder
+        diff_docs = self.issue_rag.indexer.diff_docs
+        
+        # Normalize the input file path to be relative to the repo root and use forward slashes
+        normalized_file_path = Path(file_path).as_posix()
+
+        related_issues = {} # Use a dict to store unique issues with their PRs
+
+        for pr_number, diff_doc in diff_docs.items():
+            # Normalize paths in diff_doc.files_changed as well
+            normalized_files_changed = [Path(f).as_posix() for f in diff_doc.files_changed]
+            if normalized_file_path in normalized_files_changed:
+                if diff_doc.issue_id: # Ensure there's an associated issue
+                    if diff_doc.issue_id not in related_issues:
+                        related_issues[diff_doc.issue_id] = {
+                            "issue_number": diff_doc.issue_id,
+                            "related_prs": []
+                        }
+                    related_issues[diff_doc.issue_id]["related_prs"].append({
+                        "pr_number": pr_number,
+                        "pr_title": diff_doc.pr_title if hasattr(diff_doc, 'pr_title') else f"PR #{pr_number}", # Assuming pr_title is on diff_doc
+                        "pr_url": f"https://github.com/{patch_builder.repo_owner}/{patch_builder.repo_name}/pull/{pr_number}"
+                    })
+        
+        if not related_issues:
+            return json.dumps({
+                "file_path": normalized_file_path,
+                "message": "No issues found whose resolution directly involved changes to this file based on cached PR data."
+            })
+
+        return json.dumps({
+            "file_path": normalized_file_path,
+            "related_issues_count": len(related_issues),
+            "issues": list(related_issues.values())
+        })
+
+    def get_issue_resolution_summary(
+        self,
+        issue_number: Annotated[int, "The issue number to get the resolution summary for."]
+    ) -> str:
+        """
+        Summarizes how a specific issue was resolved, including linked PRs,
+        and a summary of changes from those PRs.
+        """
+        if not self.issue_rag:
+            return json.dumps({"error": "Issue RAG system not available."})
+
+        pr_info_str = self.get_pr_for_issue(issue_number)
+        pr_info = json.loads(pr_info_str)
+
+        if "error" in pr_info or not pr_info.get("found_prs"):
+            return json.dumps({
+                "issue_number": issue_number,
+                "summary": "No directly linked PRs found for this issue in the cached data. Resolution details are unavailable.",
+                "linked_prs": []
+            })
+
+        resolution_details = []
+        for pr_data in pr_info["found_prs"]:
+            pr_num = pr_data["pr_number"]
+            summary_str = self.get_pr_summary(pr_num)
+            summary_data = json.loads(summary_str)
+            
+            detail = {
+                "pr_number": pr_num,
+                "pr_title": pr_data["pr_title"],
+                "pr_url": pr_data["pr_url"],
+                "merged_at": pr_data["merged_at"],
+                "change_summary": summary_data.get("summary", "Summary not available."),
+                "files_changed_count": len(summary_data.get("files_changed", []))
+            }
+            resolution_details.append(detail)
+        
+        overall_summary = f"Issue #{issue_number} was resolved by {len(resolution_details)} PR(s). "
+        if resolution_details:
+            overall_summary += f"Key changes involved PR #{resolution_details[0]['pr_number']} ('{resolution_details[0]['pr_title']}')."
+            if len(resolution_details) > 1:
+                overall_summary += f" Additional changes in other PRs."
+        else: # Should not happen if found_prs was true, but as a safeguard
+            overall_summary = f"Issue #{issue_number} has linked PRs, but details could not be fully summarized."
+
+
+        return json.dumps({
+            "issue_number": issue_number,
+            "overall_summary": overall_summary,
+            "linked_prs_details": resolution_details
+        })
+
+    def check_issue_status_and_linked_pr(
+        self,
+        issue_identifier: Annotated[str, "Issue number (#123) or full GitHub issue URL to check."]
+    ) -> str:
+        """
+        Checks the current status (open/closed) of a GitHub issue and lists any directly linked Pull Requests.
+        Combines issue analysis with PR linkage information.
+        """
+        # First, analyze the issue to get its current status and details
+        issue_analysis_str = self.analyze_github_issue(issue_identifier)
+        issue_analysis = json.loads(issue_analysis_str)
+
+        if "error" in issue_analysis:
+            # If issue analysis failed, return that error
+            return issue_analysis_str
+        
+        issue_number = issue_analysis.get("issue_metadata", {}).get("number")
+        if not issue_number:
+            return json.dumps({
+                "error": "Could not determine issue number from analysis.",
+                "analysis_response": issue_analysis
+            })
+
+        # Then, get linked PRs for this issue number
+        pr_info_str = self.get_pr_for_issue(issue_number)
+        pr_info = json.loads(pr_info_str)
+
+        # Combine the information
+        combined_result = {
+            "issue_number": issue_number,
+            "issue_title": issue_analysis.get("issue_metadata", {}).get("title"),
+            "current_status": issue_analysis.get("issue_metadata", {}).get("state"),
+            "classification": issue_analysis.get("issue_classification", {}).get("primary_type"),
+            "complexity": issue_analysis.get("complexity_assessment", {}).get("level"),
+            "linked_prs": pr_info.get("found_prs", []) # Default to empty list if no PRs or error in pr_info
+        }
+        
+        if "error" in pr_info and not combined_result["linked_prs"]: # Add PR error only if no PRs were found
+            combined_result["pr_linkage_error"] = pr_info["error"]
+
+
+        return json.dumps(combined_result, indent=2)
+
+    def write_complete_code(
+        self,
+        description: Annotated[str, "Detailed description of what code to write"],
+        context_files: Annotated[Optional[List[str]], "List of reference files to base the code on"] = None,
+        language: Annotated[Optional[str], "Programming language (auto-detected if not specified)"] = None,
+        output_format: Annotated[str, "Output format: 'markdown' or 'raw'"] = "markdown"
+    ) -> str:
+        """
+        Write complete, untruncated code based on specifications and reference files.
+        Produces properly formatted code in backticks for easy parsing and display.
+        """
+        try:
+            logger.info(f"[DEBUG] Writing complete code for: {description}")
+            
+            # Detect language if not provided
+            if not language and context_files:
+                language = self._detect_primary_language_from_context(context_files)
+            elif not language:
+                language = "python"  # Default fallback
+            
+            # Read and analyze context files if provided
+            context_content = ""
+            patterns = {}
+            if context_files:
+                for file_path in context_files:
+                    try:
+                        full_path = self.repo_path / file_path
+                        if full_path.exists():
+                            with open(full_path, 'r', encoding='utf-8') as f:
+                                content = f.read()
+                                context_content += f"\n\n=== {file_path} ===\n{content}"
+                    except Exception as e:
+                        logger.warning(f"Could not read context file {file_path}: {e}")
+                
+                # Extract patterns from context
+                analysis = self._analyze_repository_context(context_files)
+                patterns = {
+                    "classes": [cls["name"] for cls in analysis.get("classes", [])],
+                    "imports": analysis.get("imports", []),
+                    "base_classes": analysis.get("base_classes", []),
+                    "functions": analysis.get("functions", [])[:10]  # Limit to avoid token overflow
+                }
+            
+            # Create comprehensive prompt for complete code generation
+            prompt = self._build_complete_code_prompt(description, language, context_content, patterns, output_format)
+            
+            # Use LLM to generate complete code
+            try:
+                # Use LLMClient's OpenRouter LLM for proper API key handling
+                from .llm_client import LLMClient
+                llm_client = LLMClient()
+                
+                # Get the OpenRouter LLM instance with proper configuration
+                openrouter_llm = llm_client._get_openrouter_llm("google/gemini-2.5-flash-preview-05-20")
+                
+                # Use the LLM directly for synchronous completion
+                response = openrouter_llm.complete(prompt)
+                code_response = response.text.strip()
+                
+                # Clean and format the response
+                formatted_response = self._format_complete_code_response(
+                    code_response, description, language, output_format
+                )
+                
+                return formatted_response
+                
+            except Exception as e:
+                logger.error(f"Error generating code: {e}")
+                return self._generate_error_response(description, language, str(e))
+                
+        except Exception as e:
+            logger.error(f"Error in write_complete_code: {e}")
+            return f"Error writing code: {str(e)}"
+    
+    def _build_complete_code_prompt(
+        self, 
+        description: str, 
+        language: str, 
+        context_content: str, 
+        patterns: Dict,
+        output_format: str
+    ) -> str:
+        """Build a comprehensive prompt for complete code generation"""
+        
+        prompt = f"""You are an expert {language} developer. Write COMPLETE, PRODUCTION-READY code based on the following requirements.
+
+REQUIREMENTS:
+{description}
+
+LANGUAGE: {language}
+
+IMPORTANT INSTRUCTIONS:
+1. Write COMPLETE, UNTRUNCATED code - never cut off or abbreviate
+2. Include ALL necessary imports, classes, functions, and logic
+3. Make the code production-ready and fully functional
+4. Add comprehensive comments explaining key parts
+5. Follow best practices for {language}
+6. If multiple files are needed, provide them all
+7. ALWAYS wrap code in proper markdown code blocks with language specification
+
+"""
+
+        # Add context if available
+        if context_content:
+            prompt += f"""
+REFERENCE CODE CONTEXT:
+{context_content[:8000]}  # Limit context to avoid token overflow
+
+"""
+
+        # Add patterns if available
+        if patterns.get("classes"):
+            prompt += f"""
+AVAILABLE PATTERNS TO FOLLOW:
+- Classes: {', '.join(patterns['classes'][:5])}
+- Base classes: {', '.join(patterns['base_classes'][:3])}
+- Common imports: {', '.join(patterns['imports'][:5])}
+
+"""
+
+        # Add language-specific guidance
+        language_guidance = self._get_language_specific_guidance(language)
+        prompt += f"""
+{language_guidance}
+
+OUTPUT FORMAT:
+"""
+        
+        if output_format == "markdown":
+            prompt += f"""
+Provide the code in markdown format with proper code blocks:
+
+```{language}
+# Complete code here
+```
+
+Include explanations before and after the code blocks as needed.
+"""
+        else:
+            prompt += """
+Provide only the raw code without markdown formatting.
+"""
+
+        prompt += """
+CRITICAL: Ensure the code is COMPLETE and FUNCTIONAL. Do not truncate or abbreviate any part.
+"""
+
+        return prompt
+    
+    def _get_language_specific_guidance(self, language: str) -> str:
+        """Get language-specific coding guidance"""
+        guidance_map = {
+            "python": """
+PYTHON BEST PRACTICES:
+- Use proper imports and module structure
+- Follow PEP 8 style guidelines
+- Include docstrings for classes and functions
+- Use type hints where appropriate
+- Handle exceptions properly
+- Use context managers for resources
+""",
+            "javascript": """
+JAVASCRIPT BEST PRACTICES:
+- Use ES6+ features appropriately
+- Proper error handling with try/catch
+- Use const/let instead of var
+- Include JSDoc comments
+- Follow async/await patterns
+- Use proper module imports/exports
+""",
+            "typescript": """
+TYPESCRIPT BEST PRACTICES:
+- Define proper interfaces and types
+- Use generic types where appropriate
+- Include comprehensive type annotations
+- Follow strict TypeScript configuration
+- Use proper import/export syntax
+- Handle null/undefined safely
+""",
+            "java": """
+JAVA BEST PRACTICES:
+- Follow Java naming conventions
+- Use proper package structure
+- Include Javadoc comments
+- Handle exceptions appropriately
+- Use generics and collections properly
+- Follow SOLID principles
+""",
+            "go": """
+GO BEST PRACTICES:
+- Use proper package naming
+- Follow Go formatting conventions
+- Include proper error handling
+- Use interfaces appropriately
+- Follow Go concurrency patterns
+- Include godoc comments
+""",
+            "rust": """
+RUST BEST PRACTICES:
+- Use proper ownership and borrowing
+- Handle Result and Option types
+- Include comprehensive error handling
+- Use traits and generics appropriately
+- Follow Rust naming conventions
+- Include rustdoc comments
+""",
+            "csharp": """
+C# BEST PRACTICES:
+- Follow C# naming conventions
+- Use proper namespace structure
+- Include XML documentation
+- Use async/await patterns
+- Handle exceptions properly
+- Use LINQ where appropriate
+"""
+        }
+        
+        return guidance_map.get(language, """
+GENERAL BEST PRACTICES:
+- Follow language conventions
+- Include proper documentation
+- Handle errors appropriately
+- Use clear, descriptive names
+- Follow established patterns
+""")
+    
+    def _format_complete_code_response(
+        self, 
+        code_response: str, 
+        description: str, 
+        language: str, 
+        output_format: str
+    ) -> str:
+        """Format the code response to ensure proper presentation"""
+        
+        if output_format == "raw":
+            # For raw output, just return the LLM's response directly
+            return code_response
+        
+        # For markdown output:
+        
+        def ensure_lang_in_block(match):
+            opening_ticks = match.group(1) # ```
+            lang_spec = match.group(2) # language specifier or empty string
+            code_content = match.group(3) # content
+            closing_ticks = match.group(4) # ```
+
+            # If lang_spec is empty or just whitespace, replace with the default language
+            if not lang_spec.strip():
+                return f"{opening_ticks}{language}\n{code_content}{closing_ticks}"
+            else:
+                # Language is already specified, return as is
+                return match.group(0)
+
+        # Regex to find code blocks: ```optional_lang\n content ```
+        # It captures the opening ```, the optional language, the content, and closing ```
+        code_block_pattern = re.compile(r"(```)(.*?)\n(.*?)(```)", re.DOTALL)
+        
+        if code_block_pattern.search(code_response):
+            # If code blocks are present, ensure they have language specifiers
+            processed_response = code_block_pattern.sub(ensure_lang_in_block, code_response)
+        else:
+            # No ``` found. If the LLM was supposed to generate code,
+            # wrap the entire response in a code block as a fallback.
+            processed_response = f"# Code for: {description}\n\n```{language}\n{code_response}\n```"
+            logger.warning("LLM did not use markdown code blocks for write_complete_code. Wrapping entire response.")
+
+        # Add a general title if the response doesn't start with one (heuristic)
+        # Check if the response (after potential wrapping) starts with a Markdown heading.
+        # Use lstrip() to handle potential leading whitespace.
+        if not processed_response.lstrip().startswith("#"):
+             processed_response = f"# Generated Code: {description}\n\n{processed_response}"
+        
+        return processed_response
+    
+    def _generate_error_response(self, description: str, language: str, error: str) -> str:
+        """Generate a helpful error response"""
+        return f"""# Error: Could not generate code
+
+**Description:** {description}
+**Language:** {language}
+**Error:** {error}
+
+Please try:
+1. Simplifying the description
+2. Providing more specific requirements
+3. Including relevant context files with @ syntax
+
+Example: `@agents.py write a news aggregation agent`
+"""

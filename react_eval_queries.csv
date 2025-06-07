@@ -1,0 +1,21 @@
+query_text,expected_issue_number
+"Error with hooks in functional components",20196
+"useEffect cleanup not running",33337
+"setState not updating component",30558
+"SSR hydration fails with specific component",28001
+"Performance degradation with large lists",27025
+"Accessibility issue with ARIA attributes",26286
+"React DevTools not inspecting component state",25775
+"Memory leak when using context API",18116
+"TypeScript error with React.FC and children",18035
+"Inconsistent behavior of useReducer hook",24090
+"Problems with concurrent mode and suspense",20874
+"Strict mode double invocation causing issues",24591
+"Error boundaries not catching async errors",12009
+"Focus management issues in modal components",22832
+"SVG attributes not working as expected",13002
+"Controlled input losing cursor position",12345
+"Batching updates in React 18",20985
+"useTransition causing unexpected delays",24470
+"Compiler error with specific JSX syntax",33223
+"eslint-plugin-react-hooks false positive for conditional rendering",20196

@@ -112,6 +112,7 @@ class GitHubIssueClient:
                             body=issue_data['body'] or "",  # Ensure body is never None
                             state=issue_data['state'],
                             created_at=datetime.fromisoformat(issue_data['created_at'].replace('Z', '+00:00')),
+                            closed_at=datetime.fromisoformat(issue_data['closed_at'].replace('Z', '+00:00')) if issue_data.get('closed_at') else None,
                             url=issue_url,
                             labels=[label['name'] for label in issue_data.get('labels', [])],
                             assignees=[assignee['login'] for assignee in issue_data.get('assignees', [])],
@@ -197,9 +198,10 @@ class GitHubIssueClient:
                         issue = Issue(
                             number=issue_data['number'],
                             title=issue_data['title'],
-                            body=issue_data.get('body', ""),
+                            body=issue_data.get('body') or "",  # Ensure body is an empty string if None
                             state=issue_data['state'],
                             created_at=datetime.fromisoformat(issue_data['created_at'].replace('Z', '+00:00')),
+                            closed_at=datetime.fromisoformat(issue_data['closed_at'].replace('Z', '+00:00')) if issue_data.get('closed_at') else None,
                             url=issue_data['html_url'],
                             labels=[label['name'] for label in issue_data.get('labels', [])],
                             assignees=[assignee['login'] for assignee in issue_data.get('assignees', [])],
@@ -210,4 +212,71 @@ class GitHubIssueClient:
                     if len(data) < per_page:
                         break  # No more pages
             page += 1
-        return issues 
+        return issues
+
+    async def list_pull_requests(self, repo_url: str, state: str = "merged", per_page: int = 30, max_pages: int = 5) -> list:
+        """
+        List pull requests for a given repository URL and state.
+        Args:
+            repo_url: The GitHub repository URL (e.g., https://github.com/owner/repo)
+            state: 'open', 'closed', 'merged', or 'all'. Note: GitHub API uses 'closed' for merged PRs if not specifying 'merged'.
+                   If 'merged' is passed, we will fetch 'closed' PRs and then filter by `merged_at` if necessary,
+                   or use a specific search query if more robust. For now, we'll assume 'closed' covers 'merged'.
+            per_page: Number of PRs per page (max 100)
+            max_pages: Maximum number of pages to fetch
+        Returns:
+            List of PullRequestInfo (as dicts, to be Pydantic models later)
+        """
+        from .local_repo_loader import get_repo_info
+        # It's better to import Pydantic models at the top of the file,
+        # but if there's a circular dependency risk with models.py importing github_client,
+        # a local import like this is a common workaround.
+        # However, given the current structure, models.py does not import github_client.
+        # So, PullRequestInfo and PullRequestUser should ideally be imported at the top.
+        # For this insertion, we'll keep it local to minimize changes if that was the original intent.
+        from .models import PullRequestInfo, PullRequestUser
+
+        owner, repo = get_repo_info(repo_url)
+        pull_requests_data = []
+        page = 1
+        
+        api_state = "closed" if state == "merged" else state
+
+        while page <= max_pages:
+            url = f"https://api.github.com/repos/{owner}/{repo}/pulls?state={api_state}&per_page={per_page}&page={page}&sort=updated&direction=desc"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=self.headers) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        # Consider logging this error instead of just printing
+                        print(f"Error fetching PRs: {response.status} - {error_text}")
+                        break 
+                    data = await response.json()
+                    if not data:
+                        break 
+                    
+                    for pr_data_item in data: # Renamed pr_data to pr_data_item to avoid conflict
+                        if state == "merged" and not pr_data_item.get("merged_at"):
+                            continue
+
+                        files_changed = [] # Placeholder for now
+
+                        user_data_item = pr_data_item.get("user") # Renamed user_data
+                        pr_user = PullRequestUser(login=user_data_item["login"]) if user_data_item else None
+
+                        pull_request = PullRequestInfo(
+                            number=pr_data_item['number'],
+                            title=pr_data_item['title'],
+                            merged_at=pr_data_item.get('merged_at'),
+                            files_changed=files_changed,
+                            issue_id=None, 
+                            url=pr_data_item.get('html_url'),
+                            user=pr_user,
+                            body=pr_data_item.get('body')
+                        )
+                        pull_requests_data.append(pull_request)
+
+                    if len(data) < per_page:
+                        break 
+            page += 1
+        return pull_requests_data
