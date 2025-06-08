@@ -424,7 +424,22 @@ class IssueIndexer:
         with open(self.issues_file, 'r', encoding='utf-8') as f:
             for line in f:
                 try:
-                    issue = IssueDoc.model_validate_json(line.strip())
+                    # First try to parse as JSON to handle backward compatibility
+                    import json
+                    data = json.loads(line.strip())
+                    
+                    # Add default values for new fields if they don't exist
+                    if 'closed_by_commit' not in data:
+                        data['closed_by_commit'] = None
+                    if 'closed_by_pr' not in data:
+                        data['closed_by_pr'] = None
+                    if 'closed_by_author' not in data:
+                        data['closed_by_author'] = None
+                    if 'closed_event_data' not in data:
+                        data['closed_event_data'] = None
+                    
+                    # Now validate with the full model
+                    issue = IssueDoc.model_validate(data)
                     self.issue_docs[issue.id] = issue
                 except Exception as e:
                     logger.warning(f"Skipping malformed line in issues.jsonl: {e}")

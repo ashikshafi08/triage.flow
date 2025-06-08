@@ -75,18 +75,21 @@ class SessionListResponse(BaseModel):
     total: int
 
 class IssueDoc(BaseModel):
-    """Document model for issue indexing and retrieval"""
-    id: int                    # issue number 
-    state: str                 # open or closed
+    id: int
+    state: str
     title: str
-    body: str                  # truncated to 8k chars
-    comments: List[str]        # first + last comment, or summary 
+    body: str
+    comments: List[str]
     labels: List[str]
     created_at: str
-    closed_at: Optional[str] = None
-    patch_url: Optional[str] = None  # link to merge commit/PR
-    repo: str                  # owner/repo
-    similarity_score: Optional[float] = None  # for search results
+    closed_at: Optional[str]
+    patch_url: Optional[str]
+    repo: str
+    # Enhanced fields for issue closing tracking
+    closed_by_commit: Optional[str] = None  # SHA of closing commit
+    closed_by_pr: Optional[int] = None      # PR number that closed it
+    closed_by_author: Optional[str] = None  # Author who closed it
+    closed_event_data: Optional[Dict[str, Any]] = None  # Additional closing event data
 
 class IssueSearchResult(BaseModel):
     """Result from issue similarity search"""

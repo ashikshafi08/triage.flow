@@ -117,7 +117,7 @@ class AgenticRAGSystem:
             await self.issue_rag.initialize(force_rebuild=False) 
             
             if self.agentic_explorer: 
-                self.agentic_explorer.issue_rag = self.issue_rag
+                self.agentic_explorer.issue_rag_system = self.issue_rag
             
             logger.info(f"Session {self.session_id}: IssueAwareRAG for {owner}/{repo_name} initialized successfully.")
             session["metadata"]["issue_rag_ready"] = True
@@ -553,39 +553,6 @@ class AgenticRAGSystem:
                 logger.warning(f"Failed light semantic search: {e}")
         
         return context
-    
-    async def get_issue_context(self, issue_title: str, issue_body: str) -> Dict[str, Any]:
-        """Get context for GitHub issues using both RAG and agentic analysis"""
-        if not self.rag_extractor:
-            raise ValueError("RAG system not initialized")
-        
-        try:
-            # Get base issue context from RAG
-            base_context = await self.rag_extractor.get_issue_context(issue_title, issue_body)
-            
-            # Enhance with agentic issue analysis if available
-            if self.agentic_explorer:
-                try:
-                    # Create a mock issue for analysis
-                    issue_description = f"{issue_title}\n\n{issue_body}"
-                    
-                    # Find issue-related files
-                    related_files = self.agentic_explorer.find_issue_related_files(
-                        issue_description, "surface"
-                    )
-                    base_context["issue_related_files"] = json.loads(related_files)
-                    
-                    # Analyze the issue if we have GitHub integration
-                    # This would require the full issue URL, so we skip for now
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to enhance issue context with agentic tools: {e}")
-            
-            return base_context
-            
-        except Exception as e:
-            logger.error(f"Error getting issue context: {e}")
-            raise
     
     def get_repo_info(self) -> Optional[Dict[str, Any]]:
         """Get repository information"""

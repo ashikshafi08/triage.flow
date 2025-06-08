@@ -6,6 +6,7 @@ Provides directory exploration, codebase search, and file analysis capabilities
 import os
 import json
 import asyncio
+import time
 from typing import List, Dict, Any, Optional, Annotated, AsyncGenerator
 from pathlib import Path
 import logging
@@ -13,8 +14,14 @@ import io
 import sys
 import contextlib
 import re
+import subprocess
+import ast
+from functools import lru_cache
+from typing import Union
+from datetime import datetime
 
 from llama_index.core.tools import FunctionTool
+from .chunk_store import ChunkStoreFactory
 from llama_index.core.agent import ReActAgent
 from llama_index.core.llms import LLM
 from llama_index.core.memory import ChatMemoryBuffer
@@ -22,6 +29,7 @@ from llama_index.llms.openrouter import OpenRouter
 from llama_index.llms.openai import OpenAI
 
 from .config import settings
+from .git_tools import GitBlameTools, GitHistoryTools, IssueClosingTools
 
 logger = logging.getLogger(__name__)
 
@@ -48,25 +56,126 @@ class AgenticCodebaseExplorer:
     def __init__(self, session_id: str, repo_path: str, issue_rag_system: Optional['IssueAwareRAG'] = None):
         self.session_id = session_id
         self.repo_path = Path(repo_path)
-        self.issue_rag = issue_rag_system
+        self.issue_rag_system = issue_rag_system
+        self.chunk_store = ChunkStoreFactory.get_instance()
+        
+        # Initialize enhanced git tools
+        self.git_blame_tools = GitBlameTools(str(self.repo_path))
+        self.git_history_tools = GitHistoryTools(str(self.repo_path))
+        self.issue_closing_tools = IssueClosingTools(str(self.repo_path), issue_rag_system)
         
         # Initialize LLM based on settings
         self.llm = self._get_llm()
-        
+
         # Initialize tools
         self.tools = self._create_tools()
         
         # Create memory for the agent
         self.memory = ChatMemoryBuffer.from_defaults(token_limit=4000)
         
-        # Initialize the ReAct agent
+        # Create a comprehensive system prompt that encourages tool usage
+        system_prompt = """You are an expert codebase exploration assistant with access to powerful tools to analyze repositories, including advanced git history and issue tracking capabilities.
+
+**IMPORTANT**: You have extensive tools available - USE THEM! Never say you don't have access to information when you have tools that can find it.
+
+**Enhanced Git & Issue Analysis Tools**:
+- `find_feature_introducing_pr` - **PRIMARY TOOL** for finding which PR introduced a feature (use this for "Which PR introduced X?" questions)
+- `find_when_feature_was_added` - **DIRECT GIT SEARCH** for finding when specific code patterns/features were added (use for specific terms like "o3-mini", "gpt-4")
+- `get_issue_closing_info` - Get complete details about who closed an issue and the exact commit/PR/diff
+- `git_blame_at_commit` - View blame information at any point in history, not just current state
+- `find_commits_touching_function` - Track all changes to a specific function over time
+- `get_function_evolution` - See how a function changed between commits with diffs
+- `find_pr_closing_commit` - Get merge commit information for PRs
+- `get_open_issues_related_to_commit` - Find open issues related to recent commits
+
+**When asked about issue resolutions**:
+1. Use `get_issue_closing_info` first to get the closing PR/commit
+2. Then use `get_pr_diff` to see the exact changes
+3. Use `git_blame_at_commit` with the closing commit SHA to see who made specific changes
+
+**When asked about function/file history**:
+1. Use `find_commits_touching_function` to track changes over time
+2. Use `get_function_evolution` to see how code evolved with diffs
+3. Use `git_blame_function` for current state
+4. Use `who_implemented_this` to find original implementation
+
+**For specific commit analysis**:
+1. Use `find_pr_closing_commit` to get commit details for PRs
+2. Use `git_blame_at_commit` to see who wrote what at that point in time
+3. Use `get_open_issues_related_to_commit` to find related issues
+
+**Your Philosophy**: 
+- ALWAYS use your tools first before saying you can't find something
+- When asked about repository information, actively explore to find answers
+- Be proactive - if asked about a repo's name, check README files, package.json, setup.py, or directory structure
+- If asked general questions about a repository, explore the structure first
+
+**Historical Context**: The current git blame shows the LATEST state. To see who made changes in a specific PR or at a specific time, use `git_blame_at_commit` with that PR's merge commit SHA.
+
+**Common Questions & How to Handle Them**:
+
+1. **"Which PR introduced feature X?" or "Which PR added support for Y?"**
+   → First try `find_when_feature_was_added("specific_term")` for direct code search, then `find_feature_introducing_pr("feature X")` for broader PR search
+
+2. **"Who closed issue #123 and how?"**
+   → Use `get_issue_closing_info(123)` to get complete closing details
+
+3. **"Who implemented function X in PR Y?"**
+   → First get PR Y's merge commit using `find_pr_closing_commit`, then use `git_blame_at_commit` with that SHA
+
+4. **"How did function Z change over time?"**
+   → Use `get_function_evolution` to see the complete evolution with diffs
+
+4. **"What's the name of this repo?"** 
+   → Use `explore_directory("")` to see root files, then `read_file` on README.md, package.json, setup.py, or similar files
+
+5. **"What is this repository about?"**
+   → Read README.md, check the directory structure, examine key files
+
+6. **"Find files related to [topic]"**
+   → Use `search_codebase` or `semantic_content_search`
+
+**Tool Usage Guidelines**:
+- Start with `explore_directory("")` for general repository questions
+- Use `read_file` for examining specific files like README, package.json, setup.py
+- Use `search_codebase` when looking for specific code patterns or terms
+- Use `analyze_file_structure` for understanding code organization
+- For historical analysis, prefer the enhanced git tools over basic git blame
+- When in doubt, explore rather than apologize for lack of information
+
+**Response Style**:
+- Be helpful and informative
+- Always try to find an answer using your tools
+- If tools don't find what you're looking for, mention what you searched
+- Provide actionable insights based on what you discover
+- Use historical context when available to provide comprehensive answers
+
+Remember: You have the power to explore and analyze both current and historical code - use it!"""
+
+        # Initialize the ReAct agent with the comprehensive system prompt
         self.agent = ReActAgent.from_tools(
             tools=self.tools,
             llm=self.llm,
             memory=self.memory,
             verbose=True,
-            max_iterations=settings.AGENTIC_MAX_ITERATIONS
+            max_iterations=settings.AGENTIC_MAX_ITERATIONS,
+            system_prompt=system_prompt
         )
+
+    def _get_current_head_sha(self) -> Optional[str]:
+        """Get the current HEAD commit SHA."""
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                cwd=self.repo_path,
+                check=True
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error getting current HEAD SHA: {e}")
+            return None
     
     def _get_llm(self) -> LLM:
         """Get LLM instance based on settings"""
@@ -181,6 +290,80 @@ class AgenticCodebaseExplorer:
                 fn=self.write_complete_code,
                 name="write_complete_code",
                 description="Write complete, untruncated code files based on specifications and reference files"
+            ),
+            # Enhanced Git History & Blame Tools
+            FunctionTool.from_defaults(
+                fn=self.git_blame_function,
+                name="git_blame_function",
+                description="Get git blame information for a specific function or class, showing who last edited each line"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.who_last_edited_line,
+                name="who_last_edited_line",
+                description="Get information about who last edited a specific line in a file"
+            ),
+            # Founding Member Agent Tools
+            FunctionTool.from_defaults(
+                fn=self.get_file_history,
+                name="get_file_history",
+                description="Get the timeline of issues/PRs that touched a file. Use this to understand how a file evolved over time."
+            ),
+            FunctionTool.from_defaults(
+                fn=self.summarize_feature_evolution,
+                name="summarize_feature_evolution",
+                description="Summarize how a feature evolved over time by finding all related issues, PRs, and changes"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.who_implemented_this,
+                name="who_implemented_this",
+                description="Find who initially implemented a class, function, or feature using git history"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.regression_detector,
+                name="regression_detector",
+                description="Detect if a new issue is a regression of a past one by analyzing similar closed issues"
+            ),
+            
+            # Enhanced Git Tools - Historical Analysis
+            FunctionTool.from_defaults(
+                fn=self.git_blame_at_commit,
+                name="git_blame_at_commit",
+                description="Get git blame information for a file at a specific commit in history (not current state)"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.find_commits_touching_function,
+                name="find_commits_touching_function",
+                description="Find all commits that modified a specific function in a file over time"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.get_issue_closing_info,
+                name="get_issue_closing_info",
+                description="Get detailed information about who closed an issue and with what commit/PR"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.get_open_issues_related_to_commit,
+                name="get_open_issues_related_to_commit",
+                description="Find open issues that might be related to changes in a specific commit"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.get_function_evolution,
+                name="get_function_evolution",
+                description="Get the evolution of a function over time with diff details between commits"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.find_pr_closing_commit,
+                name="find_pr_closing_commit",
+                description="Get the merge commit information for a specific PR"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.find_feature_introducing_pr,
+                name="find_feature_introducing_pr",
+                description="Find which PR/issue introduced a specific feature by searching issue/PR data"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.find_when_feature_was_added,
+                name="find_when_feature_was_added",
+                description="Find when a specific feature, function, or code pattern was first added to the codebase using git history"
             )
         ]
         return tools
@@ -2100,10 +2283,7 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
                     input_json_lines = [lines[i].split("Action Input:", 1)[1].strip()]
                     i += 1
                     
-                    # Heuristic to capture multi-line JSON:
-                    # Continue if line doesn't start with another ReAct keyword
-                    # and we haven't hit a balanced JSON structure (if it looks like JSON)
-                    # This is tricky because Action Input might not always be JSON.
+                    
                     
                     # Try to detect if it's JSON
                     first_input_line_stripped = input_json_lines[0]
@@ -3246,7 +3426,7 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
         """
         try:
             # Use the existing issue RAG instance instead of creating a new one
-            if not self.issue_rag or not self.issue_rag.is_initialized():
+            if not self.issue_rag_system or not self.issue_rag_system.is_initialized():
                 return json.dumps({
                     "error": "Issue RAG system not available or not initialized for this session",
                     "related_issues": [],
@@ -3261,11 +3441,11 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
             try:
                 # Get issue context using the existing, already-initialized instance
                 issue_context = loop.run_until_complete(
-                    self.issue_rag.get_issue_context(query, max_issues=k)
+                    self.issue_rag_system.get_issue_context(query, max_issues=k)
                 )
                 
                 # Get repo info from the existing instance
-                repo_info = self.issue_rag.indexer.repo_owner, self.issue_rag.indexer.repo_name
+                repo_info = self.issue_rag_system.indexer.repo_owner, self.issue_rag_system.indexer.repo_name
                 owner, repo = repo_info
                 
                 # Format results
@@ -3316,10 +3496,10 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
         Finds the pull request (PR) associated with a given issue number.
         This tool looks at the pre-built patch linkage data to find the PR that closed or fixed the issue.
         """
-        if not self.issue_rag or not self.issue_rag.indexer.patch_builder:
+        if not self.issue_rag_system or not self.issue_rag_system.indexer.patch_builder:
             return json.dumps({"error": "Issue RAG system or PatchLinkageBuilder not available."})
 
-        patch_builder = self.issue_rag.indexer.patch_builder
+        patch_builder = self.issue_rag_system.indexer.patch_builder
         links_by_issue = patch_builder.load_patch_links()
 
         if issue_number not in links_by_issue:
@@ -3351,10 +3531,10 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
         Retrieves the diff for a given pull request (PR) number.
         This tool reads the cached diff file that was downloaded during the patch linkage build process.
         """
-        if not self.issue_rag or not self.issue_rag.indexer.diff_docs:
+        if not self.issue_rag_system or not self.issue_rag_system.indexer.diff_docs:
             return json.dumps({"error": "Issue RAG system or diff documents not available."})
 
-        diff_docs = self.issue_rag.indexer.diff_docs
+        diff_docs = self.issue_rag_system.indexer.diff_docs
         
         if pr_number not in diff_docs:
             return json.dumps({
@@ -3389,10 +3569,10 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
         Lists all files that were modified, added, or deleted in a given pull request.
         This tool accesses the cached diff information.
         """
-        if not self.issue_rag or not self.issue_rag.indexer.diff_docs:
+        if not self.issue_rag_system or not self.issue_rag_system.indexer.diff_docs:
             return json.dumps({"error": "Issue RAG system or diff documents not available."})
 
-        diff_docs = self.issue_rag.indexer.diff_docs
+        diff_docs = self.issue_rag_system.indexer.diff_docs
         
         if pr_number not in diff_docs:
             return json.dumps({
@@ -3416,10 +3596,10 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
         Provides a concise summary of the changes made in a specific pull request, based on its diff.
         Uses an LLM to generate the summary.
         """
-        if not self.issue_rag or not self.issue_rag.indexer.diff_docs:
+        if not self.issue_rag_system or not self.issue_rag_system.indexer.diff_docs:
             return json.dumps({"error": "Issue RAG system or diff documents not available."})
 
-        diff_docs = self.issue_rag.indexer.diff_docs
+        diff_docs = self.issue_rag_system.indexer.diff_docs
         
         if pr_number not in diff_docs:
             return json.dumps({
@@ -3460,7 +3640,7 @@ Summary:"""
                 # Attempt to use a specific summarization model if configured, else default
                 summary_llm = OpenRouter(
                     api_key=settings.openrouter_api_key,
-                    model=settings.summarization_model or "mistralai/mistral-7b-instruct", # Default to a small model
+                    model=settings.summarization_model or "mistralai/mistral-small-24b-instruct-2501", # Default to a small model
                     max_tokens=200,
                     temperature=0.5
                 )
@@ -3491,11 +3671,11 @@ Summary:"""
         Finds issues whose resolution involved changes to the specified file path.
         This tool uses the cached patch linkage and diff information.
         """
-        if not self.issue_rag or not self.issue_rag.indexer.patch_builder or not self.issue_rag.indexer.diff_docs:
+        if not self.issue_rag_system or not self.issue_rag_system.indexer.patch_builder or not self.issue_rag_system.indexer.diff_docs:
             return json.dumps({"error": "Issue RAG system, PatchLinkageBuilder, or diff documents not available."})
 
-        patch_builder = self.issue_rag.indexer.patch_builder
-        diff_docs = self.issue_rag.indexer.diff_docs
+        patch_builder = self.issue_rag_system.indexer.patch_builder
+        diff_docs = self.issue_rag_system.indexer.diff_docs
         
         # Normalize the input file path to be relative to the repo root and use forward slashes
         normalized_file_path = Path(file_path).as_posix()
@@ -3538,7 +3718,7 @@ Summary:"""
         Summarizes how a specific issue was resolved, including linked PRs,
         and a summary of changes from those PRs.
         """
-        if not self.issue_rag:
+        if not self.issue_rag_system:
             return json.dumps({"error": "Issue RAG system not available."})
 
         pr_info_str = self.get_pr_for_issue(issue_number)
@@ -3915,3 +4095,1148 @@ Please try:
 
 Example: `@agents.py write a news aggregation agent`
 """
+
+    # =====================================================================
+    # ENHANCED GIT HISTORY & BLAME FUNCTIONALITY
+    # =====================================================================
+
+    def git_blame_function(
+        self,
+        function_name: Annotated[str, "Name of the function or class to get blame information for"],
+        file_path: Annotated[Optional[str], "File path to search in. If not provided, will search the entire codebase"] = None
+    ) -> str:
+        """Get git blame information for a specific function or class"""
+        try:
+            # Get current HEAD SHA
+            head_sha = self._get_current_head_sha()
+            
+            # Delegate to git_blame_tools
+            result = self.git_blame_tools.git_blame_function_at_commit(
+                file_path, function_name, head_sha
+            )
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            logger.error(f"Error in git_blame_function: {e}")
+            return json.dumps({
+                "function_name": function_name,
+                "file_path": file_path,
+                "error": str(e)
+            })
+
+    def who_last_edited_line(
+        self,
+        file_path: Annotated[str, "Path to the file to check"],
+        line_number: Annotated[int, "Line number to get blame information for"]
+    ) -> str:
+        """Get information about who last edited a specific line in a file"""
+        try:
+            # Get current HEAD SHA
+            head_sha = self._get_current_head_sha()
+            
+            # Delegate to git_blame_tools
+            result = self.git_blame_tools.git_blame_at_commit(
+                file_path, head_sha, line_start=line_number, line_end=line_number
+            )
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            logger.error(f"Error in who_last_edited_line: {e}")
+            return json.dumps({
+                "file_path": file_path,
+                "line_number": line_number,
+                "error": str(e)
+            })
+
+    # =====================================================================
+    # FOUNDING MEMBER AGENT TOOLS INTEGRATION
+    # =====================================================================
+
+    def get_file_history(
+        self,
+        file_path: Annotated[str, "Path to the file to get history for, relative to repository root"]
+    ) -> str:
+        """Get a timeline of all PRs and issues that touched the given file"""
+        try:
+            if not self.issue_rag_system or not hasattr(self.issue_rag_system, 'indexer'):
+                return json.dumps({
+                    "file_path": file_path,
+                    "error": "Issue RAG system not available for file history"
+                })
+            
+            patch_builder = self.issue_rag_system.indexer.patch_builder
+            links_by_issue = patch_builder.load_patch_links()
+            diff_docs = getattr(self.issue_rag_system.indexer, 'diff_docs', {})
+            
+            history = []
+            for issue_id, pr_links in links_by_issue.items():
+                for link in pr_links:
+                    if file_path in link.files_changed:
+                        diff_doc = diff_docs.get(link.pr_number)
+                        diff_summary = diff_doc.diff_summary if diff_doc else None
+                        
+                        issue_title = None
+                        issue_url = None
+                        if issue_id in self.issue_rag_system.indexer.issue_docs:
+                            issue_doc = self.issue_rag_system.indexer.issue_docs[issue_id]
+                            issue_title = issue_doc.title
+                            issue_url = f"https://github.com/{self.issue_rag_system.repo_owner}/{self.issue_rag_system.repo_name}/issues/{issue_id}"
+                        
+                        history.append({
+                            "pr_number": link.pr_number,
+                            "pr_title": link.pr_title,
+                            "pr_url": link.pr_url,
+                            "merged_at": link.merged_at,
+                            "issue_id": issue_id,
+                            "issue_title": issue_title,
+                            "issue_url": issue_url,
+                            "diff_summary": diff_summary
+                        })
+            
+            # Sort by merged_at
+            def parse_date(dt):
+                try:
+                    return datetime.fromisoformat(dt.replace('Z', '+00:00')) if dt else None
+                except Exception:
+                    return None
+            
+            history.sort(key=lambda x: parse_date(x.get('merged_at')), reverse=False)
+            
+            if not history:
+                return json.dumps({
+                    "file_path": file_path,
+                    "history": [],
+                    "message": "No PR or issue history found for this file."
+                })
+            
+            return self._chunk_large_output(json.dumps({
+                "file_path": file_path,
+                "history": history,
+                "count": len(history)
+            }))
+            
+        except Exception as e:
+            logger.error(f"Error getting file history: {e}")
+            return json.dumps({
+                "file_path": file_path,
+                "error": str(e)
+            })
+
+    def summarize_feature_evolution(
+        self,
+        feature_query: Annotated[str, "Feature name, keyword, or description to trace evolution for"]
+    ) -> str:
+        """Summarize how a feature evolved over time by finding all related issues, PRs, and changes"""
+        try:
+            if not self.issue_rag_system or not hasattr(self.issue_rag_system, 'indexer'):
+                return json.dumps({
+                    "feature_query": feature_query,
+                    "error": "Issue RAG system not available for feature evolution analysis"
+                })
+            
+            # Search for related issues and patches
+            issues = list(self.issue_rag_system.indexer.issue_docs.values())
+            patches = list(self.issue_rag_system.indexer.diff_docs.values())
+            
+            feature_lower = feature_query.lower()
+            
+            # Filter issues by keyword
+            related_issues = []
+            for issue in issues:
+                if (feature_lower in issue.title.lower() or 
+                    feature_lower in issue.body.lower() or
+                    any(feature_lower in label.lower() for label in issue.labels)):
+                    related_issues.append(issue)
+            
+            # Find related patches
+            related_patches = []
+            for patch in patches:
+                if (feature_lower in patch.diff_summary.lower() or
+                    any(feature_lower in f.lower() for f in patch.files_changed)):
+                    related_patches.append(patch)
+            
+            # Build timeline
+            timeline = []
+            
+            for issue in related_issues:
+                timeline.append({
+                    "type": "issue",
+                    "id": issue.id,
+                    "title": issue.title,
+                    "url": f"https://github.com/{self.issue_rag_system.repo_owner}/{self.issue_rag_system.repo_name}/issues/{issue.id}",
+                    "created_at": issue.created_at,
+                    "closed_at": issue.closed_at,
+                    "state": issue.state,
+                    "labels": issue.labels
+                })
+            
+            for patch in related_patches:
+                timeline.append({
+                    "type": "pr",
+                    "pr_number": patch.pr_number,
+                    "issue_id": getattr(patch, 'issue_id', None),
+                    "files_changed": patch.files_changed,
+                    "diff_summary": patch.diff_summary,
+                    "merged_at": getattr(patch, 'merged_at', None),
+                    "url": f"https://github.com/{self.issue_rag_system.repo_owner}/{self.issue_rag_system.repo_name}/pull/{patch.pr_number}"
+                })
+            
+            # Sort by date
+            def parse_date(item):
+                if item["type"] == "issue":
+                    return item["created_at"] or ""
+                else:
+                    return item.get("merged_at") or ""
+            
+            timeline.sort(key=parse_date)
+            
+            if not timeline:
+                return json.dumps({
+                    "feature_query": feature_query,
+                    "timeline": [],
+                    "message": "No evolution history found for this feature."
+                })
+            
+            return self._chunk_large_output(json.dumps({
+                "feature_query": feature_query,
+                "timeline": timeline,
+                "count": len(timeline),
+                "summary": {
+                    "total_issues": len(related_issues),
+                    "total_prs": len(related_patches),
+                    "open_issues": len([i for i in related_issues if i.state == "open"]),
+                    "closed_issues": len([i for i in related_issues if i.state == "closed"])
+                }
+            }))
+            
+        except Exception as e:
+            logger.error(f"Error summarizing feature evolution: {e}")
+            return json.dumps({
+                "feature_query": feature_query,
+                "error": str(e)
+            })
+
+    def who_implemented_this(
+        self,
+        feature_name: Annotated[str, "Name of the feature, function, class, or code pattern to find the original implementation for"],
+        file_path: Annotated[Optional[str], "Optional file path to search in. If not provided, searches the entire repository"] = None
+    ) -> str:
+        """Find who initially implemented a feature, function, or class using git history"""
+        try:
+            # ENHANCED APPROACH: Try to find using issue/PR data first
+            if self.issue_rag_system and hasattr(self.issue_rag_system, 'indexer'):
+                try:
+                    # Search for related issues/PRs about this feature using asyncio
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                    try:
+                        issues, patches = loop.run_until_complete(
+                            self.issue_rag_system.retriever.find_related_issues(
+                                feature_name, 
+                                k=5,
+                                include_patches=True
+                            )
+                        )
+                    finally:
+                        loop.close()
+                    
+                    if issues:
+                        # Find the oldest closed issue that likely introduced this feature
+                        oldest_pr = None
+                        oldest_date = None
+                        
+                        for issue_result in issues:
+                            issue = issue_result.issue
+                            if issue.state == "closed" and issue.patch_url:
+                                # Extract PR number from patch URL
+                                import re
+                                pr_match = re.search(r'/pull/(\d+)', issue.patch_url)
+                                if pr_match:
+                                    pr_number = int(pr_match.group(1))
+                                    
+                                    # Get diff docs for this PR
+                                    if hasattr(self.issue_rag_system.indexer, 'diff_docs'):
+                                        diff_docs = self.issue_rag_system.indexer.diff_docs
+                                        if pr_number in diff_docs:
+                                            diff_doc = diff_docs[pr_number]
+                                            merged_at_val = getattr(diff_doc, 'merged_at', None)
+                                            if merged_at_val:
+                                                try:
+                                                    from datetime import datetime
+                                                    merged_date = datetime.fromisoformat(merged_at_val.replace('Z', '+00:00'))
+                                                    
+                                                    if oldest_date is None or merged_date < oldest_date:
+                                                        oldest_date = merged_date
+                                                        oldest_pr = {
+                                                            "pr_number": pr_number,
+                                                            "issue_id": issue.id,
+                                                            "issue_title": issue.title,
+                                                            "merged_at": merged_at_val,
+                                                            "files_changed": diff_doc.files_changed,
+                                                            "diff_summary": diff_doc.diff_summary[:300] + "..." if len(diff_doc.diff_summary) > 300 else diff_doc.diff_summary,
+                                                            "similarity": issue_result.similarity
+                                                        }
+                                                except Exception:
+                                                    continue
+                        
+                        if oldest_pr:
+                            # Get the PR closing commit for better details
+                            pr_commit = self.git_history_tools.find_pr_closing_commit(oldest_pr["pr_number"])
+                            
+                            result_data = {
+                                "feature_name": feature_name,
+                                "file_path": file_path,
+                                "method": "enhanced_pr_tracking",
+                                "introducing_pr": oldest_pr,
+                                "initial_implementation": pr_commit,
+                                "message": f"Feature '{feature_name}' was most likely introduced in PR #{oldest_pr['pr_number']}: {oldest_pr['issue_title']}"
+                            }
+                            
+                            return json.dumps(result_data, indent=2)
+                            
+                except Exception as e:
+                    logger.warning(f"Enhanced PR tracking failed, falling back to git log: {e}")
+            
+            # FALLBACK: Use the original git log approach
+            try:
+                # Build the git log command
+                if file_path:
+                    # Validate file path
+                    abs_path = os.path.join(self.repo_path, file_path)
+                    if not abs_path.startswith(os.path.realpath(self.repo_path)):
+                        return json.dumps({"error": "File path outside repository"})
+                    
+                    log_cmd = [
+                        "git", "log", "--reverse", "--pretty=format:%H|%an|%ae|%ad|%s",
+                        "-S", feature_name, "--", file_path
+                    ]
+                else:
+                    log_cmd = [
+                        "git", "log", "--reverse", "--pretty=format:%H|%an|%ae|%ad|%s",
+                        "-S", feature_name
+                    ]
+                
+                result = subprocess.run(log_cmd, capture_output=True, text=True, cwd=self.repo_path)
+                
+                if result.returncode != 0:
+                    return json.dumps({
+                        "feature_name": feature_name,
+                        "file_path": file_path,
+                        "error": f"Git log failed: {result.stderr}"
+                    })
+                
+                if not result.stdout.strip():
+                    return json.dumps({
+                        "feature_name": feature_name,
+                        "file_path": file_path,
+                        "message": f"No commits found that introduced '{feature_name}'"
+                    })
+                
+                # Get the first commit (oldest)
+                lines = result.stdout.strip().split('\n')
+                first_line = lines[0]
+                parts = first_line.split('|', 4)
+                
+                if len(parts) < 5:
+                    return json.dumps({
+                        "feature_name": feature_name,
+                        "error": "Could not parse git log output"
+                    })
+                
+                commit_hash, author_name, author_email, date, subject = parts
+                
+                # Get files changed in this commit
+                show_cmd = ["git", "show", "--name-only", "--pretty=format:", commit_hash]
+                show_result = subprocess.run(show_cmd, capture_output=True, text=True, cwd=self.repo_path)
+                
+                files_changed = []
+                if show_result.returncode == 0:
+                    files_changed = [f.strip() for f in show_result.stdout.strip().split('\n') if f.strip()]
+                
+                # Find related issue/PR from commit message
+                related_issue = None
+                if self.issue_rag_system and hasattr(self.issue_rag_system, 'indexer'):
+                    import re
+                    issue_refs = re.findall(r'#(\d+)', subject)
+                    for issue_num in issue_refs:
+                        try:
+                            issue_id = int(issue_num)
+                            if issue_id in self.issue_rag_system.indexer.issue_docs:
+                                issue_doc = self.issue_rag_system.indexer.issue_docs[issue_id]
+                                related_issue = {
+                                    "id": issue_id,
+                                    "title": issue_doc.title,
+                                    "url": f"https://github.com/{self.issue_rag_system.repo_owner}/{self.issue_rag_system.repo_name}/issues/{issue_id}"
+                                }
+                                break
+                        except ValueError:
+                            continue
+                
+                # Get all contributors to this feature
+                all_contributors_cmd = ["git", "log", "--pretty=format:%an", "-S", feature_name]
+                if file_path:
+                    all_contributors_cmd.extend(["--", file_path])
+                
+                contributors_result = subprocess.run(all_contributors_cmd, capture_output=True, text=True, cwd=self.repo_path)
+                contributors = []
+                total_contributors = 0
+                
+                if contributors_result.returncode == 0 and contributors_result.stdout.strip():
+                    all_contributors = contributors_result.stdout.strip().split('\n')
+                    unique_contributors = list(set(all_contributors))
+                    contributors = unique_contributors[:5]  # Top 5 contributors
+                    total_contributors = len(unique_contributors)
+                
+                result_data = {
+                    "feature_name": feature_name,
+                    "file_path": file_path,
+                    "initial_implementation": {
+                        "commit": {
+                            "hash": commit_hash.strip(),
+                            "author_name": author_name.strip(),
+                            "author_email": author_email.strip(),
+                            "date": date.strip(),
+                            "subject": subject.strip()
+                        },
+                        "files_changed": files_changed[:10],  # Limit to 10 files
+                        "total_files_changed": len(files_changed)
+                    },
+                    "contributor_summary": {
+                        "total_contributors": total_contributors,
+                        "top_contributors": contributors
+                    }
+                }
+                
+                if related_issue:
+                    result_data["related_issue"] = related_issue
+                
+                return json.dumps(result_data)
+                
+            except Exception as e:
+                raise e
+                
+        except Exception as e:
+            logger.error(f"Error in who_implemented_this: {e}")
+            return json.dumps({
+                "feature_name": feature_name,
+                "file_path": file_path,
+                "error": str(e)
+            })
+
+    async def regression_detector(
+        self,
+        issue_query: Annotated[str, "Description of the new issue to check for potential regressions"]
+    ) -> str:
+        """Detect if a new issue might be a regression of a previously fixed issue"""
+        try:
+            if not self.issue_rag_system:
+                return json.dumps({
+                    "query": issue_query,
+                    "error": "Issue RAG system not available for regression detection"
+                })
+            
+            # Search for similar issues
+            issues, patches = await self.issue_rag_system.retriever.find_related_issues(
+                issue_query, 
+                k=10,
+                include_patches=True
+            )
+            
+            if not issues:
+                return json.dumps({
+                    "query": issue_query,
+                    "regression_candidates": [],
+                    "message": "No similar issues found to analyze for regressions."
+                })
+
+            regression_candidates = []
+            
+            for issue_result in issues:
+                issue = issue_result.issue
+                
+                # Skip open issues
+                if issue.state != "closed":
+                    continue
+                
+                # Check if this issue has a patch URL
+                if not issue.patch_url:
+                    continue
+                
+                # Extract PR number from patch URL
+                import re
+                pr_match = re.search(r'/pull/(\d+)', issue.patch_url)
+                pr_number = int(pr_match.group(1)) if pr_match else None
+                if not pr_number:
+                    continue
+                
+                # Get the diff doc for this PR
+                diff_docs = self.issue_rag_system.indexer.diff_docs
+                diff_doc = diff_docs.get(pr_number)
+                if not diff_doc:
+                    continue
+                
+                files_changed = diff_doc.files_changed
+                
+                # Find newer PRs that touched the same files
+                newer_prs = []
+                for dd in diff_docs.values():
+                    if any(f in dd.files_changed for f in files_changed):
+                        try:
+                            old_date = datetime.fromisoformat(getattr(diff_doc, 'merged_at', None).replace('Z', '+00:00')) if getattr(diff_doc, 'merged_at', None) else None
+                            new_date = datetime.fromisoformat(getattr(dd, 'merged_at', None).replace('Z', '+00:00')) if getattr(dd, 'merged_at', None) else None
+                            
+                            if old_date and new_date and new_date > old_date:
+                                newer_prs.append({
+                                    "pr_number": dd.pr_number,
+                                    "merged_at": getattr(dd, 'merged_at', None),
+                                    "files_changed": dd.files_changed,
+                                    "diff_summary": dd.diff_summary[:200] + "..." if len(dd.diff_summary) > 200 else dd.diff_summary
+                                })
+                        except Exception:
+                            continue
+                
+                # Only include if there are newer PRs
+                if newer_prs:
+                    regression_candidates.append({
+                        "closed_issue": {
+                            "id": issue.id,
+                            "title": issue.title,
+                            "url": f"https://github.com/{self.issue_rag_system.repo_owner}/{self.issue_rag_system.repo_name}/issues/{issue.id}",
+                            "closed_at": issue.closed_at,
+                            "similarity": issue_result.similarity
+                        },
+                        "fix_pr": {
+                            "pr_number": pr_number,
+                            "patch_url": issue.patch_url,
+                            "files_changed": files_changed
+                        },
+                        "newer_prs": newer_prs[:5]  # Limit to 5 most recent
+                    })
+            
+            # Sort by similarity
+            regression_candidates.sort(key=lambda x: x["closed_issue"]["similarity"], reverse=True)
+            
+            return self._chunk_large_output(json.dumps({
+                "query": issue_query,
+                "regression_candidates": regression_candidates[:5],  # Top 5
+                "total_candidates": len(regression_candidates),
+                "analysis_summary": {
+                    "similar_issues_found": len(issues),
+                    "closed_issues_analyzed": len([i for i in issues if i.issue.state == "closed"]),
+                    "potential_regressions": len(regression_candidates)
+                }
+            }))
+            
+        except Exception as e:
+            logger.error(f"Error in regression detection: {e}")
+            return json.dumps({
+                "query": issue_query,
+                "error": str(e)
+            })
+
+    @lru_cache(maxsize=4096)
+    def _blame_line_cached(self, file_path: str, line_number: int) -> Optional[Dict[str, Any]]:
+        """Cached version of blame line for performance"""
+        try:
+            abs_path = os.path.join(self.repo_path, file_path)
+            if not os.path.exists(abs_path):
+                return None
+            
+            try:
+                blame_cmd = ["git", "blame", "-w", "-C", "-L", f"{line_number},{line_number}", file_path]
+                result = subprocess.run(blame_cmd, capture_output=True, text=True, cwd=self.repo_path)
+                
+                if result.returncode != 0:
+                    return None
+                
+                blame_line = result.stdout.strip()
+                if not blame_line:
+                    return None
+                
+                # Parse blame output
+                parts = blame_line.split(')', 1)
+                if len(parts) != 2:
+                    return None
+                
+                commit_info = parts[0] + ')'
+                code = parts[1].strip()
+                commit_hash = commit_info.split()[0]
+                
+                # Extract author and date
+                paren_content = commit_info[commit_info.find('(')+1:commit_info.rfind(')')]
+                paren_parts = paren_content.rsplit(' ', 3)
+                
+                if len(paren_parts) >= 4:
+                    author = ' '.join(paren_parts[:-3])
+                    date = ' '.join(paren_parts[-3:])
+                else:
+                    author = paren_content
+                    date = "unknown"
+                
+                return {
+                    "commit": commit_hash,
+                    "author": author,
+                    "date": date,
+                    "code": code
+                }
+                
+            except Exception:
+                return None
+                
+        except Exception:
+            return None
+
+    def _chunk_large_output(self, content: str) -> str:
+        """Handle large outputs by chunking and storing in cache if available"""
+        try:
+            # Try to use chunk store if available
+            if hasattr(self, 'chunk_store') and self.chunk_store:
+                chunk_size = 8192  # Default chunk size
+                if len(content) > chunk_size:
+                    chunk_id = self.chunk_store.store(content)
+                    preview_size = 1000
+                    return json.dumps({
+                        "type": "chunked",
+                        "chunk_id": chunk_id,
+                        "preview": content[:preview_size] + "...",
+                        "total_size": len(content),
+                        "message": "Response was too large and has been chunked. Use the chunk_id to retrieve the full content."
+                    })
+            
+            # Fallback: just return the content (might be truncated by UI)
+            return content
+            
+        except Exception as e:
+            logger.warning(f"Error chunking output: {e}")
+            # Return with preview if chunking fails
+            preview_size = 1000
+            if len(content) > preview_size:
+                return json.dumps({
+                    "type": "truncated",
+                    "preview": content[:preview_size] + "...",
+                    "total_size": len(content),
+                    "error": "Could not chunk large response",
+                    "message": str(e)
+                })
+            return content
+
+    # Enhanced Git Tools - Wrapper Methods
+    def git_blame_at_commit(
+        self,
+        file_path: Annotated[str, "Path to the file to blame"],
+        commit_sha: Annotated[str, "Commit SHA to run blame at"],
+        line_start: Annotated[Optional[int], "Starting line number (optional)"] = None,
+        line_end: Annotated[Optional[int], "Ending line number (optional)"] = None
+    ) -> str:
+        """Get git blame information for a file at a specific commit"""
+        try:
+            result = self.git_blame_tools.git_blame_at_commit(
+                file_path, commit_sha, line_start, line_end
+            )
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            logger.error(f"Error in git_blame_at_commit: {e}")
+            return json.dumps({"error": str(e)})
+
+    def find_commits_touching_function(
+        self,
+        function_name: Annotated[str, "Name of the function to track"],
+        file_path: Annotated[str, "File containing the function"],
+        limit: Annotated[int, "Maximum number of commits to return"] = 10
+    ) -> str:
+        """Find all commits that modified a specific function"""
+        try:
+            result = self.git_history_tools.find_commits_touching_function(
+                function_name, file_path, limit
+            )
+            return self._chunk_large_output(json.dumps(result, indent=2))
+        except Exception as e:
+            logger.error(f"Error finding commits for function: {e}")
+            return json.dumps({"error": str(e)})
+
+    def get_function_evolution(
+        self,
+        function_name: Annotated[str, "Name of the function to track evolution for"],
+        file_path: Annotated[str, "File containing the function"],
+        limit: Annotated[int, "Maximum number of commits to analyze"] = 5
+    ) -> str:
+        """Get the evolution of a function over time with diff details"""
+        try:
+            result = self.git_history_tools.get_function_evolution(
+                function_name, file_path, limit
+            )
+            return self._chunk_large_output(json.dumps(result, indent=2))
+        except Exception as e:
+            logger.error(f"Error getting function evolution: {e}")
+            return json.dumps({"error": str(e)})
+
+    def find_pr_closing_commit(
+        self,
+        pr_number: Annotated[int, "PR number to find the closing commit for"]
+    ) -> str:
+        """Get the merge commit information for a PR"""
+        try:
+            result = self.git_history_tools.find_pr_closing_commit(pr_number)
+            if result:
+                return json.dumps(result, indent=2)
+            else:
+                return json.dumps({"error": f"No closing commit found for PR #{pr_number}"})
+        except Exception as e:
+            logger.error(f"Error finding PR closing commit: {e}")
+            return json.dumps({"error": str(e)})
+
+    def get_issue_closing_info(
+        self,
+        issue_number: Annotated[int, "Issue number to get closing information for"]
+    ) -> str:
+        """Get detailed information about who closed an issue and with what commit/PR"""
+        try:
+            result = self.issue_closing_tools.get_issue_closing_info(issue_number)
+            return self._chunk_large_output(json.dumps(result, indent=2))
+        except Exception as e:
+            logger.error(f"Error getting issue closing info: {e}")
+            return json.dumps({"error": str(e)})
+
+    def get_open_issues_related_to_commit(
+        self,
+        commit_sha: Annotated[str, "Commit SHA to find related open issues for"]
+    ) -> str:
+        """Find open issues that might be related to changes in a specific commit"""
+        try:
+            result = self.issue_closing_tools.get_open_issues_related_to_commit(commit_sha)
+            return self._chunk_large_output(json.dumps(result, indent=2))
+        except Exception as e:
+            logger.error(f"Error finding issues related to commit: {e}")
+            return json.dumps({"error": str(e)})
+
+    def find_feature_introducing_pr(
+        self,
+        feature_name: Annotated[str, "Name of the feature to find the introducing PR for (e.g., 'Gemini models', 'authentication', etc.)"]
+    ) -> str:
+        """Find which PR/issue introduced a specific feature by searching the comprehensive RAG index (issues + PR diffs)"""
+        try:
+            introducing_prs = []
+            search_methods = []
+            
+                        # Method 1: Search through issues and diffs using RAG (primary method)
+            if self.issue_rag_system:
+                try:
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                    try:
+                        issues, patches = loop.run_until_complete(
+                            self.issue_rag_system.retriever.find_related_issues(
+                                feature_name, 
+                                k=10,
+                                include_patches=True
+                            )
+                        )
+                    finally:
+                        loop.close()
+                    
+                    search_methods.append("issue_and_diff_rag_search")
+                    
+                    for issue_result in issues:
+                        issue = issue_result.issue
+                        
+                        # Look for closed issues with PRs
+                        if issue.state == "closed" and issue.patch_url:
+                            # Extract PR number from patch URL
+                            import re
+                            pr_match = re.search(r'/pull/(\d+)', issue.patch_url)
+                            if pr_match:
+                                pr_number = int(pr_match.group(1))
+                                
+                                pr_info = {
+                                    "pr_number": pr_number,
+                                    "issue_id": issue.id,
+                                    "issue_title": issue.title,
+                                    "pr_title": issue.title,  # Use issue title as PR title initially
+                                    "issue_state": issue.state,
+                                    "patch_url": issue.patch_url,
+                                    "similarity": round(issue_result.similarity, 3),
+                                    "closed_at": issue.closed_at,
+                                    "source": "rag_search"
+                                }
+                                
+                                # Add diff information if available
+                                if hasattr(self.issue_rag_system.indexer, 'diff_docs'):
+                                    diff_docs = self.issue_rag_system.indexer.diff_docs
+                                    if pr_number in diff_docs:
+                                        diff_doc = diff_docs[pr_number]
+                                        merged_at_val = getattr(diff_doc, 'merged_at', None)
+                                        pr_info.update({
+                                            "merged_at": merged_at_val,
+                                            "files_changed": diff_doc.files_changed[:10],
+                                            "total_files_changed": len(diff_doc.files_changed),
+                                            "diff_summary": diff_doc.diff_summary[:300] + "..." if len(diff_doc.diff_summary) > 300 else diff_doc.diff_summary
+                                        })
+                                
+                                introducing_prs.append(pr_info)
+                
+                except Exception as e:
+                    logger.warning(f"Issue RAG search failed: {e}")
+            
+            # Method 2: Direct git commit message search (NEW - more reliable)
+            try:
+                search_methods.append("git_commit_search")
+                
+                # Search for commits mentioning the feature in commit messages
+                feature_keywords = feature_name.lower().split()
+                
+                # Use git log to search commit messages
+                for keyword in feature_keywords:
+                    try:
+                        # Search for commits with the keyword in the message
+                        git_cmd = [
+                            "git", "log", 
+                            "--grep", keyword,
+                            "--grep", keyword.upper(),
+                            "--pretty=format:%H|%an|%ae|%ad|%s",
+                            "--all",
+                            "-20"  # Limit to recent commits
+                        ]
+                        
+                        result = subprocess.run(
+                            git_cmd,
+                            capture_output=True,
+                            text=True,
+                            cwd=self.repo_path
+                        )
+                        
+                        if result.returncode == 0 and result.stdout.strip():
+                            lines = result.stdout.strip().split('\n')
+                            for line in lines:
+                                parts = line.split('|', 4)
+                                if len(parts) >= 5:
+                                    commit_sha, author, email, date, message = parts
+                                    
+                                    # Look for PR references in commit message
+                                    pr_match = re.search(r'#(\d+)|pull request #?(\d+)|PR #?(\d+)', message, re.IGNORECASE)
+                                    if pr_match:
+                                        pr_number = int(next(g for g in pr_match.groups() if g))
+                                        
+                                        # Score this match
+                                        message_lower = message.lower()
+                                        score = sum(0.3 for kw in feature_keywords if kw in message_lower)
+                                        
+                                        if score > 0.2:  # Minimum threshold
+                                            # Check if we already have this PR
+                                            existing_pr = next((pr for pr in introducing_prs if pr["pr_number"] == pr_number), None)
+                                            
+                                            if not existing_pr:
+                                                pr_info = {
+                                                    "pr_number": pr_number,
+                                                    "commit_sha": commit_sha,
+                                                    "pr_title": message,
+                                                    "similarity": round(score, 3),
+                                                    "merged_at": date,
+                                                    "author": author,
+                                                    "source": "git_commit_search",
+                                                    "matching_commit": f"{commit_sha[:8]}: {message}"
+                                                }
+                                                introducing_prs.append(pr_info)
+                    except Exception as e:
+                        logger.warning(f"Git commit search failed for keyword '{keyword}': {e}")
+                        
+            except Exception as e:
+                logger.warning(f"Git commit search failed: {e}")
+            
+            # Method 3: Search through diff docs (improved repo detection)
+            try:
+                from .patch_linkage import PatchLinkageBuilder
+                
+                # Better repo detection for temporary folders
+                repo_owner, repo_name = self._extract_repo_info()
+                
+                if repo_owner != "unknown" and repo_name != "unknown":
+                    # Load diff docs
+                    patch_builder = PatchLinkageBuilder(repo_owner, repo_name)
+                    diff_docs = patch_builder.load_diff_docs()
+                    
+                    if diff_docs:
+                        search_methods.append("diff_content_search")
+                        
+                        # Search through diff docs for feature mentions
+                        feature_keywords = feature_name.lower().split()
+                        
+                        for diff_doc in diff_docs:
+                            score = 0
+                            matching_reasons = []
+                            
+                            # Check PR title (if we have issue data)
+                            pr_title = ""
+                            if hasattr(self.issue_rag_system, 'indexer') and hasattr(self.issue_rag_system.indexer, 'issues'):
+                                for issue in self.issue_rag_system.indexer.issues:
+                                    if hasattr(issue, 'patch_url') and f"pull/{diff_doc.pr_number}" in (issue.patch_url or ""):
+                                        pr_title = issue.title
+                                        break
+                            
+                            # Score based on PR title
+                            if pr_title:
+                                title_lower = pr_title.lower()
+                                title_matches = sum(1 for keyword in feature_keywords if keyword in title_lower)
+                                if title_matches > 0:
+                                    score += title_matches * 0.4
+                                    matching_reasons.append(f"title_matches: {title_matches}")
+                            
+                            # Score based on diff summary content
+                            diff_lower = diff_doc.diff_summary.lower()
+                            diff_matches = sum(1 for keyword in feature_keywords if keyword in diff_lower)
+                            if diff_matches > 0:
+                                score += diff_matches * 0.3
+                                matching_reasons.append(f"diff_content_matches: {diff_matches}")
+                            
+                            # Score based on files changed (look for relevant file patterns)
+                            file_matches = 0
+                            for file_path in diff_doc.files_changed:
+                                file_lower = file_path.lower()
+                                for keyword in feature_keywords:
+                                    if keyword in file_lower:
+                                        file_matches += 1
+                            if file_matches > 0:
+                                score += file_matches * 0.2
+                                matching_reasons.append(f"file_path_matches: {file_matches}")
+                            
+                            # Only include PRs with meaningful matches
+                            if score > 0.3:  # Minimum threshold
+                                # Check if this PR is already in our results
+                                existing_pr = next((pr for pr in introducing_prs if pr["pr_number"] == diff_doc.pr_number), None)
+                                
+                                if existing_pr:
+                                    # Update existing PR with diff info if missing
+                                    existing_pr["source"] = "multiple_sources"
+                                    if not existing_pr.get("diff_summary"):
+                                        existing_pr.update({
+                                            "files_changed": diff_doc.files_changed[:10],
+                                            "total_files_changed": len(diff_doc.files_changed),
+                                            "diff_summary": diff_doc.diff_summary[:300] + "..." if len(diff_doc.diff_summary) > 300 else diff_doc.diff_summary,
+                                            "merged_at": diff_doc.merged_at
+                                        })
+                                else:
+                                    # Add new PR from diff search
+                                    pr_info = {
+                                        "pr_number": diff_doc.pr_number,
+                                        "issue_id": diff_doc.issue_id,
+                                        "pr_title": pr_title or f"PR #{diff_doc.pr_number}",
+                                        "similarity": round(min(score, 1.0), 3),  # Cap at 1.0
+                                        "merged_at": diff_doc.merged_at,
+                                        "files_changed": diff_doc.files_changed[:10],
+                                        "total_files_changed": len(diff_doc.files_changed),
+                                        "diff_summary": diff_doc.diff_summary[:300] + "..." if len(diff_doc.diff_summary) > 300 else diff_doc.diff_summary,
+                                        "source": "diff_search",
+                                        "matching_reasons": matching_reasons
+                                    }
+                                    introducing_prs.append(pr_info)
+                else:
+                    logger.warning(f"Could not determine repo owner/name from path: {self.repo_path}")
+                        
+            except Exception as e:
+                logger.warning(f"Diff content search failed: {e}")
+            
+            if not introducing_prs:
+                return json.dumps({
+                    "feature_name": feature_name,
+                    "message": f"No PRs found related to '{feature_name}' using any search method",
+                    "search_methods_attempted": search_methods,
+                    "repo_path": str(self.repo_path)
+                })
+            
+            # Sort by similarity (highest first) and then by date (newest first for same similarity)
+            introducing_prs.sort(key=lambda x: (-x["similarity"], -(time.mktime(time.strptime(x.get("merged_at", "1970-01-01T00:00:00Z")[:19], "%Y-%m-%dT%H:%M:%S")) if x.get("merged_at") else 0)))
+            
+            # Get the most likely introducing PR (highest similarity)
+            most_likely_pr = introducing_prs[0] if introducing_prs else None
+            
+            result = {
+                "feature_name": feature_name,
+                "total_related_prs": len(introducing_prs),
+                "most_likely_introducing_pr": most_likely_pr,
+                "all_related_prs": introducing_prs[:5],  # Show top 5
+                "search_methods_used": search_methods
+            }
+            
+            if most_likely_pr:
+                result["summary"] = f"Feature '{feature_name}' was most likely introduced in PR #{most_likely_pr['pr_number']}: {most_likely_pr['pr_title']} (similarity: {most_likely_pr['similarity']}, source: {most_likely_pr['source']})"
+            
+            return self._chunk_large_output(json.dumps(result, indent=2))
+            
+        except Exception as e:
+            logger.error(f"Error finding feature introducing PR: {e}")
+            return json.dumps({"error": str(e)})
+
+    def _extract_repo_info(self) -> tuple[str, str]:
+        """Extract repository owner and name from various sources"""
+        try:
+            # Method 1: Try to get from git remote
+            result = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                remote_url = result.stdout.strip()
+                # Parse GitHub URL
+                import re
+                github_match = re.search(r'github\.com[:/]([^/]+)/([^/.]+)', remote_url)
+                if github_match:
+                    owner, name = github_match.groups()
+                    # Clean up the name (remove .git suffix)
+                    name = name.replace('.git', '')
+                    return owner, name
+            
+            # Method 2: Try to extract from README or other metadata files
+            for readme_file in ['README.md', 'readme.md', 'README.txt', 'package.json']:
+                readme_path = self.repo_path / readme_file
+                if readme_path.exists():
+                    try:
+                        content = readme_path.read_text(encoding='utf-8')
+                        # Look for GitHub URLs in content
+                        github_match = re.search(r'github\.com/([^/]+)/([^/\s)]+)', content)
+                        if github_match:
+                            owner, name = github_match.groups()
+                            name = name.replace('.git', '')
+                            return owner, name
+                    except:
+                        continue
+            
+            # Method 3: Last resort - return unknown
+            return "unknown", "unknown"
+            
+        except Exception as e:
+            logger.warning(f"Error extracting repo info: {e}")
+            return "unknown", "unknown"
+
+    def find_when_feature_was_added(
+        self,
+        feature_search_term: Annotated[str, "Code pattern, function name, or content to find when it was first added (e.g., 'o3-mini', 'gpt-4', 'function_name')"]
+    ) -> str:
+        """Find when a specific feature, function, or code pattern was first added to the codebase"""
+        try:
+            results = []
+            
+            # Use git log -S to find when the content was added
+            git_cmd = [
+                "git", "log", 
+                "-S", feature_search_term,
+                "--pretty=format:%H|%an|%ae|%ad|%s",
+                "--source",
+                "--all",
+                "-20"
+            ]
+            
+            result = subprocess.run(
+                git_cmd,
+                capture_output=True,
+                text=True,
+                cwd=self.repo_path
+            )
+            
+            if result.returncode == 0 and result.stdout.strip():
+                lines = result.stdout.strip().split('\n')
+                
+                for line in lines:
+                    if '|' in line:  # Skip lines that aren't commit info
+                        parts = line.split('|', 4)
+                        if len(parts) >= 5:
+                            commit_sha, author, email, date, message = parts
+                            
+                            # Get the diff for this commit to see what changed
+                            diff_cmd = [
+                                "git", "show", commit_sha,
+                                "--pretty=format:",
+                                "-S", feature_search_term
+                            ]
+                            
+                            diff_result = subprocess.run(
+                                diff_cmd,
+                                capture_output=True,
+                                text=True,
+                                cwd=self.repo_path
+                            )
+                            
+                            files_changed = []
+                            additions = []
+                            removals = []
+                            
+                            if diff_result.returncode == 0:
+                                diff_lines = diff_result.stdout.split('\n')
+                                current_file = None
+                                
+                                for diff_line in diff_lines:
+                                    if diff_line.startswith('diff --git'):
+                                        # Extract filename
+                                        parts = diff_line.split()
+                                        if len(parts) >= 4:
+                                            current_file = parts[3][2:]  # Remove 'b/' prefix
+                                            if current_file not in files_changed:
+                                                files_changed.append(current_file)
+                                    elif diff_line.startswith('+') and feature_search_term in diff_line:
+                                        additions.append({
+                                            "file": current_file,
+                                            "line": diff_line[1:].strip()
+                                        })
+                                    elif diff_line.startswith('-') and feature_search_term in diff_line:
+                                        removals.append({
+                                            "file": current_file, 
+                                            "line": diff_line[1:].strip()
+                                        })
+                            
+                            # Look for PR references in commit message
+                            pr_match = re.search(r'#(\d+)|pull request #?(\d+)|PR #?(\d+)', message, re.IGNORECASE)
+                            pr_number = None
+                            if pr_match:
+                                pr_number = int(next(g for g in pr_match.groups() if g))
+                            
+                            commit_info = {
+                                "commit_sha": commit_sha,
+                                "author": author,
+                                "email": email,
+                                "date": date,
+                                "message": message,
+                                "pr_number": pr_number,
+                                "files_changed": files_changed,
+                                "additions": additions,
+                                "removals": removals,
+                                "net_change": len(additions) - len(removals)
+                            }
+                            
+                            results.append(commit_info)
+            
+            # Sort by date (oldest first to find when feature was first introduced)
+            results.sort(key=lambda x: x["date"])
+            
+            # Find the most likely introducing commit (first one with net additions)
+            introducing_commit = None
+            for commit in results:
+                if commit["net_change"] > 0:  # More additions than removals
+                    introducing_commit = commit
+                    break
+            
+            if not introducing_commit and results:
+                # Fallback to first commit if no clear additions
+                introducing_commit = results[0]
+            
+            summary = {
+                "search_term": feature_search_term,
+                "total_commits_found": len(results),
+                "most_likely_introducing_commit": introducing_commit,
+                "all_commits": results[:10],  # Show first 10
+                "method": "git_log_content_search"
+            }
+            
+            if introducing_commit:
+                pr_info = ""
+                if introducing_commit.get("pr_number"):
+                    pr_info = f" (PR #{introducing_commit['pr_number']})"
+                
+                summary["summary"] = f"Feature '{feature_search_term}' was most likely first added in commit {introducing_commit['commit_sha'][:8]} by {introducing_commit['author']} on {introducing_commit['date']}: {introducing_commit['message']}{pr_info}"
+            
+            return self._chunk_large_output(json.dumps(summary, indent=2))
+            
+        except Exception as e:
+            logger.error(f"Error finding when feature was added: {e}")
+            return json.dumps({"error": str(e), "search_term": feature_search_term})

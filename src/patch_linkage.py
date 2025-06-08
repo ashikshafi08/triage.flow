@@ -56,6 +56,7 @@ class DiffDoc:
     diff_path: str
     diff_text: str  # The actual diff content
     diff_summary: str  # Cleaned summary for embedding
+    merged_at: Optional[str] = None # Add merged_at field
 
 class PatchLinkageBuilder:
     """Builds and persists the issue→PR mapping for a repository"""
@@ -858,7 +859,8 @@ class PatchLinkageBuilder:
                 files_changed=link.files_changed,
                 diff_path=str(diff_path),
                 diff_text=diff_text,
-                diff_summary=diff_summary
+                diff_summary=diff_summary,
+                merged_at=link.merged_at # Populate merged_at
             )
             
             return diff_doc
@@ -943,6 +945,7 @@ class PatchLinkageBuilder:
                     "files_changed": doc.files_changed,
                     "diff_path": doc.diff_path,
                     "diff_summary": doc.diff_summary,
+                    "merged_at": doc.merged_at, # Save merged_at
                     "created_at": datetime.now().isoformat()
                 }
                 f.write(json.dumps(doc_dict, ensure_ascii=False) + '\n')
@@ -968,7 +971,8 @@ class PatchLinkageBuilder:
                             files_changed=doc_data.get("files_changed", []),
                             diff_path=doc_data["diff_path"],
                             diff_text="",  # We'll load this on demand
-                            diff_summary=doc_data["diff_summary"]
+                            diff_summary=doc_data["diff_summary"],
+                            merged_at=doc_data.get("merged_at") # Load merged_at
                         )
                         
                         diff_docs.append(diff_doc)
