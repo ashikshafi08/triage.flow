@@ -95,8 +95,34 @@ CUSTOM_SIGNATURE_IDENTIFIERS = {
             name_identifier="name.definition.class",
         ),
     },
-
-    
+    "c": {
+        "function_definition": _SignatureCaptureOptions(
+            end_signature_types=[_SignatureCaptureType(type="{", inclusive=False)],
+            name_identifier="declarator",
+        ),
+        "struct_specifier": _SignatureCaptureOptions(
+            end_signature_types=[_SignatureCaptureType(type="{", inclusive=False)],
+            name_identifier="name",
+        ),
+        "enum_specifier": _SignatureCaptureOptions(
+            end_signature_types=[_SignatureCaptureType(type="{", inclusive=False)],
+            name_identifier="name",
+        ),
+    },
+    "cpp": {
+        "function_definition": _SignatureCaptureOptions(
+            end_signature_types=[_SignatureCaptureType(type="{", inclusive=False)],
+            name_identifier="declarator",
+        ),
+        "class_specifier": _SignatureCaptureOptions(
+            end_signature_types=[_SignatureCaptureType(type="{", inclusive=False)],
+            name_identifier="name",
+        ),
+        "struct_specifier": _SignatureCaptureOptions(
+            end_signature_types=[_SignatureCaptureType(type="{", inclusive=False)],
+            name_identifier="name",
+        ),
+    },
 }
 
 # Custom comment options for additional languages
@@ -108,6 +134,12 @@ CUSTOM_COMMENT_OPTIONS = {
         comment_template="<!-- {} -->", scope_method=_ScopeMethod.INDENTATION
     ),
     "javascript": _CommentOptions(
+        comment_template="// {}", scope_method=_ScopeMethod.BRACKETS
+    ),
+    "c": _CommentOptions(
+        comment_template="// {}", scope_method=_ScopeMethod.BRACKETS
+    ),
+    "cpp": _CommentOptions(
         comment_template="// {}", scope_method=_ScopeMethod.BRACKETS
     ),
 }
@@ -473,9 +505,10 @@ Code:
                         signature_identifiers = CUSTOM_SIGNATURE_IDENTIFIERS.get(tree_sitter_lang)
                         
                         # Initialize CodeHierarchyNodeParser with the specific language
+                        # Provide empty dict as fallback for signature_identifiers to prevent pydantic validation errors
                         node_parser = CodeHierarchyNodeParser(
                             language=tree_sitter_lang,
-                            signature_identifiers=signature_identifiers,
+                            signature_identifiers=signature_identifiers or {},
                             code_splitter=CodeSplitter(
                                 language=tree_sitter_lang,
                                 chunk_lines=150, # Increased from 40 to show more actual code

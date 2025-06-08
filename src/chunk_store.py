@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 import json
 import hashlib
 import logging
-from .config import settings
+from src.config import settings
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -208,4 +208,4 @@ class ChunkStoreFactory:
             else:
                 cls._instance = InMemoryChunkStore()
                 logger.info("Using in-memory chunk store")
-        return cls._instance 
+        return cls._instance

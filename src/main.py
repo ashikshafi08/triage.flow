@@ -1675,13 +1675,11 @@ async def create_founding_session(request: FounderSessionRequest, background_tas
             session["_code_rag"] = code_rag
             session["_issue_rag"] = issue_rag
             # 4. Start patch linkage and agent setup in background
-            def finish_patch_linkage_and_agent():
-                import asyncio
+            async def finish_patch_linkage_and_agent():
                 try:
-                    loop = asyncio.get_event_loop()
                     # Reuse code_rag and issue_rag
                     # Re-initialize issue_rag with full patch linkage
-                    loop.run_until_complete(issue_rag.initialize(force_rebuild=False))
+                    await issue_rag.initialize(force_rebuild=False)
                     session = session_manager.get_session(session_id)
                     # Create the agent and store in session
                     agent = FoundingMemberAgent(session_id, code_rag, issue_rag)
@@ -1797,6 +1795,269 @@ async def sync_repository_data(session_id: str, background_tasks: BackgroundTask
     background_tasks.add_task(_sync_task)
     
     return {"message": "Repository data sync process started in the background."}
+
+def parse_repo_url(repo_url: str) -> tuple[str, str]:
+    """Extract owner and repository name from a GitHub URL."""
+    # Remove .git if present
+    repo_url = repo_url.replace(".git", "")
+    # Split by / and get last two parts
+    parts = repo_url.split("/")
+    owner = parts[-2]
+    repo = parts[-1]
+    return owner, repo
+
+def extract_file_diff_from_full_diff(full_diff: str, target_file_path: str) -> Optional[str]:
+    """Extract diff content for a specific file from a full PR diff"""
+    import re
+    from pathlib import Path
+    
+    # Normalize the target file path (convert to forward slashes, make relative)
+    target_path = Path(target_file_path).as_posix()
+    
+    # Split diff into individual file sections
+    # Each file section starts with "diff --git" or "--- a/"
+    sections = re.split(r'^(?=diff --git|--- a/)', full_diff, flags=re.MULTILINE)
+    
+    for section in sections:
+        if not section.strip():
+            continue
+            
+        # Look for the target file in this section
+        # Check both old and new file paths in case file was renamed
+        file_patterns = [
+            rf'^diff --git a/([^\s]+) b/([^\s]+)',
+            rf'^--- a/([^\s\n]+)',
+            rf'^\+\+\+ b/([^\s\n]+)'
+        ]
+        
+        section_files = set()
+        for pattern in file_patterns:
+            matches = re.findall(pattern, section, flags=re.MULTILINE)
+            if matches:
+                if isinstance(matches[0], tuple):
+                    section_files.update(matches[0])
+                else:
+                    section_files.update(matches)
+        
+        # Normalize section file paths and check for match
+        normalized_section_files = {Path(f).as_posix() for f in section_files}
+        
+        if target_path in normalized_section_files:
+            # Found the target file, clean up the diff section
+            lines = section.strip().split('\n')
+            
+            # Remove any leading empty lines
+            while lines and not lines[0].strip():
+                lines.pop(0)
+            
+            # Format the diff for better display
+            cleaned_diff = format_diff_for_display('\n'.join(lines))
+            
+            # If it's a proper diff with additions/deletions, return it
+            if any(line.startswith(('+', '-')) for line in lines):
+                return cleaned_diff
+    
+    return None
+
+def format_diff_for_display(diff_content: str) -> str:
+    """Format diff content for better display in the frontend"""
+    lines = diff_content.split('\n')
+    formatted_lines = []
+    
+    for line in lines:
+        if line.startswith('+++') or line.startswith('---'):
+            # File headers - make them more readable
+            if line.startswith('+++'):
+                line = line.replace('+++ b/', '+++ ')
+            elif line.startswith('---'):
+                line = line.replace('--- a/', '--- ')
+        elif line.startswith('@@'):
+            # Hunk headers - keep as is but ensure proper formatting
+            pass
+        elif line.startswith('+') and not line.startswith('+++'):
+            # Addition lines - ensure they stand out
+            pass
+        elif line.startswith('-') and not line.startswith('---'):
+            # Deletion lines - ensure they stand out  
+            pass
+        
+        formatted_lines.append(line)
+    
+    return '\n'.join(formatted_lines)
+
+@app.get("/api/file-snippet")
+async def get_file_snippet(
+    session_id: str = Query(..., description="Session ID to identify the repository"),
+    file_path: str = Query(..., description="Path to the file relative to repository root"),
+    lines: int = Query(10, description="Number of lines to return (default: 10)"),
+    start_line: Optional[int] = Query(None, description="Starting line number (1-indexed)"),
+    pr_number: Optional[int] = Query(None, description="PR number to show diff for this file"),
+    show_diff: bool = Query(False, description="Show diff instead of file content")
+):
+    """Get a snippet of a file for inline preview, with optional RAG-powered diff support"""
+    try:
+        # Get the session to access repository path and RAG system
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        repo_path = session.get("repo_path")
+        if not repo_path:
+            raise HTTPException(status_code=400, detail="No repository loaded in this session")
+        
+        # If diff is requested and we have a PR number, try RAG-based diff first
+        if show_diff and pr_number:
+            try:
+                # Try to use the RAG-based diff system (similar to agentic_tools.py)
+                agentic_rag = session.get("agentic_rag")
+                if agentic_rag and hasattr(agentic_rag, 'agentic_explorer') and agentic_rag.agentic_explorer:
+                    # Use the get_pr_diff method from agentic_tools
+                    diff_response = agentic_rag.agentic_explorer.get_pr_diff(pr_number)
+                    
+                    try:
+                        diff_data = json.loads(diff_response)
+                        if "error" not in diff_data and "full_diff" in diff_data:
+                            # Extract diff content for this specific file
+                            full_diff = diff_data["full_diff"]
+                            file_diff = extract_file_diff_from_full_diff(full_diff, file_path)
+                            
+                            if file_diff:
+                                return {
+                                    "snippet": file_diff,
+                                    "file_path": file_path,
+                                    "pr_number": pr_number,
+                                    "type": "diff",
+                                    "truncated": False,
+                                    "source": "rag_cache",
+                                    "files_changed": diff_data.get("files_changed", []),
+                                    "diff_summary": diff_data.get("diff_summary", "")
+                                }
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+                
+                # Fallback to git-based diff
+                return await get_file_diff_for_pr(repo_path, file_path, pr_number)
+            except Exception as e:
+                logger.warning(f"Failed to get diff for PR {pr_number}: {e}")
+                # Fall back to regular file content
+        
+        # Regular file content logic (existing code)
+        from pathlib import Path
+        import os
+        
+        repo_root = Path(repo_path)
+        target_file = repo_root / file_path
+        
+        # Security check: ensure the file is within the repo directory
+        try:
+            target_file = target_file.resolve()
+            repo_root = repo_root.resolve()
+            if not str(target_file).startswith(str(repo_root)):
+                raise HTTPException(status_code=403, detail="Access denied: File outside repository")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid file path: {str(e)}")
+        
+        # Check if file exists
+        if not target_file.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Check if it's actually a file
+        if not target_file.is_file():
+            raise HTTPException(status_code=400, detail="Path is not a file")
+        
+        # Read the file content
+        try:
+            with open(target_file, 'r', encoding='utf-8', errors='ignore') as f:
+                all_lines = f.readlines()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error reading file: {str(e)}")
+        
+        total_lines = len(all_lines)
+        
+        # Determine which lines to return
+        if start_line is not None:
+            # Start from specific line
+            start_idx = max(0, start_line - 1)  # Convert to 0-indexed
+            end_idx = min(total_lines, start_idx + lines)
+        else:
+            # Return first N lines by default
+            start_idx = 0
+            end_idx = min(total_lines, lines)
+        
+        # Extract the snippet
+        snippet_lines = all_lines[start_idx:end_idx]
+        snippet = ''.join(snippet_lines)
+        
+        # Remove trailing newline if present
+        snippet = snippet.rstrip('\n')
+        
+        return {
+            "snippet": snippet,
+            "file_path": file_path,
+            "start_line": start_idx + 1,  # Convert back to 1-indexed
+            "end_line": end_idx,
+            "total_lines": total_lines,
+            "truncated": end_idx < total_lines,
+            "type": "file_content"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting file snippet: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+async def get_file_diff_for_pr(repo_path: str, file_path: str, pr_number: int):
+    """Get the diff for a specific file in a PR"""
+    import subprocess
+    from pathlib import Path
+    
+    try:
+        repo_root = Path(repo_path)
+        
+        # Get PR information from git
+        result = subprocess.run([
+            "git", "log", "--oneline", "--grep", f"#{pr_number}", "-1"
+        ], cwd=repo_root, capture_output=True, text=True, check=True)
+        
+        if not result.stdout.strip():
+            # Try alternative approach - look for merge commits
+            result = subprocess.run([
+                "git", "log", "--oneline", "--merges", "--grep", f"#{pr_number}", "-1"
+            ], cwd=repo_root, capture_output=True, text=True, check=True)
+        
+        if not result.stdout.strip():
+            raise Exception(f"No commit found for PR #{pr_number}")
+        
+        commit_hash = result.stdout.strip().split()[0]
+        
+        # Get the diff for this specific file
+        diff_result = subprocess.run([
+            "git", "show", f"{commit_hash}", "--", file_path
+        ], cwd=repo_root, capture_output=True, text=True, check=True)
+        
+        diff_content = diff_result.stdout
+        
+        if not diff_content.strip():
+            # Try getting diff from parent commit
+            diff_result = subprocess.run([
+                "git", "diff", f"{commit_hash}^", commit_hash, "--", file_path
+            ], cwd=repo_root, capture_output=True, text=True, check=True)
+            diff_content = diff_result.stdout
+        
+        return {
+            "snippet": diff_content,
+            "file_path": file_path,
+            "pr_number": pr_number,
+            "commit_hash": commit_hash,
+            "type": "diff",
+            "truncated": False
+        }
+        
+    except subprocess.CalledProcessError as e:
+        raise Exception(f"Git command failed: {e}")
+    except Exception as e:
+        raise Exception(f"Failed to get diff: {e}")
 
 if __name__ == "__main__":
     import uvicorn

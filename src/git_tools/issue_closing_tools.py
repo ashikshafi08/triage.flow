@@ -103,13 +103,28 @@ class IssueClosingTools:
             query = ' '.join(keywords[:5])  # Use top 5 keywords
             
             # Use the issue RAG system to find related issues
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
             try:
-                issue_context = loop.run_until_complete(
-                    self.issue_rag_system.get_issue_context(query, max_issues=10)
-                )
+                # Check if we're already in an event loop
+                current_loop = None
+                try:
+                    current_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    current_loop = None
+                
+                if current_loop:
+                    # We're already in an async context, use concurrent.futures
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(
+                            asyncio.run,
+                            self.issue_rag_system.get_issue_context(query, max_issues=10)
+                        )
+                        issue_context = future.result(timeout=30)  # 30 second timeout
+                else:
+                    # No event loop running, safe to use asyncio.run
+                    issue_context = asyncio.run(
+                        self.issue_rag_system.get_issue_context(query, max_issues=10)
+                    )
                 
                 for search_result in issue_context.related_issues:
                     issue = search_result.issue
@@ -130,8 +145,8 @@ class IssueClosingTools:
                             "labels": issue.labels
                         })
                 
-            finally:
-                loop.close()
+            except Exception as e:
+                logger.warning(f"Error searching for related issues: {e}")
             
             return {
                 "commit_sha": commit_sha,

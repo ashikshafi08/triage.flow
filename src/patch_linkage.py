@@ -17,7 +17,7 @@ from tqdm.auto import tqdm
 from collections import defaultdict
 import re
 
-from .config import settings
+from src.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -869,7 +869,7 @@ class PatchLinkageBuilder:
             logger.warning(f"Error downloading diff for PR #{link.pr_number}: {e}")
             return None
 
-    def _extract_diff_hunks(self, diff_text: str, max_chars: int = 8000) -> str:
+    def _extract_diff_hunks(self, diff_text: str, max_chars: int = 4000) -> str:
         """Extract and format diff hunks for embedding, with size limit"""
         if not diff_text.strip():
             return "No diff content available"

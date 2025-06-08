@@ -139,11 +139,28 @@ class GitHubIssueClient:
         Synchronous wrapper to get issue data as a dictionary.
         Used by session_manager for backward compatibility.
         """
-        # Run the async method in a new event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # Handle async method properly
         try:
-            response = loop.run_until_complete(self.get_issue(issue_url))
+            # Check if we're already in an event loop
+            current_loop = None
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            
+            if current_loop:
+                # We're already in an async context, use concurrent.futures
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        self.get_issue(issue_url)
+                    )
+                    response = future.result(timeout=30)  # 30 second timeout
+            else:
+                # No event loop running, safe to use asyncio.run
+                response = asyncio.run(self.get_issue(issue_url))
+            
             if response.status == "success" and response.data:
                 # Convert Issue model to dict and add repository info
                 issue_dict = response.data.model_dump()
@@ -162,8 +179,8 @@ class GitHubIssueClient:
                 return issue_dict
             else:
                 raise Exception(f"Failed to fetch issue: {response.error}")
-        finally:
-            loop.close()
+        except Exception as e:
+            raise Exception(f"Failed to fetch issue: {str(e)}")
 
     async def list_issues(self, repo_url: str, state: str = "open", per_page: int = 30, max_pages: int = 5) -> list:
         """

@@ -25,7 +25,7 @@ from llama_index.core.postprocessor import LLMRerank
 import Stemmer
 from tqdm.auto import tqdm # Import tqdm
 
-from .config import settings
+from src.config import settings
 from .github_client import GitHubIssueClient
 from .llm_client import LLMClient
 from .models import IssueDoc, IssueSearchResult, IssueContextResponse, PatchSearchResult
@@ -131,13 +131,13 @@ class IssueIndexer:
             # Combine title, body, and key metadata for better semantic matching
             searchable_content = self._create_searchable_content(issue)
             
+            # Keep metadata minimal to avoid chunk size issues
+            # Move detailed information to the main text content
             doc = Document(
                 text=searchable_content,
                 metadata={
-                    "issue_id": issue.number, # Use issue.number for metadata consistency
-                    "title": issue.title,
+                    "issue_id": issue.number,
                     "state": issue.state,
-                    "labels": issue.labels,
                     "type": "issue",
                 },
             )
@@ -150,14 +150,16 @@ class IssueIndexer:
             self.diff_docs = {diff.pr_number: diff for diff in loaded_diffs}
             logger.info(f"Loaded {len(loaded_diffs)} diff documents to add to the index.")
             for diff in loaded_diffs:
-                # Create a more detailed document for patches
+                # Create detailed text content that includes all information
+                # Move file paths and detailed info to text content rather than metadata
+                detailed_content = self._create_patch_content(diff)
+                
                 doc = Document(
-                    text=f"Patch for Issue #{diff.issue_id} (PR #{diff.pr_number}):\n{diff.diff_summary}",
+                    text=detailed_content,
                     metadata={
                         "issue_id": diff.issue_id,
                         "pr_number": diff.pr_number,
                         "type": "patch",
-                        "files": diff.files_changed,
                     },
                 )
                 patch_documents.append(doc)
@@ -168,8 +170,15 @@ class IssueIndexer:
 
         all_documents = issue_documents + patch_documents
         
-        # 4. Build FAISS index for vector search
+        # 4. Build FAISS index for vector search with larger chunk size
         logger.info(f"Building FAISS index with {len(all_documents)} total documents...")
+        
+        # Use a node parser with larger chunk size to accommodate rich content
+        node_parser = SimpleNodeParser.from_defaults(
+            chunk_size=4096,  # Increased from default 1024
+            chunk_overlap=200  # Add overlap to preserve context
+        )
+        
         # Get embedding dimensions for the small model (1536 for text-embedding-3-small)
         embedding_dimensions = self.embed_model.dimensions
         if embedding_dimensions is None:
@@ -181,14 +190,17 @@ class IssueIndexer:
         logger.info(f"Using embedding dimension: {vec_size}")
         vector_store = FaissVectorStore(faiss_index=faiss.IndexFlatL2(vec_size))
         storage_context = StorageContext.from_defaults(vector_store=vector_store)
-        self.vector_index = VectorStoreIndex.from_documents(
-            all_documents,
+        
+        # Create nodes with the larger chunk size
+        nodes = node_parser.get_nodes_from_documents(all_documents)
+        
+        self.vector_index = VectorStoreIndex(
+            nodes=nodes,
             storage_context=storage_context,
             embed_model=self.embed_model
         )
         
         # 5. Save index components
-        nodes = list(self.vector_index.docstore.docs.values())
         self._save_faiss_index(nodes)
         
         # 6. Build and cache BM25 retriever
@@ -503,7 +515,8 @@ class IssueIndexer:
             parts.append(f"Labels: {labels_text}")
             
             # Also add labels as individual searchable terms
-            parts.append(f"Categories: {' '.join([f'category-{label}' for label in issue.labels])}")
+            category_labels = [f'category-{label}' for label in issue.labels]
+            parts.append(f"Categories: {' '.join(category_labels)}")
         
         # Add issue type context
         if any(label in ['bug', 'error', 'issue'] for label in issue.labels):
@@ -512,6 +525,22 @@ class IssueIndexer:
             parts.append("Type: Feature request or enhancement")
         elif any(label in ['question', 'help'] for label in issue.labels):
             parts.append("Type: Question or help request")
+        
+        # Combine with good separation for embedding
+        return "\n\n".join(parts)
+
+    def _create_patch_content(self, diff: Any) -> str:
+        """Create detailed text content for a patch"""
+        parts = []
+        
+        # Add summary and details
+        parts.append(f"Summary: {diff.diff_summary}")
+        parts.append(f"Files changed: {', '.join(diff.files_changed)}")
+        
+        # Add detailed information
+        parts.append(f"Issue ID: {diff.issue_id}")
+        parts.append(f"PR Number: {diff.pr_number}")
+        parts.append(f"Merged at: {diff.merged_at}")
         
         # Combine with good separation for embedding
         return "\n\n".join(parts)
@@ -1148,7 +1177,17 @@ class IssueAwareRAG:
         """Initialize the RAG system by building or loading the index"""
         self.indexer = IssueIndexer(self.repo_owner, self.repo_name)
         
-        # Build patch linkage first
+        # Check if we can load existing index FIRST (before expensive operations)
+        if not force_rebuild and await self.indexer.load_existing_index():
+            logger.info(f"Issue-aware RAG loaded from cache for {self.repo_owner}/{self.repo_name}.")
+            self.retriever = IssueRetriever(self.indexer)
+            self._initialized = True
+            return
+        
+        # Only do expensive building if we need to rebuild or no cache exists
+        logger.info(f"Building new index for {self.repo_owner}/{self.repo_name} (force_rebuild={force_rebuild})")
+        
+        # Build patch linkage (expensive)
         builder = PatchLinkageBuilder(self.repo_owner, self.repo_name, self.progress_callback)
         await builder.build_patch_linkage(
             max_issues=max_issues_for_patch_linkage,
@@ -1156,20 +1195,16 @@ class IssueAwareRAG:
             download_diffs=True
         )
         
-        # Then build/load the issue index
-        if force_rebuild or not await self.indexer.load_existing_index():
-            await self.indexer.crawl_and_index_issues(
-                max_issues=max_issues_for_patch_linkage,
-                force_rebuild_dependencies=force_rebuild,
-                max_issues_for_patch_linkage=max_issues_for_patch_linkage
-            )
-            self.retriever = IssueRetriever(self.indexer)
-            self._initialized = True
-            logger.info(f"Issue-aware RAG initialized for {self.repo_owner}/{self.repo_name} from cache.")
-            return
+        # Build the issue index (expensive)
+        await self.indexer.crawl_and_index_issues(
+            max_issues=max_issues_for_patch_linkage,
+            force_rebuild_dependencies=force_rebuild,
+            max_issues_for_patch_linkage=max_issues_for_patch_linkage
+        )
         
         self.retriever = IssueRetriever(self.indexer)
         self._initialized = True
+        logger.info(f"Issue-aware RAG initialized for {self.repo_owner}/{self.repo_name} successfully.")
     
     async def get_issue_context(
         self, 

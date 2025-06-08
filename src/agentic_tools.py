@@ -19,6 +19,7 @@ import ast
 from functools import lru_cache
 from typing import Union
 from datetime import datetime
+import concurrent.futures
 
 from llama_index.core.tools import FunctionTool
 from .chunk_store import ChunkStoreFactory
@@ -3433,16 +3434,29 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
                     "suggestion": "The issue search system is still loading. Please try again in a moment."
                 })
             
-            # Use asyncio to run async function
-            import asyncio
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
+            # Handle async function call properly
             try:
-                # Get issue context using the existing, already-initialized instance
-                issue_context = loop.run_until_complete(
-                    self.issue_rag_system.get_issue_context(query, max_issues=k)
-                )
+                # Check if we're already in an event loop
+                current_loop = None
+                try:
+                    current_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    current_loop = None
+                
+                if current_loop:
+                    # We're already in an async context, use concurrent.futures
+                    
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(
+                            asyncio.run,
+                            self.issue_rag_system.get_issue_context(query, max_issues=k)
+                        )
+                        issue_context = future.result(timeout=30)  # 30 second timeout
+                else:
+                    # No event loop running, safe to use asyncio.run
+                    issue_context = asyncio.run(
+                        self.issue_rag_system.get_issue_context(query, max_issues=k)
+                    )
                 
                 # Get repo info from the existing instance
                 repo_info = self.issue_rag_system.indexer.repo_owner, self.issue_rag_system.indexer.repo_name
@@ -3478,8 +3492,11 @@ I had some trouble with that analysis. Let me help you explore your codebase wit
                 
                 return json.dumps(results, indent=2)
                 
-            finally:
-                loop.close()
+            except Exception as inner_e:
+                return json.dumps({
+                    "error": f"Error during issue search: {str(inner_e)}",
+                    "related_issues": []
+                })
                 
         except Exception as e:
             logger.error(f"Error in related_issues tool: {e}")
@@ -4325,20 +4342,37 @@ Example: `@agents.py write a news aggregation agent`
             if self.issue_rag_system and hasattr(self.issue_rag_system, 'indexer'):
                 try:
                     # Search for related issues/PRs about this feature using asyncio
-                    import asyncio
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    
                     try:
-                        issues, patches = loop.run_until_complete(
-                            self.issue_rag_system.retriever.find_related_issues(
-                                feature_name, 
-                                k=5,
-                                include_patches=True
+                        # Check if we're already in an event loop
+                        current_loop = None
+                        try:
+                            current_loop = asyncio.get_running_loop()
+                        except RuntimeError:
+                            current_loop = None
+                        
+                        if current_loop:
+                            # We're already in an async context, use concurrent.futures
+                            with concurrent.futures.ThreadPoolExecutor() as executor:
+                                future = executor.submit(
+                                    asyncio.run,
+                                    self.issue_rag_system.retriever.find_related_issues(
+                                        feature_name, 
+                                        k=5,
+                                        include_patches=True
+                                    )
+                                )
+                                issues, patches = future.result(timeout=30)  # 30 second timeout
+                        else:
+                            # No event loop running, safe to use asyncio.run
+                            issues, patches = asyncio.run(
+                                self.issue_rag_system.retriever.find_related_issues(
+                                    feature_name, 
+                                    k=5,
+                                    include_patches=True
+                                )
                             )
-                        )
-                    finally:
-                        loop.close()
+                    except Exception:
+                        raise  # Re-raise for the outer exception handler
                     
                     if issues:
                         # Find the oldest closed issue that likely introduced this feature
@@ -4821,20 +4855,34 @@ Example: `@agents.py write a news aggregation agent`
                         # Method 1: Search through issues and diffs using RAG (primary method)
             if self.issue_rag_system:
                 try:
-                    import asyncio
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    
+                    # Check if we're already in an event loop
+                    current_loop = None
                     try:
-                        issues, patches = loop.run_until_complete(
+                        current_loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        current_loop = None
+                    
+                    if current_loop:
+                        # We're already in an async context, use concurrent.futures
+                        with concurrent.futures.ThreadPoolExecutor() as executor:
+                            future = executor.submit(
+                                asyncio.run,
+                                self.issue_rag_system.retriever.find_related_issues(
+                                    feature_name, 
+                                    k=10,
+                                    include_patches=True
+                                )
+                            )
+                            issues, patches = future.result(timeout=30)  # 30 second timeout
+                    else:
+                        # No event loop running, safe to use asyncio.run
+                        issues, patches = asyncio.run(
                             self.issue_rag_system.retriever.find_related_issues(
                                 feature_name, 
                                 k=10,
                                 include_patches=True
                             )
                         )
-                    finally:
-                        loop.close()
                     
                     search_methods.append("issue_and_diff_rag_search")
                     
