@@ -427,7 +427,33 @@ Remember: You have the power to explore and analyze both current and historical 
             FunctionTool.from_defaults(
                 fn=self.check_issue_status_and_linked_pr,
                 name="check_issue_status_and_linked_pr",
-                description="Checks the current status (open/closed) of a GitHub issue and lists any directly linked Pull Requests."
+                description="Checks the current status (open/closed) of a GitHub issue and lists any directly linked Pull Requests (both merged and open)."
+            ),
+            # Open PR Analysis Tools
+            FunctionTool.from_defaults(
+                fn=self.find_open_prs_for_issue,
+                name="find_open_prs_for_issue",
+                description="Find open pull requests that are related to or reference a specific issue number."
+            ),
+            FunctionTool.from_defaults(
+                fn=self.get_open_pr_status,
+                name="get_open_pr_status",
+                description="Get comprehensive status information for an open PR including reviews, CI status, and mergeability."
+            ),
+            FunctionTool.from_defaults(
+                fn=self.find_open_prs_by_files,
+                name="find_open_prs_by_files",
+                description="Find open pull requests that modify specific files in the repository."
+            ),
+            FunctionTool.from_defaults(
+                fn=self.search_open_prs,
+                name="search_open_prs",
+                description="Search through open pull requests by keywords, features, or descriptions to find relevant ones."
+            ),
+            FunctionTool.from_defaults(
+                fn=self.check_pr_readiness,
+                name="check_pr_readiness",
+                description="Check if an open pull request is ready for merging based on reviews, CI status, and conflicts."
             ),
             FunctionTool.from_defaults(
                 fn=self.write_complete_code,
@@ -3948,13 +3974,13 @@ Summary:"""
             "linked_prs_details": resolution_details
         })
 
-    def check_issue_status_and_linked_pr(
+    async def check_issue_status_and_linked_pr(
         self,
         issue_identifier: Annotated[str, "Issue number (#123) or full GitHub issue URL to check."]
     ) -> str:
         """
         Checks the current status (open/closed) of a GitHub issue and lists any directly linked Pull Requests.
-        Combines issue analysis with PR linkage information.
+        Combines issue analysis with PR linkage information, including both merged and open PRs.
         """
         # First, analyze the issue to get its current status and details
         issue_analysis_str = self.analyze_github_issue(issue_identifier)
@@ -3971,9 +3997,31 @@ Summary:"""
                 "analysis_response": issue_analysis
             })
 
-        # Then, get linked PRs for this issue number
-        pr_info_str = self.get_pr_for_issue(issue_number)
-        pr_info = json.loads(pr_info_str)
+        # Get merged PRs for this issue number
+        merged_pr_info_str = self.get_pr_for_issue(issue_number)
+        merged_pr_info = json.loads(merged_pr_info_str)
+
+        # Get open PRs for this issue number
+        open_pr_info_str = await self.find_open_prs_for_issue(issue_number)
+        open_pr_info = json.loads(open_pr_info_str)
+
+        # Combine merged and open PRs
+        merged_prs = merged_pr_info.get("found_prs", [])
+        open_prs = open_pr_info.get("open_prs", [])
+        
+        all_linked_prs = []
+        
+        # Add merged PRs with status
+        for pr in merged_prs:
+            pr_with_status = pr.copy()
+            pr_with_status["status"] = "merged"
+            all_linked_prs.append(pr_with_status)
+        
+        # Add open PRs with status
+        for pr in open_prs:
+            pr_with_status = pr.copy()
+            pr_with_status["status"] = "open"
+            all_linked_prs.append(pr_with_status)
 
         # Combine the information
         combined_result = {
@@ -3982,12 +4030,16 @@ Summary:"""
             "current_status": issue_analysis.get("issue_metadata", {}).get("state"),
             "classification": issue_analysis.get("issue_classification", {}).get("primary_type"),
             "complexity": issue_analysis.get("complexity_assessment", {}).get("level"),
-            "linked_prs": pr_info.get("found_prs", []) # Default to empty list if no PRs or error in pr_info
+            "linked_prs": all_linked_prs,
+            "pr_summary": {
+                "total_linked_prs": len(all_linked_prs),
+                "merged_prs": len(merged_prs),
+                "open_prs": len(open_prs)
+            }
         }
         
-        if "error" in pr_info and not combined_result["linked_prs"]: # Add PR error only if no PRs were found
-            combined_result["pr_linkage_error"] = pr_info["error"]
-
+        if "error" in merged_pr_info and "error" in open_pr_info and not all_linked_prs:
+            combined_result["pr_linkage_error"] = f"Merged PRs: {merged_pr_info.get('error', 'Unknown error')}; Open PRs: {open_pr_info.get('error', 'Unknown error')}"
 
         return json.dumps(combined_result, indent=2)
 
@@ -5877,3 +5929,475 @@ Example: `@agents.py write a news aggregation agent`
         except Exception as e:
             logger.error(f"Error in analyze_commit_patterns: {e}")
             return f"Error analyzing commit patterns: {str(e)}"
+
+    async def find_open_prs_for_issue(
+        self,
+        issue_number: Annotated[int, "The issue number to find related open PRs for."]
+    ) -> str:
+        """
+        Find open pull requests related to a specific issue.
+        """
+        try:
+            if not self.issue_rag_system or not self.issue_rag_system.is_initialized():
+                return json.dumps({
+                    "error": "Issue RAG system not initialized", 
+                    "open_prs": []
+                })
+            
+            # Get the issue details to understand what we're looking for
+            issue_doc = None
+            if hasattr(self.issue_rag_system.indexer, 'issue_docs'):
+                issue_doc = self.issue_rag_system.indexer.issue_docs.get(issue_number)
+            
+            if not issue_doc:
+                return json.dumps({
+                    "error": f"Issue #{issue_number} not found in the index",
+                    "open_prs": []
+                })
+            
+            # Get all open PRs from the patch linkage builder
+            from .patch_linkage import PatchLinkageBuilder
+            
+            # Extract repo info
+            repo_owner, repo_name = self._extract_repo_info()
+            patch_builder = PatchLinkageBuilder(repo_owner, repo_name)
+            
+            # Load open PRs
+            open_prs = patch_builder.load_open_prs()
+            
+            if not open_prs:
+                return json.dumps({
+                    "message": f"No open pull requests found in the repository index",
+                    "open_prs": []
+                })
+            
+            # Create search query based on the issue
+            issue_text = f"{issue_doc.title} {issue_doc.body}"
+            
+            # Find PRs that mention this issue or are related by content
+            related_prs = []
+            
+            for pr in open_prs:
+                similarity_score = 0.0
+                reasons = []
+                
+                # Check if PR mentions this issue directly
+                issue_ref_patterns = [f"#{issue_number}", f"issue {issue_number}", f"fixes #{issue_number}", f"closes #{issue_number}"]
+                pr_text = f"{pr.title} {pr.body}".lower()
+                
+                for pattern in issue_ref_patterns:
+                    if pattern in pr_text:
+                        similarity_score += 0.9
+                        reasons.append(f"mentions {pattern}")
+                        break
+                
+                # Basic text similarity (simple keyword matching)
+                issue_keywords = set(issue_doc.title.lower().split())
+                pr_keywords = set(pr.title.lower().split())
+                
+                # Remove common words
+                common_words = {"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by", "from", "as", "is", "was", "are", "were", "be", "been", "have", "has", "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "cannot", "not", "no", "yes", "this", "that", "these", "those", "it", "its", "they", "them", "their", "we", "us", "our", "you", "your", "i", "me", "my"}
+                
+                issue_keywords = issue_keywords - common_words
+                pr_keywords = pr_keywords - common_words
+                
+                if issue_keywords and pr_keywords:
+                    intersection = issue_keywords.intersection(pr_keywords)
+                    if intersection:
+                        keyword_similarity = len(intersection) / max(len(issue_keywords), len(pr_keywords))
+                        similarity_score += keyword_similarity * 0.6
+                        reasons.append(f"keyword overlap: {', '.join(intersection)}")
+                
+                # Add PR if it has any similarity
+                if similarity_score > 0.0:
+                    related_prs.append({
+                        "pr_number": pr.pr_number,
+                        "title": pr.title,
+                        "author": pr.author,
+                        "created_at": pr.created_at,
+                        "updated_at": pr.updated_at,
+                        "url": pr.url,
+                        "review_decision": pr.review_decision,
+                        "reviews_summary": pr.reviews_summary,
+                        "status_summary": pr.status_summary,
+                        "draft": pr.draft,
+                        "mergeable": pr.mergeable,
+                        "files_changed": pr.files_changed,
+                        "similarity": similarity_score,
+                        "match_reasons": reasons
+                    })
+            
+            # Sort by similarity score
+            related_prs.sort(key=lambda x: x["similarity"], reverse=True)
+            
+            return json.dumps({
+                "issue_number": issue_number,
+                "issue_title": issue_doc.title,
+                "total_open_prs": len(open_prs),
+                "related_prs_found": len(related_prs),
+                "open_prs": related_prs[:10]  # Return top 10
+            })
+            
+        except Exception as e:
+            return json.dumps({
+                "error": f"Error finding open PRs for issue #{issue_number}: {str(e)}",
+                "open_prs": []
+            })
+
+    def get_open_pr_status(
+        self,
+        pr_number: Annotated[int, "The pull request number to get status for."]
+    ) -> str:
+        """
+        Get comprehensive status information for an open pull request including reviews and CI.
+        """
+        try:
+            if not self.issue_rag_system or not self.issue_rag_system.is_initialized():
+                return "❌ Issue RAG system not initialized. Cannot get PR status."
+            
+            # Check if we have this PR in our open PRs data
+            open_pr_doc = None
+            if hasattr(self.issue_rag_system.indexer, 'open_pr_docs'):
+                open_pr_doc = self.issue_rag_system.indexer.open_pr_docs.get(pr_number)
+            
+            if not open_pr_doc:
+                return f"❌ Open PR #{pr_number} not found in the index. It may be closed/merged or not yet indexed."
+            
+            result = [
+                f"📋 **Status for Open PR #{pr_number}**",
+                f"**Title**: {open_pr_doc.title}",
+                f"**Author**: {open_pr_doc.author}",
+                f"**Created**: {open_pr_doc.created_at[:10]}",
+                f"**Last Updated**: {open_pr_doc.updated_at[:10]}"
+            ]
+            
+            # Draft status
+            if open_pr_doc.draft:
+                result.append("**Status**: 📝 Draft")
+            else:
+                result.append("**Status**: 🔄 Ready for review")
+            
+            # Review decision
+            if open_pr_doc.review_decision:
+                status_info = {
+                    'APPROVED': '✅ Approved - Ready to merge',
+                    'REVIEW_REQUIRED': '⏳ Review required',
+                    'CHANGES_REQUESTED': '❌ Changes requested'
+                }
+                review_status = status_info.get(open_pr_doc.review_decision, open_pr_doc.review_decision)
+                result.append(f"**Review Decision**: {review_status}")
+            
+            # Review summary
+            if open_pr_doc.reviews_summary:
+                result.append(f"**Reviews**: {open_pr_doc.reviews_summary}")
+            
+            # CI/Status checks
+            if open_pr_doc.status_summary:
+                result.append(f"**CI Status**: {open_pr_doc.status_summary}")
+            
+            # Mergeability
+            if open_pr_doc.mergeable:
+                mergeable_info = {
+                    'MERGEABLE': '✅ Ready to merge',
+                    'CONFLICTING': '⚠️ Has merge conflicts',
+                    'UNKNOWN': '❓ Mergeability unknown'
+                }
+                mergeable_status = mergeable_info.get(open_pr_doc.mergeable, open_pr_doc.mergeable)
+                result.append(f"**Mergeable**: {mergeable_status}")
+            
+            # Files changed
+            if open_pr_doc.files_changed:
+                files_count = len(open_pr_doc.files_changed)
+                result.append(f"**Files Changed**: {files_count}")
+                if files_count <= 10:
+                    result.append(f"**Changed Files**: {', '.join(open_pr_doc.files_changed)}")
+                else:
+                    result.append(f"**Sample Files**: {', '.join(open_pr_doc.files_changed[:5])} ... and {files_count - 5} more")
+            
+            # URL
+            if open_pr_doc.url:
+                result.append(f"**URL**: {open_pr_doc.url}")
+            
+            # Description preview
+            if open_pr_doc.body:
+                description = open_pr_doc.body[:300] + "..." if len(open_pr_doc.body) > 300 else open_pr_doc.body
+                result.append(f"**Description**: {description}")
+            
+            return '\n'.join(result)
+            
+        except Exception as e:
+            return f"❌ Error getting PR status: {str(e)}"
+
+    def find_open_prs_by_files(
+        self,
+        file_paths: Annotated[List[str], "List of file paths to find related open PRs for."]
+    ) -> str:
+        """
+        Find open pull requests that modify specific files.
+        """
+        try:
+            if not self.issue_rag_system or not self.issue_rag_system.is_initialized():
+                return "❌ Issue RAG system not initialized. Cannot search for open PRs."
+            
+            if not file_paths:
+                return "❌ No file paths provided."
+            
+            # Get all open PRs
+            open_prs = []
+            if hasattr(self.issue_rag_system.indexer, 'open_pr_docs'):
+                open_prs = list(self.issue_rag_system.indexer.open_pr_docs.values())
+            
+            if not open_prs:
+                return "📝 No open pull requests found in the index."
+            
+            # Find PRs that touch the specified files
+            matching_prs = []
+            
+            for pr in open_prs:
+                if not pr.files_changed:
+                    continue
+                    
+                # Check if any of the PR's files match any of the search files
+                pr_files_set = set(pr.files_changed)
+                search_files_set = set(file_paths)
+                
+                # Exact matches
+                exact_matches = pr_files_set.intersection(search_files_set)
+                
+                # Partial matches (file name contains search term or vice versa)
+                partial_matches = set()
+                for pr_file in pr.files_changed:
+                    for search_file in file_paths:
+                        if search_file in pr_file or pr_file in search_file:
+                            partial_matches.add(pr_file)
+                
+                all_matches = exact_matches.union(partial_matches)
+                
+                if all_matches:
+                    matching_prs.append({
+                        'pr': pr,
+                        'matched_files': list(all_matches),
+                        'exact_matches': list(exact_matches),
+                        'partial_matches': list(partial_matches - exact_matches)
+                    })
+            
+            if not matching_prs:
+                return f"📝 No open pull requests found that modify any of these files: {', '.join(file_paths)}"
+            
+            result = [f"🔍 Found {len(matching_prs)} open PR(s) that modify the specified files:\n"]
+            
+            for i, match in enumerate(matching_prs[:10], 1):  # Limit to top 10
+                pr = match['pr']
+                pr_info = [
+                    f"{i}. **PR #{pr.pr_number}**: {pr.title}",
+                    f"   👤 Author: {pr.author}",
+                    f"   📅 Updated: {pr.updated_at[:10]}"
+                ]
+                
+                # Show matched files
+                if match['exact_matches']:
+                    pr_info.append(f"   ✅ Exact matches: {', '.join(match['exact_matches'])}")
+                if match['partial_matches']:
+                    pr_info.append(f"   🔍 Partial matches: {', '.join(match['partial_matches'])}")
+                
+                # Review status
+                if pr.review_decision:
+                    status_emoji = {
+                        'APPROVED': '✅',
+                        'REVIEW_REQUIRED': '⏳',
+                        'CHANGES_REQUESTED': '❌'
+                    }.get(pr.review_decision, '❓')
+                    pr_info.append(f"   {status_emoji} Review: {pr.review_decision}")
+                
+                if pr.draft:
+                    pr_info.append("   📝 Status: Draft")
+                
+                if pr.url:
+                    pr_info.append(f"   🔗 URL: {pr.url}")
+                
+                result.append('\n'.join(pr_info))
+            
+            return '\n\n'.join(result)
+            
+        except Exception as e:
+            return f"❌ Error finding open PRs by files: {str(e)}"
+
+    async def search_open_prs(
+        self,
+        query: Annotated[str, "Search query to find relevant open PRs (can be keywords, features, bug descriptions, etc.)"],
+        limit: Annotated[int, "Maximum number of results to return (default: 5)"] = 5
+    ) -> str:
+        """
+        Search open pull requests by content, title, or description.
+        """
+        try:
+            if not self.issue_rag_system or not self.issue_rag_system.is_initialized():
+                return "❌ Issue RAG system not initialized. Cannot search for open PRs."
+            
+            # Search for related content including open PRs
+            related_issues, patches = await self.issue_rag_system.retriever.find_related_issues(
+                query=query,
+                k=limit * 2,  # Get more results to filter
+                similarity_threshold=0.3,  # Lower threshold for broader search
+                include_patches=True
+            )
+            
+            # Filter for open PRs only
+            open_prs = [p for p in patches if p.get("type") == "open_pr"]
+            
+            if not open_prs:
+                return f"📝 No open pull requests found matching query: '{query}'"
+            
+            # Limit results
+            open_prs = open_prs[:limit]
+            
+            result = [f"🔍 Found {len(open_prs)} open PR(s) matching '{query}':\n"]
+            
+            for i, pr in enumerate(open_prs, 1):
+                pr_info = [
+                    f"{i}. **PR #{pr['pr_number']}**: {pr['title']}",
+                    f"   👤 Author: {pr['author']}",
+                    f"   📅 Created: {pr['created_at'][:10]}",
+                    f"   📅 Updated: {pr['updated_at'][:10]}"
+                ]
+                
+                # Review status
+                if pr.get('review_decision'):
+                    status_emoji = {
+                        'APPROVED': '✅',
+                        'REVIEW_REQUIRED': '⏳', 
+                        'CHANGES_REQUESTED': '❌'
+                    }.get(pr['review_decision'], '❓')
+                    pr_info.append(f"   {status_emoji} Review: {pr['review_decision']}")
+                
+                # Draft status
+                if pr.get('draft'):
+                    pr_info.append("   📝 Status: Draft")
+                
+                # Mergeable status
+                if pr.get('mergeable'):
+                    mergeable_emoji = '✅' if pr['mergeable'] == 'MERGEABLE' else '⚠️'
+                    pr_info.append(f"   {mergeable_emoji} Mergeable: {pr['mergeable']}")
+                
+                # Files changed
+                if pr.get('files_changed'):
+                    files_count = len(pr['files_changed'])
+                    pr_info.append(f"   📁 Files: {files_count}")
+                
+                # Match reasons
+                if pr.get('match_reasons'):
+                    pr_info.append(f"   🎯 Match: {', '.join(pr['match_reasons'])}")
+                
+                # Similarity score
+                pr_info.append(f"   📊 Similarity: {pr['similarity']:.2f}")
+                
+                # URL
+                if pr.get('url'):
+                    pr_info.append(f"   🔗 URL: {pr['url']}")
+                
+                # Description preview
+                if pr.get('body') and len(pr['body'].strip()) > 0:
+                    description = pr['body'][:150] + "..." if len(pr['body']) > 150 else pr['body']
+                    pr_info.append(f"   📝 Description: {description}")
+                
+                result.append('\n'.join(pr_info))
+            
+            return '\n\n'.join(result)
+            
+        except Exception as e:
+            return f"❌ Error searching open PRs: {str(e)}"
+
+    def check_pr_readiness(
+        self,
+        pr_number: Annotated[int, "The pull request number to check readiness for merging."]
+    ) -> str:
+        """
+        Check if an open pull request is ready for merging based on reviews, CI, and other factors.
+        """
+        try:
+            if not self.issue_rag_system or not self.issue_rag_system.is_initialized():
+                return "❌ Issue RAG system not initialized. Cannot check PR readiness."
+            
+            # Get the PR details
+            open_pr_doc = None
+            if hasattr(self.issue_rag_system.indexer, 'open_pr_docs'):
+                open_pr_doc = self.issue_rag_system.indexer.open_pr_docs.get(pr_number)
+            
+            if not open_pr_doc:
+                return f"❌ Open PR #{pr_number} not found. It may be closed/merged or not yet indexed."
+            
+            # Check various readiness factors
+            readiness_checks = []
+            
+            # Check if it's a draft
+            if open_pr_doc.draft:
+                readiness_checks.append("❌ **Draft Status**: PR is marked as draft")
+            else:
+                readiness_checks.append("✅ **Draft Status**: Not a draft")
+            
+            # Check review decision
+            if open_pr_doc.review_decision == 'APPROVED':
+                readiness_checks.append("✅ **Reviews**: Approved")
+            elif open_pr_doc.review_decision == 'REVIEW_REQUIRED':
+                readiness_checks.append("⏳ **Reviews**: Review required")
+            elif open_pr_doc.review_decision == 'CHANGES_REQUESTED':
+                readiness_checks.append("❌ **Reviews**: Changes requested")
+            else:
+                readiness_checks.append("❓ **Reviews**: No review decision available")
+            
+            # Check mergeability
+            if open_pr_doc.mergeable == 'MERGEABLE':
+                readiness_checks.append("✅ **Merge Conflicts**: No conflicts")
+            elif open_pr_doc.mergeable == 'CONFLICTING':
+                readiness_checks.append("❌ **Merge Conflicts**: Has conflicts")
+            else:
+                readiness_checks.append("❓ **Merge Conflicts**: Status unknown")
+            
+            # Check CI status
+            if 'SUCCESS' in (open_pr_doc.status_summary or ''):
+                readiness_checks.append("✅ **CI Status**: Passing")
+            elif 'FAILURE' in (open_pr_doc.status_summary or ''):
+                readiness_checks.append("❌ **CI Status**: Failing")
+            elif 'PENDING' in (open_pr_doc.status_summary or ''):
+                readiness_checks.append("⏳ **CI Status**: In progress")
+            else:
+                readiness_checks.append("❓ **CI Status**: No status available")
+            
+            # Overall readiness assessment
+            all_ready = (
+                not open_pr_doc.draft and
+                open_pr_doc.review_decision == 'APPROVED' and
+                open_pr_doc.mergeable == 'MERGEABLE' and
+                'SUCCESS' in (open_pr_doc.status_summary or '')
+            )
+            
+            if all_ready:
+                overall_status = "✅ **Overall**: Ready to merge!"
+            else:
+                overall_status = "❌ **Overall**: Not ready to merge"
+            
+            result = [
+                f"🚦 **Merge Readiness for PR #{pr_number}**",
+                f"**Title**: {open_pr_doc.title}",
+                f"**Author**: {open_pr_doc.author}",
+                "",
+                "**Readiness Checks**:",
+                *readiness_checks,
+                "",
+                overall_status
+            ]
+            
+            # Additional info
+            if open_pr_doc.reviews_summary:
+                result.extend(["", f"**Review Details**: {open_pr_doc.reviews_summary}"])
+            
+            if open_pr_doc.status_summary:
+                result.extend(["", f"**CI Details**: {open_pr_doc.status_summary}"])
+            
+            if open_pr_doc.url:
+                result.extend(["", f"**URL**: {open_pr_doc.url}"])
+            
+            return '\n'.join(result)
+            
+        except Exception as e:
+            return f"❌ Error checking PR readiness: {str(e)}"

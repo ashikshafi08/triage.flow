@@ -3,6 +3,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 from dataclasses import dataclass, field
 from .patch_linkage import DiffDoc
+import asyncio
 
 class IssueComment(BaseModel):
     body: str
@@ -124,3 +125,55 @@ class PullRequestInfo(BaseModel):
     url: Optional[str] = None
     user: Optional[PullRequestUser] = None
     body: Optional[str] = None
+
+@dataclass
+class PullRequestReview:
+    """Represents a pull request review"""
+    author: str
+    state: str  # APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED
+    submitted_at: str
+    body: Optional[str] = None
+
+@dataclass
+class PullRequestReviewer:
+    """Represents a requested reviewer"""
+    login: Optional[str] = None
+    name: Optional[str] = None  # For teams
+    type: str = "User"  # User or Team
+
+@dataclass
+class PullRequestStatusCheck:
+    """Represents CI/status check information"""
+    state: str  # SUCCESS, FAILURE, PENDING, ERROR
+    context: Optional[str] = None
+    description: Optional[str] = None
+
+@dataclass
+class EnhancedPullRequestInfo:
+    """Enhanced PR info with review and status data"""
+    number: int
+    title: str
+    state: str  # open, closed, merged
+    merged_at: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    url: Optional[str] = None
+    body: Optional[str] = None
+    user: Optional['PullRequestUser'] = None
+    files_changed: List[str] = field(default_factory=list)
+    issue_id: Optional[int] = None
+    
+    # Review information
+    review_decision: Optional[str] = None  # APPROVED, REVIEW_REQUIRED, CHANGES_REQUESTED
+    reviews: List[PullRequestReview] = field(default_factory=list)
+    review_requests: List[PullRequestReviewer] = field(default_factory=list)
+    
+    # Status information
+    mergeable: Optional[str] = None  # MERGEABLE, CONFLICTING, UNKNOWN
+    status_checks: List[PullRequestStatusCheck] = field(default_factory=list)
+    
+    # Additional metadata
+    draft: bool = False
+    commits_count: Optional[int] = None
+    additions: Optional[int] = None
+    deletions: Optional[int] = None

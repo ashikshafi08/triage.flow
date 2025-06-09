@@ -82,6 +82,7 @@ class IssueIndexer:
         self.vector_index = None
         self.issue_docs = {}  # id -> IssueDoc
         self.diff_docs = {} # pr_number -> DiffDoc
+        self.open_pr_docs = {} # pr_number -> OpenPRDoc
         self.bm25_retriever = None
         self.bm25_score_cache = {}  # Cache for BM25 score normalization
         
@@ -176,7 +177,33 @@ class IssueIndexer:
         except Exception as e:
             logger.error(f"Error loading diff docs: {e}")
 
-        all_documents = issue_documents + patch_documents
+        # 3.5. Load open PR documents and add them to the index
+        open_pr_documents = []
+        try:
+            loaded_open_prs = self.patch_builder.load_open_prs()
+            self.open_pr_docs = {pr.pr_number: pr for pr in loaded_open_prs}
+            logger.info(f"Loaded {len(loaded_open_prs)} open PR documents to add to the index.")
+            for open_pr in loaded_open_prs:
+                # Create searchable content for open PRs
+                detailed_content = self._create_open_pr_content(open_pr)
+                
+                doc = Document(
+                    text=detailed_content,
+                    metadata={
+                        "pr_number": open_pr.pr_number,
+                        "type": "open_pr",
+                        "review_decision": open_pr.review_decision,
+                        "draft": open_pr.draft,
+                        "mergeable": open_pr.mergeable,
+                    },
+                )
+                open_pr_documents.append(doc)
+        except FileNotFoundError:
+            logger.warning("open_prs.jsonl not found. Index will be built without open PRs.")
+        except Exception as e:
+            logger.error(f"Error loading open PR docs: {e}")
+
+        all_documents = issue_documents + patch_documents + open_pr_documents
         
         # 4. Build FAISS index for vector search with larger chunk size
         logger.info(f"Building FAISS index with {len(all_documents)} total documents...")
@@ -224,7 +251,7 @@ class IssueIndexer:
         # 7. Save issues and metadata
         await self._save_issues()
         await self._save_metadata(total_issues=len(issues), total_docs=len(all_documents))
-        logger.info("Successfully built and saved new issue and patch index.")
+        logger.info("Successfully built and saved new issue, patch, and open PR index.")
     
     async def _compute_bm25_statistics(self, nodes: List) -> None:
         """Pre-compute BM25 score statistics for better normalization"""
@@ -335,6 +362,16 @@ class IssueIndexer:
                         logger.info("No cached diff documents found to load.")
                     except Exception as e:
                         logger.warning(f"Could not load diff documents: {e}")
+                    
+                    # Load open PR docs
+                    try:
+                        loaded_open_prs = self.patch_builder.load_open_prs()
+                        self.open_pr_docs = {pr.pr_number: pr for pr in loaded_open_prs}
+                        logger.info(f"Loaded {len(self.open_pr_docs)} open PR documents from cache.")
+                    except FileNotFoundError:
+                        logger.info("No cached open PR documents found to load.")
+                    except Exception as e:
+                        logger.warning(f"Could not load open PR documents: {e}")
                     
                     # Rebuild BM25 retriever
                     try:
@@ -553,6 +590,58 @@ class IssueIndexer:
         # Combine with good separation for embedding
         return "\n\n".join(parts)
 
+    def _create_open_pr_content(self, open_pr) -> str:
+        """Create detailed text content for an open PR"""
+        parts = []
+        
+        # Main title and description
+        parts.append(f"Open Pull Request #{open_pr.pr_number}: {open_pr.title}")
+        
+        # Clean and format body
+        body = open_pr.body or ""
+        if body:
+            # Clean markdown formatting for better text search
+            import re
+            body = re.sub(r'```[\s\S]*?```', '[CODE_BLOCK]', body)  # Replace code blocks
+            body = re.sub(r'`([^`]+)`', r'\1', body)  # Remove inline code formatting
+            body = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', body)  # Extract link text
+            body = re.sub(r'#+\s*', '', body)  # Remove markdown headers
+            body = re.sub(r'\s+', ' ', body).strip()  # Normalize whitespace
+            
+        parts.append(f"Description: {body}")
+        
+        # Add PR-specific metadata
+        parts.append(f"Author: {open_pr.author}")
+        parts.append(f"State: Open PR")
+        
+        if open_pr.draft:
+            parts.append("Status: Draft")
+        
+        if open_pr.review_decision:
+            parts.append(f"Review Decision: {open_pr.review_decision}")
+        
+        if open_pr.reviews_summary:
+            parts.append(f"Reviews: {open_pr.reviews_summary}")
+        
+        if open_pr.status_summary:
+            parts.append(f"CI Status: {open_pr.status_summary}")
+        
+        if open_pr.mergeable:
+            parts.append(f"Mergeable: {open_pr.mergeable}")
+        
+        # Add files changed information
+        if open_pr.files_changed:
+            parts.append(f"Files changed: {', '.join(open_pr.files_changed[:10])}")
+            if len(open_pr.files_changed) > 10:
+                parts.append(f"... and {len(open_pr.files_changed) - 10} more files")
+        
+        # Add temporal context
+        parts.append(f"Created: {open_pr.created_at}")
+        parts.append(f"Updated: {open_pr.updated_at}")
+        
+        # Combine with good separation for embedding
+        return "\n\n".join(parts)
+
 
 class IssueReranker:
     """Reranks issue candidates using a cheaper LLM"""
@@ -745,20 +834,34 @@ class IssueRetriever:
             
             # Process patch results if requested
             patch_search_results = []
+            open_pr_search_results = []
             if include_patches:
                 combined_patches = self._combine_results(dense_patches, sparse_patches)
                 filtered_patches = [p for p in combined_patches if p["similarity"] >= similarity_threshold * 0.8]
                 
-                # Rerank patches
-                reranked_patches = await self.reranker.rerank(
-                    query=processed_query,
-                    candidates=filtered_patches,
-                    max_candidates=k
-                )
+                # Separate merged patches from open PRs
+                merged_patches = [p for p in filtered_patches if p.get("type") == "patch"]
+                open_prs = [p for p in filtered_patches if p.get("type") == "open_pr"]
                 
-                patch_search_results = self._format_patch_results(reranked_patches, similarity_threshold)
+                # Rerank patches
+                if merged_patches:
+                    reranked_patches = await self.reranker.rerank(
+                        query=processed_query,
+                        candidates=merged_patches,
+                        max_candidates=k
+                    )
+                    patch_search_results = self._format_patch_results(reranked_patches, similarity_threshold)
+                
+                # Rerank open PRs
+                if open_prs:
+                    reranked_open_prs = await self.reranker.rerank(
+                        query=processed_query,
+                        candidates=open_prs,
+                        max_candidates=k
+                    )
+                    open_pr_search_results = self._format_open_pr_results(reranked_open_prs, similarity_threshold)
             
-            return issue_search_results, patch_search_results
+            return issue_search_results, patch_search_results + open_pr_search_results
             
         except Exception as e:
             logger.error(f"Error in issue retrieval: {e}")
@@ -859,7 +962,12 @@ class IssueRetriever:
                 if pr_number and pr_number in self.indexer.diff_docs:  # Check if patch exists
                     result_item["pr_number"] = pr_number
                     results.append(result_item)
-                
+            elif doc_type == "open_pr":
+                pr_number = to_int(metadata.get("pr_number"))
+                if pr_number and pr_number in self.indexer.open_pr_docs:  # Check if open PR exists
+                    result_item["pr_number"] = pr_number
+                    results.append(result_item)
+        
         return results
     
     async def _sparse_search(self, query: str, k: int) -> List[Dict]:
@@ -897,13 +1005,19 @@ class IssueRetriever:
                 if pr_number and pr_number in self.indexer.diff_docs:  # Check if patch exists
                     result_item["pr_number"] = pr_number
                     results.append(result_item)
-                
+            elif doc_type == "open_pr":
+                pr_number = to_int(metadata.get("pr_number"))
+                if pr_number and pr_number in self.indexer.open_pr_docs:  # Check if open PR exists
+                    result_item["pr_number"] = pr_number
+                    results.append(result_item)
+        
         return results
     
     def _combine_results(self, dense_results: List[Dict], sparse_results: List[Dict]) -> List[Dict]:
-        """Combine and deduplicate search results for both issues and patches with improved scoring"""
+        """Combine and deduplicate search results for issues, patches, and open PRs with improved scoring"""
         seen_issues = set()
         seen_patches = set()
+        seen_open_prs = set()
         combined = []
         
         # Create a lookup for combining scores from both search methods
@@ -944,6 +1058,22 @@ class IssueRetriever:
                     result["has_sparse"] = False
                     result["sparse_similarity"] = 0.0
                     score_lookup[("patch", item_id)] = result
+                    combined.append(result)
+                    
+            elif doc_type == "open_pr":
+                item_id = to_int(result.get("pr_number"))
+                if not item_id or item_id not in self.indexer.open_pr_docs:
+                    continue
+                    
+                if item_id not in seen_open_prs:
+                    seen_open_prs.add(item_id)
+                    result["pr_number"] = item_id
+                    result["has_dense"] = True
+                    result["dense_similarity"] = result.get("similarity", 0.0)
+                    # Ensure sparse fields are initialized
+                    result["has_sparse"] = False
+                    result["sparse_similarity"] = 0.0
+                    score_lookup[("open_pr", item_id)] = result
                     combined.append(result)
         
         # Add sparse results and combine scores for items found in both
@@ -993,6 +1123,31 @@ class IssueRetriever:
                     existing["match_reasons"].append("keyword match")
                 else:
                     seen_patches.add(item_id)
+                    result["pr_number"] = item_id
+                    result["has_sparse"] = True
+                    result["sparse_similarity"] = result.get("similarity", 0.0)
+                    # Ensure dense fields are initialized
+                    result["has_dense"] = False
+                    result["dense_similarity"] = 0.0
+                    score_lookup[key] = result
+                    combined.append(result)
+                    
+            elif doc_type == "open_pr":
+                item_id = to_int(result.get("pr_number"))
+                if not item_id or item_id not in self.indexer.open_pr_docs:
+                    continue
+                
+                key = ("open_pr", item_id)
+                if item_id in seen_open_prs:
+                    # Combine scores
+                    existing = score_lookup[key]
+                    existing["has_sparse"] = True
+                    existing["sparse_similarity"] = result["similarity"]
+                    existing["similarity"] = (0.6 * existing.get("dense_similarity", 0.0) + 
+                                            0.4 * result.get("similarity", 0.0))
+                    existing["match_reasons"].append("keyword match")
+                else:
+                    seen_open_prs.add(item_id)
                     result["pr_number"] = item_id
                     result["has_sparse"] = True
                     result["sparse_similarity"] = result.get("similarity", 0.0)
@@ -1163,6 +1318,41 @@ class IssueRetriever:
             
         return patch_results
 
+    def _format_open_pr_results(self, results: List[Dict], similarity_threshold: float) -> List[Dict]:
+        """Format open PR search results"""
+        open_pr_results = []
+        
+        for result in results:
+            pr_number = to_int(result.get("pr_number"))
+            if not pr_number or pr_number not in self.indexer.open_pr_docs:
+                continue
+                
+            # Use a slightly lower threshold for open PRs since they're current
+            if result["similarity"] < similarity_threshold * 0.7:  # 30% lower threshold for open PRs
+                continue
+                
+            open_pr_doc = self.indexer.open_pr_docs[pr_number]
+            open_pr_results.append({
+                "type": "open_pr",
+                "pr_number": pr_number,
+                "title": open_pr_doc.title,
+                "body": open_pr_doc.body[:200] + "..." if len(open_pr_doc.body) > 200 else open_pr_doc.body,
+                "author": open_pr_doc.author,
+                "created_at": open_pr_doc.created_at,
+                "updated_at": open_pr_doc.updated_at,
+                "files_changed": open_pr_doc.files_changed,
+                "review_decision": open_pr_doc.review_decision,
+                "reviews_summary": open_pr_doc.reviews_summary,
+                "status_summary": open_pr_doc.status_summary,
+                "draft": open_pr_doc.draft,
+                "mergeable": open_pr_doc.mergeable,
+                "url": open_pr_doc.url,
+                "similarity": result["similarity"],
+                "match_reasons": result.get("match_reasons", [])
+            })
+            
+        return open_pr_results
+
 
 class IssueAwareRAG:
     """Main interface for issue-aware RAG functionality"""
@@ -1200,7 +1390,8 @@ class IssueAwareRAG:
         await builder.build_patch_linkage(
             max_issues=max_issues_for_patch_linkage,
             max_prs=max_prs_for_patch_linkage,
-            download_diffs=True
+            download_diffs=True,
+            include_open_prs=True  # Enable open PRs collection
         )
         
         # Build the issue index (expensive)

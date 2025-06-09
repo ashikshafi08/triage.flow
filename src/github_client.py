@@ -1,10 +1,10 @@
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 import re
 import asyncio
 from datetime import datetime, timedelta
 import aiohttp
 from .config import settings
-from .models import Issue, IssueResponse, IssueComment
+from .models import Issue, IssueResponse, IssueComment, PullRequestInfo, PullRequestUser, EnhancedPullRequestInfo, PullRequestReview, PullRequestReviewer, PullRequestStatusCheck
 
 class GitHubIssueClient:
     def __init__(self):
@@ -333,3 +333,459 @@ class GitHubIssueClient:
                         break 
             page += 1
         return pull_requests_data
+
+    async def list_open_pull_requests_with_reviews(
+        self, 
+        repo_url: str, 
+        per_page: int = 50, 
+        max_pages: int = 10
+    ) -> List[EnhancedPullRequestInfo]:
+        """
+        Fetch open pull requests with review information using GraphQL.
+        This provides comprehensive PR data including reviews, status checks, and review requests.
+        """
+        from .local_repo_loader import get_repo_info
+        owner, repo = get_repo_info(repo_url)
+        
+        # GraphQL query to get open PRs with review information
+        query = """
+        query OpenPullRequests($owner: String!, $repo: String!, $first: Int!, $after: String) {
+            repository(owner: $owner, name: $repo) {
+                pullRequests(
+                    states: OPEN, 
+                    first: $first, 
+                    after: $after,
+                    orderBy: {field: UPDATED_AT, direction: DESC}
+                ) {
+                    nodes {
+                        number
+                        title
+                        url
+                        createdAt
+                        updatedAt
+                        body
+                        isDraft
+                        author { 
+                            login 
+                        }
+                        
+                        # Review information
+                        reviewDecision
+                        
+                        # Who still needs to review?
+                        reviewRequests(first: 10) {
+                            nodes {
+                                requestedReviewer {
+                                    __typename
+                                    ... on User { 
+                                        login 
+                                    }
+                                    ... on Team { 
+                                        name 
+                                    }
+                                }
+                            }
+                        }
+                        
+                        # Actual reviews
+                        reviews(last: 20) {
+                            nodes {
+                                author { 
+                                    login 
+                                }
+                                state
+                                submittedAt
+                                body
+                            }
+                        }
+                        
+                        # Mergeability and status
+                        mergeable
+                        
+                        # CI status from latest commit
+                        commits(last: 1) {
+                            nodes {
+                                commit {
+                                    statusCheckRollup {
+                                        state
+                                        contexts(first: 10) {
+                                            nodes {
+                                                __typename
+                                                ... on StatusContext {
+                                                    context
+                                                    description
+                                                    state
+                                                }
+                                                ... on CheckRun {
+                                                    name
+                                                    conclusion
+                                                    status
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        # Files changed
+                        files(first: 100) {
+                            nodes {
+                                path
+                            }
+                        }
+                        
+                        # Additional stats
+                        additions
+                        deletions
+                        changedFiles
+                    }
+                    pageInfo {
+                        hasNextPage
+                        endCursor
+                    }
+                }
+            }
+        }
+        """
+        
+        all_prs = []
+        has_next_page = True
+        after_cursor = None
+        page = 0
+        
+        async with aiohttp.ClientSession() as session:
+            while has_next_page and page < max_pages:
+                variables = {
+                    "owner": owner,
+                    "repo": repo,
+                    "first": per_page,
+                    "after": after_cursor
+                }
+                
+                try:
+                    async with session.post(
+                        "https://api.github.com/graphql",
+                        json={"query": query, "variables": variables},
+                        headers=self.headers
+                    ) as response:
+                        if response.status != 200:
+                            error_text = await response.text()
+                            raise Exception(f"GraphQL request failed: HTTP {response.status} - {error_text}")
+                        
+                        data = await response.json()
+                        
+                        if "errors" in data:
+                            raise Exception(f"GraphQL errors: {data['errors']}")
+                        
+                        prs_data = data["data"]["repository"]["pullRequests"]
+                        prs = prs_data["nodes"]
+                        page_info = prs_data["pageInfo"]
+                        
+                        # Process each PR
+                        for pr_data in prs:
+                            enhanced_pr = self._parse_enhanced_pr_data(pr_data)
+                            all_prs.append(enhanced_pr)
+                        
+                        # Update pagination
+                        has_next_page = page_info["hasNextPage"]
+                        after_cursor = page_info["endCursor"]
+                        page += 1
+                        
+                except Exception as e:
+                    print(f"Error fetching open PRs: {e}")
+                    break
+        
+        return all_prs
+    
+    def _parse_enhanced_pr_data(self, pr_data: Dict[str, Any]) -> EnhancedPullRequestInfo:
+        """Parse GraphQL PR data into EnhancedPullRequestInfo"""
+        
+        # Parse reviews
+        reviews = []
+        for review_data in pr_data.get("reviews", {}).get("nodes", []):
+            if review_data.get("author"):
+                review = PullRequestReview(
+                    author=review_data["author"]["login"],
+                    state=review_data["state"],
+                    submitted_at=review_data["submittedAt"],
+                    body=review_data.get("body")
+                )
+                reviews.append(review)
+        
+        # Parse review requests
+        review_requests = []
+        for request_data in pr_data.get("reviewRequests", {}).get("nodes", []):
+            reviewer_data = request_data.get("requestedReviewer", {})
+            if reviewer_data:
+                reviewer = PullRequestReviewer(
+                    login=reviewer_data.get("login"),
+                    name=reviewer_data.get("name"),
+                    type=reviewer_data.get("__typename", "User")
+                )
+                review_requests.append(reviewer)
+        
+        # Parse status checks
+        status_checks = []
+        commits = pr_data.get("commits", {}).get("nodes", [])
+        if commits:
+            latest_commit = commits[0]
+            rollup = latest_commit.get("commit", {}).get("statusCheckRollup")
+            if rollup:
+                # Overall status
+                overall_status = PullRequestStatusCheck(
+                    state=rollup.get("state", "UNKNOWN"),
+                    context="overall",
+                    description="Overall status check rollup"
+                )
+                status_checks.append(overall_status)
+                
+                # Individual contexts
+                for context_data in rollup.get("contexts", {}).get("nodes", []):
+                    if context_data.get("__typename") == "StatusContext":
+                        status_check = PullRequestStatusCheck(
+                            state=context_data.get("state", "UNKNOWN"),
+                            context=context_data.get("context"),
+                            description=context_data.get("description")
+                        )
+                        status_checks.append(status_check)
+                    elif context_data.get("__typename") == "CheckRun":
+                        # Map CheckRun conclusion to status state
+                        conclusion = context_data.get("conclusion", "NEUTRAL")
+                        state_mapping = {
+                            "SUCCESS": "SUCCESS",
+                            "FAILURE": "FAILURE", 
+                            "NEUTRAL": "PENDING",
+                            "CANCELLED": "FAILURE",
+                            "TIMED_OUT": "FAILURE",
+                            "ACTION_REQUIRED": "FAILURE"
+                        }
+                        
+                        status_check = PullRequestStatusCheck(
+                            state=state_mapping.get(conclusion, "UNKNOWN"),
+                            context=context_data.get("name"),
+                            description=f"Check run: {context_data.get('status', 'unknown')}"
+                        )
+                        status_checks.append(status_check)
+        
+        # Parse files changed
+        files_changed = []
+        for file_data in pr_data.get("files", {}).get("nodes", []):
+            files_changed.append(file_data["path"])
+        
+        # Parse user
+        user = None
+        if pr_data.get("author"):
+            user = PullRequestUser(login=pr_data["author"]["login"])
+        
+        return EnhancedPullRequestInfo(
+            number=pr_data["number"],
+            title=pr_data["title"],
+            state="open",
+            created_at=pr_data.get("createdAt"),
+            updated_at=pr_data.get("updatedAt"),
+            url=pr_data.get("url"),
+            body=pr_data.get("body"),
+            user=user,
+            files_changed=files_changed,
+            review_decision=pr_data.get("reviewDecision"),
+            reviews=reviews,
+            review_requests=review_requests,
+            mergeable=pr_data.get("mergeable"),
+            status_checks=status_checks,
+            draft=pr_data.get("isDraft", False),
+            commits_count=pr_data.get("changedFiles"),
+            additions=pr_data.get("additions"),
+            deletions=pr_data.get("deletions")
+        )
+
+    async def get_pr_reviews(
+        self,
+        repo_url: str,
+        pr_number: int
+    ) -> List[PullRequestReview]:
+        """
+        Get detailed review information for a specific PR.
+        """
+        from .local_repo_loader import get_repo_info
+        owner, repo = get_repo_info(repo_url)
+        
+        query = """
+        query PRReviews($owner: String!, $repo: String!, $number: Int!) {
+            repository(owner: $owner, name: $repo) {
+                pullRequest(number: $number) {
+                    reviews(first: 100) {
+                        nodes {
+                            author {
+                                login
+                            }
+                            state
+                            submittedAt
+                            body
+                        }
+                    }
+                }
+            }
+        }
+        """
+        
+        variables = {
+            "owner": owner,
+            "repo": repo,
+            "number": pr_number
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.github.com/graphql",
+                    json={"query": query, "variables": variables},
+                    headers=self.headers
+                ) as response:
+                    if response.status != 200:
+                        return []
+                    
+                    data = await response.json()
+                    
+                    if "errors" in data:
+                        return []
+                    
+                    reviews_data = data["data"]["repository"]["pullRequest"]["reviews"]["nodes"]
+                    
+                    reviews = []
+                    for review_data in reviews_data:
+                        if review_data.get("author"):
+                            review = PullRequestReview(
+                                author=review_data["author"]["login"],
+                                state=review_data["state"],
+                                submitted_at=review_data["submittedAt"],
+                                body=review_data.get("body")
+                            )
+                            reviews.append(review)
+                    
+                    return reviews
+                    
+        except Exception as e:
+            print(f"Error fetching PR reviews: {e}")
+            return []
+
+    async def get_pr_detailed_info(
+        self,
+        repo_url: str,
+        pr_number: int
+    ) -> Optional[EnhancedPullRequestInfo]:
+        """
+        Get detailed information for a specific PR including reviews and status.
+        """
+        from .local_repo_loader import get_repo_info
+        owner, repo = get_repo_info(repo_url)
+        
+        query = """
+        query PRDetails($owner: String!, $repo: String!, $number: Int!) {
+            repository(owner: $owner, name: $repo) {
+                pullRequest(number: $number) {
+                    number
+                    title
+                    url
+                    state
+                    createdAt
+                    updatedAt
+                    mergedAt
+                    body
+                    isDraft
+                    author { 
+                        login 
+                    }
+                    
+                    # Review information
+                    reviewDecision
+                    
+                    reviewRequests(first: 10) {
+                        nodes {
+                            requestedReviewer {
+                                __typename
+                                ... on User { login }
+                                ... on Team { name }
+                            }
+                        }
+                    }
+                    
+                    reviews(last: 50) {
+                        nodes {
+                            author { login }
+                            state
+                            submittedAt
+                            body
+                        }
+                    }
+                    
+                    # Status and mergeability
+                    mergeable
+                    
+                    commits(last: 1) {
+                        nodes {
+                            commit {
+                                statusCheckRollup {
+                                    state
+                                    contexts(first: 20) {
+                                        nodes {
+                                            __typename
+                                            ... on StatusContext {
+                                                context
+                                                description
+                                                state
+                                            }
+                                            ... on CheckRun {
+                                                name
+                                                conclusion
+                                                status
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    # Files and stats
+                    files(first: 200) {
+                        nodes {
+                            path
+                        }
+                    }
+                    
+                    additions
+                    deletions
+                    changedFiles
+                }
+            }
+        }
+        """
+        
+        variables = {
+            "owner": owner,
+            "repo": repo,
+            "number": pr_number
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.github.com/graphql",
+                    json={"query": query, "variables": variables},
+                    headers=self.headers
+                ) as response:
+                    if response.status != 200:
+                        return None
+                    
+                    data = await response.json()
+                    
+                    if "errors" in data or not data.get("data", {}).get("repository", {}).get("pullRequest"):
+                        return None
+                    
+                    pr_data = data["data"]["repository"]["pullRequest"]
+                    return self._parse_enhanced_pr_data(pr_data)
+                    
+        except Exception as e:
+            print(f"Error fetching PR details: {e}")
+            return None

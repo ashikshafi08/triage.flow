@@ -58,6 +58,23 @@ class DiffDoc:
     diff_summary: str  # Cleaned summary for embedding
     merged_at: Optional[str] = None # Add merged_at field
 
+@dataclass
+class OpenPRDoc:
+    """Represents an open PR for embedding and retrieval"""
+    pr_number: int
+    title: str
+    body: str
+    author: str
+    created_at: str
+    updated_at: str
+    files_changed: List[str]
+    review_decision: Optional[str] = None  # APPROVED, REVIEW_REQUIRED, CHANGES_REQUESTED
+    reviews_summary: str = ""  # Summary of reviews for embedding
+    status_summary: str = ""  # Summary of CI/status checks
+    draft: bool = False
+    mergeable: Optional[str] = None
+    url: Optional[str] = None
+
 class PatchLinkageBuilder:
     """Builds and persists the issue→PR mapping for a repository"""
     
@@ -74,6 +91,7 @@ class PatchLinkageBuilder:
             "connectivity": 2,  # seconds
             "issues_and_prs": 30,  # seconds
             "merged_prs": 20,  # seconds
+            "open_prs": 15,  # seconds - NEW STAGE
             "downloading_diffs": 120,  # seconds
             "processing_diffs": 60,  # seconds
             "finalizing": 5  # seconds
@@ -98,6 +116,7 @@ class PatchLinkageBuilder:
         self.index_dir = Path(f"index_{self.repo_key.replace('/', '_')}")
         self.index_dir.mkdir(exist_ok=True)
         self.patch_links_file = self.index_dir / "patch_links.jsonl"
+        self.open_prs_file = self.index_dir / "open_prs.jsonl"  # NEW FILE
         self.diffs_dir = self.index_dir / "diffs"
         self.diffs_dir.mkdir(exist_ok=True)
         
@@ -175,7 +194,7 @@ class PatchLinkageBuilder:
                 logger.error(f"Unexpected error for {url}: {e}")
                 raise
 
-    async def build_patch_linkage(self, max_issues: Optional[int] = None, max_prs: Optional[int] = None, download_diffs: bool = True) -> None:
+    async def build_patch_linkage(self, max_issues: Optional[int] = None, max_prs: Optional[int] = None, download_diffs: bool = True, include_open_prs: bool = True) -> None:
         """
         Build complete patch linkage using optimized GraphQL queries with detailed progress tracking
         """
@@ -185,7 +204,7 @@ class PatchLinkageBuilder:
         max_issues = max_issues or settings.MAX_ISSUES_TO_PROCESS
         max_prs = max_prs or settings.MAX_PR_TO_PROCESS
         
-        logger.info(f"Building patch linkage for {self.repo_key} (max_issues={max_issues}, max_prs={max_prs}, download_diffs={download_diffs})")
+        logger.info(f"Building patch linkage for {self.repo_key} (max_issues={max_issues}, max_prs={max_prs}, download_diffs={download_diffs}, include_open_prs={include_open_prs})")
         
         self._report_progress(
             stage="initialization",
@@ -194,7 +213,7 @@ class PatchLinkageBuilder:
             items_processed=0,
             total_items=1,
             current_item=f"Initializing {self.repo_key}",
-            details={"max_issues": max_issues, "max_prs": max_prs, "download_diffs": download_diffs}
+            details={"max_issues": max_issues, "max_prs": max_prs, "download_diffs": download_diffs, "include_open_prs": include_open_prs}
         )
         
         # Increase connection pool size for better parallelism
@@ -240,7 +259,7 @@ class PatchLinkageBuilder:
             self._report_progress(
                 stage="processing",
                 current_step="Saving patch links",
-                progress_percentage=40,
+                progress_percentage=30,
                 items_processed=len(all_patch_links),
                 total_items=len(all_patch_links),
                 current_item=f"Saving {len(all_patch_links)} patch links"
@@ -251,13 +270,31 @@ class PatchLinkageBuilder:
             self._report_progress(
                 stage="merged_prs",
                 current_step="Fetching merged pull requests",
-                progress_percentage=50,
+                progress_percentage=40,
                 items_processed=0,
                 total_items=max_prs,
-                current_item="Starting GraphQL query for PRs"
+                current_item="Starting GraphQL query for merged PRs"
             )
             logger.info("Step 3: Fetching all merged PRs...")
             merged_prs = await self._fetch_merged_prs_graphql_optimized(session, max_prs)
+            
+            # Step 3.5: Fetch open PRs if requested
+            open_prs_docs = []
+            if include_open_prs:
+                self._report_progress(
+                    stage="open_prs",
+                    current_step="Fetching open pull requests",
+                    progress_percentage=50,
+                    items_processed=0,
+                    total_items=max_prs // 2,  # Assume fewer open PRs than merged
+                    current_item="Starting GraphQL query for open PRs"
+                )
+                logger.info("Step 3.5: Fetching open PRs with review information...")
+                open_prs_docs = await self._fetch_open_prs_with_reviews(session, max_prs // 2)
+                
+                # Save open PRs
+                await self._save_open_prs(open_prs_docs)
+                logger.info(f"Collected {len(open_prs_docs)} open PRs")
             
             # Step 4: Download diffs if requested (with parallel downloads)
             if download_diffs and (all_patch_links or merged_prs):
@@ -320,7 +357,7 @@ class PatchLinkageBuilder:
                         else:
                             all_diff_docs.append(result)
                         processed_diffs += 1
-                        progress_percentage = (processed_diffs / total_diffs) * 100
+                        progress_percentage = 60 + (processed_diffs / total_diffs) * 25  # 60-85%
                         self._report_progress(
                             stage="downloading_diffs",
                             current_step="Downloading diffs",
@@ -343,7 +380,7 @@ class PatchLinkageBuilder:
                     self._report_progress(
                         stage="downloading_diffs",
                         current_step="Retrying failed downloads",
-                        progress_percentage=90,
+                        progress_percentage=85,
                         items_processed=len(all_diff_docs),
                         total_items=total_diffs,
                         current_item=f"Retrying {len(failed_downloads)} failed downloads"
@@ -355,7 +392,7 @@ class PatchLinkageBuilder:
                             self._report_progress(
                                 stage="downloading_diffs",
                                 current_step="Retrying failed downloads",
-                                progress_percentage=90 + (idx_num / len(failed_downloads)) * 5,
+                                progress_percentage=85 + (idx_num / len(failed_downloads)) * 5,
                                 items_processed=len(all_diff_docs),
                                 total_items=total_diffs,
                                 current_item=f"Retry {idx_num + 1}/{len(failed_downloads)}"
@@ -381,7 +418,8 @@ class PatchLinkageBuilder:
             progress_percentage=100,
             items_processed=1,
             total_items=1,
-            current_item="Patch linkage build complete!"
+            current_item="Patch linkage build complete!",
+            details={"open_prs_collected": len(open_prs_docs) if include_open_prs else 0}
         )
         logger.info(f"Patch linkage build complete! Files saved to {self.index_dir}")
 
@@ -987,6 +1025,286 @@ class PatchLinkageBuilder:
         
         logger.info(f"Loaded {len(diff_docs)} diff docs")
         return diff_docs
+
+    async def _fetch_open_prs_with_reviews(self, session: aiohttp.ClientSession, max_prs: int) -> List[OpenPRDoc]:
+        """
+        Fetch open PRs with review information using GraphQL
+        """
+        logger.info(f"Fetching up to {max_prs} open PRs with reviews using GraphQL...")
+        
+        query = """
+        query OpenPullRequests($owner: String!, $name: String!, $after: String, $first: Int!) {
+            repository(owner: $owner, name: $name) {
+                pullRequests(
+                    first: $first,
+                    after: $after,
+                    states: [OPEN],
+                    orderBy: {field: UPDATED_AT, direction: DESC}
+                ) {
+                    nodes {
+                        number
+                        title
+                        body
+                        createdAt
+                        updatedAt
+                        url
+                        isDraft
+                        author {
+                            login
+                        }
+                        
+                        # Review information
+                        reviewDecision
+                        
+                        reviews(last: 10) {
+                            nodes {
+                                author {
+                                    login
+                                }
+                                state
+                                submittedAt
+                                body
+                            }
+                        }
+                        
+                        reviewRequests(first: 10) {
+                            nodes {
+                                requestedReviewer {
+                                    __typename
+                                    ... on User { login }
+                                    ... on Team { name }
+                                }
+                            }
+                        }
+                        
+                        # Status information
+                        mergeable
+                        
+                        commits(last: 1) {
+                            nodes {
+                                commit {
+                                    statusCheckRollup {
+                                        state
+                                        contexts(first: 5) {
+                                            nodes {
+                                                __typename
+                                                ... on StatusContext {
+                                                    context
+                                                    state
+                                                }
+                                                ... on CheckRun {
+                                                    name
+                                                    conclusion
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        # Files changed
+                        files(first: 50) {
+                            nodes {
+                                path
+                            }
+                        }
+                    }
+                    pageInfo {
+                        hasNextPage
+                        endCursor
+                    }
+                }
+            }
+        }
+        """
+        
+        all_open_prs = []
+        has_next_page = True
+        after_cursor = None
+        batch_size = min(50, max_prs)
+        
+        while has_next_page and len(all_open_prs) < max_prs:
+            variables = {
+                "owner": self.repo_owner,
+                "name": self.repo_name,
+                "first": min(batch_size, max_prs - len(all_open_prs)),
+                "after": after_cursor
+            }
+            
+            try:
+                async with session.post(
+                    "https://api.github.com/graphql",
+                    json={"query": query, "variables": variables},
+                    headers=self.headers
+                ) as response:
+                    if response.status != 200:
+                        logger.error(f"GraphQL request failed with status {response.status}")
+                        break
+                    
+                    data = await response.json()
+                    
+                    if "errors" in data:
+                        logger.error(f"GraphQL errors: {data['errors']}")
+                        break
+                    
+                    prs_data = data["data"]["repository"]["pullRequests"]
+                    prs = prs_data["nodes"]
+                    page_info = prs_data["pageInfo"]
+                    
+                    # Process PRs and create OpenPRDoc objects
+                    for pr in prs:
+                        open_pr_doc = self._create_open_pr_doc(pr)
+                        all_open_prs.append(open_pr_doc)
+                    
+                    # Update pagination
+                    has_next_page = page_info["hasNextPage"]
+                    after_cursor = page_info["endCursor"]
+                    
+                    if len(prs) < batch_size:
+                        has_next_page = False
+                        
+            except Exception as e:
+                logger.error(f"Error in open PRs GraphQL query: {e}")
+                break
+        
+        logger.info(f"Fetched {len(all_open_prs)} open PRs with review information")
+        return all_open_prs
+    
+    def _create_open_pr_doc(self, pr_data: Dict[str, Any]) -> OpenPRDoc:
+        """Create an OpenPRDoc from GraphQL PR data"""
+        
+        # Extract files changed
+        files_changed = [f["path"] for f in pr_data.get("files", {}).get("nodes", [])]
+        
+        # Create reviews summary
+        reviews = pr_data.get("reviews", {}).get("nodes", [])
+        reviews_summary_parts = []
+        
+        if reviews:
+            approval_count = sum(1 for r in reviews if r["state"] == "APPROVED")
+            changes_requested_count = sum(1 for r in reviews if r["state"] == "CHANGES_REQUESTED")
+            comment_count = sum(1 for r in reviews if r["state"] == "COMMENTED")
+            
+            reviews_summary_parts.append(f"Reviews: {len(reviews)} total")
+            if approval_count > 0:
+                reviews_summary_parts.append(f"{approval_count} approvals")
+            if changes_requested_count > 0:
+                reviews_summary_parts.append(f"{changes_requested_count} change requests")
+            if comment_count > 0:
+                reviews_summary_parts.append(f"{comment_count} comments")
+            
+            # Add recent review details
+            for review in reviews[-3:]:  # Last 3 reviews
+                author = review.get("author", {}).get("login", "Unknown")
+                state = review["state"]
+                reviews_summary_parts.append(f"{author}: {state}")
+        
+        reviews_summary = ". ".join(reviews_summary_parts)
+        
+        # Create status summary
+        status_summary_parts = []
+        commits = pr_data.get("commits", {}).get("nodes", [])
+        if commits:
+            rollup = commits[0].get("commit", {}).get("statusCheckRollup")
+            if rollup:
+                overall_state = rollup.get("state", "UNKNOWN")
+                status_summary_parts.append(f"CI Status: {overall_state}")
+                
+                contexts = rollup.get("contexts", {}).get("nodes", [])
+                for context in contexts[:3]:  # First 3 contexts
+                    if context.get("__typename") == "StatusContext":
+                        name = context.get("context", "Unknown")
+                        state = context.get("state", "UNKNOWN")
+                        status_summary_parts.append(f"{name}: {state}")
+                    elif context.get("__typename") == "CheckRun":
+                        name = context.get("name", "Unknown")
+                        conclusion = context.get("conclusion", "PENDING")
+                        status_summary_parts.append(f"{name}: {conclusion}")
+        
+        status_summary = ". ".join(status_summary_parts)
+        
+        return OpenPRDoc(
+            pr_number=pr_data["number"],
+            title=pr_data["title"],
+            body=pr_data.get("body", ""),
+            author=pr_data.get("author", {}).get("login", "Unknown"),
+            created_at=pr_data["createdAt"],
+            updated_at=pr_data["updatedAt"],
+            files_changed=files_changed,
+            review_decision=pr_data.get("reviewDecision"),
+            reviews_summary=reviews_summary,
+            status_summary=status_summary,
+            draft=pr_data.get("isDraft", False),
+            mergeable=pr_data.get("mergeable"),
+            url=pr_data.get("url")
+        )
+    
+    async def _save_open_prs(self, open_prs: List[OpenPRDoc]) -> None:
+        """Save open PRs to JSONL file"""
+        logger.info(f"Saving {len(open_prs)} open PRs to {self.open_prs_file}")
+        
+        with open(self.open_prs_file, 'w', encoding='utf-8') as f:
+            for pr_doc in open_prs:
+                pr_dict = {
+                    "pr_number": pr_doc.pr_number,
+                    "title": pr_doc.title,
+                    "body": pr_doc.body,
+                    "author": pr_doc.author,
+                    "created_at": pr_doc.created_at,
+                    "updated_at": pr_doc.updated_at,
+                    "files_changed": pr_doc.files_changed,
+                    "review_decision": pr_doc.review_decision,
+                    "reviews_summary": pr_doc.reviews_summary,
+                    "status_summary": pr_doc.status_summary,
+                    "draft": pr_doc.draft,
+                    "mergeable": pr_doc.mergeable,
+                    "url": pr_doc.url,
+                    "created_at_indexed": datetime.now().isoformat()
+                }
+                f.write(json.dumps(pr_dict, ensure_ascii=False) + '\n')
+    
+    def load_open_prs(self) -> List[OpenPRDoc]:
+        """Load open PRs from saved data"""
+        if not self.open_prs_file.exists():
+            return []
+        
+        open_prs = []
+        
+        try:
+            with open(self.open_prs_file, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    try:
+                        pr_data = json.loads(line.strip())
+                        
+                        open_pr = OpenPRDoc(
+                            pr_number=pr_data["pr_number"],
+                            title=pr_data["title"],
+                            body=pr_data.get("body", ""),
+                            author=pr_data["author"],
+                            created_at=pr_data["created_at"],
+                            updated_at=pr_data["updated_at"],
+                            files_changed=pr_data.get("files_changed", []),
+                            review_decision=pr_data.get("review_decision"),
+                            reviews_summary=pr_data.get("reviews_summary", ""),
+                            status_summary=pr_data.get("status_summary", ""),
+                            draft=pr_data.get("draft", False),
+                            mergeable=pr_data.get("mergeable"),
+                            url=pr_data.get("url")
+                        )
+                        
+                        open_prs.append(open_pr)
+                        
+                    except Exception as e:
+                        logger.warning(f"Failed to parse open PR line {line_num}: {e}")
+                        continue
+                        
+        except Exception as e:
+            logger.error(f"Error loading open PRs: {e}")
+            return []
+        
+        logger.info(f"Loaded {len(open_prs)} open PRs")
+        return open_prs
 
 # Utility function to build patch linkage for a repository
 async def build_repository_patch_linkage(repo_owner: str, repo_name: str, max_issues: Optional[int] = None, max_prs: Optional[int] = None) -> None:

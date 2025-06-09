@@ -15,6 +15,7 @@ from .new_rag import LocalRepoContextExtractor
 from .agentic_tools import AgenticCodebaseExplorer
 from .config import settings
 from .issue_rag import IssueAwareRAG
+from .patch_linkage import PatchLinkageBuilder
 
 logger = logging.getLogger(__name__)
 
