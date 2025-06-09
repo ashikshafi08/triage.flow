@@ -31,6 +31,7 @@ from llama_index.llms.openai import OpenAI
 
 from .config import settings
 from .git_tools import GitBlameTools, GitHistoryTools, IssueClosingTools
+from .commit_index import CommitIndexManager  # Add commit index import
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,147 @@ class AgenticCodebaseExplorer:
         self.git_history_tools = GitHistoryTools(str(self.repo_path))
         self.issue_closing_tools = IssueClosingTools(str(self.repo_path), issue_rag_system)
         
+        # Initialize commit index manager
+        repo_owner, repo_name = self._extract_repo_info() if self._extract_repo_info() else (None, None)
+        self.commit_index_manager = CommitIndexManager(
+            str(self.repo_path), 
+            repo_owner=repo_owner, 
+            repo_name=repo_name
+        )
+        
+        # Initialize LLM based on settings
+        self.llm = self._get_llm()
+
+        # Initialize tools
+        self.tools = self._create_tools()
+        
+        # Create memory for the agent
+        self.memory = ChatMemoryBuffer.from_defaults(token_limit=4000)
+        
+        # Create a comprehensive system prompt that encourages tool usage
+        system_prompt = """You are an expert codebase exploration assistant with access to powerful tools to analyze repositories, including advanced git history, issue tracking, and commit-level analysis capabilities.
+
+**IMPORTANT**: You have extensive tools available - USE THEM! Never say you don't have access to information when you have tools that can find it.
+
+**Enhanced Git & Issue Analysis Tools**:
+- `find_feature_introducing_pr` - **PRIMARY TOOL** for finding which PR introduced a feature (use this for "Which PR introduced X?" questions)
+- `find_when_feature_was_added` - **DIRECT GIT SEARCH** for finding when specific code patterns/features were added (use for specific terms like "o3-mini", "gpt-4")
+- `get_issue_closing_info` - Get complete details about who closed an issue and the exact commit/PR/diff
+- `git_blame_at_commit` - View blame information at any point in history, not just current state
+- `find_commits_touching_function` - Track all changes to a specific function over time
+- `get_function_evolution` - See how a function changed between commits with diffs
+- `find_pr_closing_commit` - Get merge commit information for PRs
+- `get_open_issues_related_to_commit` - Find open issues related to recent commits
+
+**New Commit-Level Analysis Tools**:
+- `search_commits` - **SEMANTIC SEARCH** over commit messages and metadata for deeper insights
+- `get_file_timeline` - Get complete timeline of all commits that touched a specific file (beyond PR level)
+- `get_file_commit_statistics` - Get comprehensive statistics about file changes and contributors
+- `get_commit_details` - Get detailed information about any specific commit
+- `analyze_commit_patterns` - Find patterns in commit messages, authors, and file changes
+
+**When asked about issue resolutions**:
+1. Use `get_issue_closing_info` first to get the closing PR/commit
+2. Then use `get_pr_diff` to see the exact changes
+3. Use `git_blame_at_commit` with the closing commit SHA to see who made specific changes
+
+**When asked about function/file history**:
+1. Use `find_commits_touching_function` to track changes over time
+2. Use `get_function_evolution` to see how code evolved with diffs
+3. Use `get_file_timeline` for complete commit-level file history
+4. Use `git_blame_function` for current state
+5. Use `who_implemented_this` to find original implementation
+
+**For commit-level analysis and archaeology**:
+1. Use `search_commits` to find commits by message content, author, or specific terms
+2. Use `get_file_timeline` to see every commit that touched a file (more granular than PR history)
+3. Use `get_file_commit_statistics` to understand file evolution patterns
+4. Use `get_commit_details` to dive deep into specific commits
+
+**Your Philosophy**: 
+- ALWAYS use your tools first before saying you can't find something
+- When asked about repository information, actively explore to find answers
+- Be proactive - if asked about a repo's name, check README files, package.json, setup.py, or directory structure
+- If asked general questions about a repository, explore the structure first
+- Use the most specific tool available (commit-level tools for detailed analysis, PR-level for feature discussions)
+
+**Historical Context**: The current git blame shows the LATEST state. To see who made changes in a specific PR or at a specific time, use `git_blame_at_commit` with that PR's merge commit SHA.
+
+**Hybrid PR-Diff + Commit Approach**:
+- Use PR-level tools for understanding feature implementations and issue resolutions
+- Use commit-level tools for detailed code archaeology, line-by-line attribution, and fine-grained timeline analysis
+- Combine both approaches for comprehensive analysis
+
+**Common Questions & How to Handle Them**:
+
+1. **"Which PR introduced feature X?" or "Which PR added support for Y?"**
+   → First try `find_when_feature_was_added("specific_term")` for direct code search, then `find_feature_introducing_pr("feature X")` for broader PR search
+
+2. **"Who closed issue #123 and how?"**
+   → Use `get_issue_closing_info(123)` to get complete closing details
+
+3. **"Who implemented function X in PR Y?"**
+   → First get PR Y's merge commit using `find_pr_closing_commit`, then use `git_blame_at_commit` with that SHA
+
+4. **"How did function Z change over time?"**
+   → Use `get_function_evolution` to see the complete evolution with diffs
+
+5. **"Show me all commits that touched file X"**
+   → Use `get_file_timeline` for complete commit history
+
+6. **"Find commits about performance optimization"**
+   → Use `search_commits("performance optimization")` 
+
+7. **"Who contributed most to file Y?"**
+   → Use `get_file_commit_statistics` to see contributor patterns
+
+8. **"What's the name of this repo?"** 
+   → Use `explore_directory("")` to see root files, then `read_file` on README.md, package.json, setup.py, or similar files
+
+**Tool Usage Guidelines**:
+- Start with `explore_directory("")` for general repository questions
+- Use `read_file` for examining specific files like README, package.json, setup.py
+- Use `search_codebase` when looking for specific code patterns or terms
+- Use `analyze_file_structure` for understanding code organization
+- For historical analysis, prefer the enhanced git tools over basic git blame
+- Use commit-level tools when you need granular detail beyond PR/issue level
+- When in doubt, explore rather than apologize for lack of information
+
+**Response Style**:
+- Be helpful and informative
+- Always try to find an answer using your tools
+- If tools don't find what you're looking for, mention what you searched
+- Provide actionable insights based on what you discover
+- Use historical context when available to provide comprehensive answers
+
+Remember: You have the power to explore and analyze both current and historical code at multiple levels of granularity - use it!"""
+
+        # Initialize the ReAct agent with the comprehensive system prompt
+        self.agent = ReActAgent.from_tools(
+            tools=self.tools,
+            llm=self.llm,
+            memory=self.memory,
+            verbose=True,
+            max_iterations=settings.AGENTIC_MAX_ITERATIONS,
+            system_prompt=system_prompt
+        )
+
+    async def initialize_commit_index(
+        self, 
+        max_commits: Optional[int] = None,
+        force_rebuild: bool = False
+    ) -> None:
+        """Initialize the commit index for enhanced commit-level analysis"""
+        try:
+            await self.commit_index_manager.initialize(
+                max_commits=max_commits,
+                force_rebuild=force_rebuild
+            )
+            logger.info("Commit index initialized successfully")
+        except Exception as e:
+            logger.warning(f"Failed to initialize commit index: {e}")
+            # Continue without commit index - other tools will still work
+
         # Initialize LLM based on settings
         self.llm = self._get_llm()
 
@@ -365,6 +507,33 @@ Remember: You have the power to explore and analyze both current and historical 
                 fn=self.find_when_feature_was_added,
                 name="find_when_feature_was_added",
                 description="Find when a specific feature, function, or code pattern was first added to the codebase using git history"
+            ),
+            
+            # New Commit-Level Analysis Tools
+            FunctionTool.from_defaults(
+                fn=self.search_commits,
+                name="search_commits",
+                description="Semantic search over commit messages and metadata for deeper insights into code history"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.get_file_timeline,
+                name="get_file_timeline",
+                description="Get complete timeline of all commits that touched a specific file (more granular than PR history)"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.get_file_commit_statistics,
+                name="get_file_commit_statistics",
+                description="Get comprehensive statistics about file changes and contributors"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.get_commit_details,
+                name="get_commit_details",
+                description="Get detailed information about any specific commit by SHA"
+            ),
+            FunctionTool.from_defaults(
+                fn=self.analyze_commit_patterns,
+                name="analyze_commit_patterns",
+                description="Find patterns in commit messages, authors, and file changes across repository history"
             )
         ]
         return tools
@@ -5288,3 +5457,423 @@ Example: `@agents.py write a news aggregation agent`
         except Exception as e:
             logger.error(f"Error finding when feature was added: {e}")
             return json.dumps({"error": str(e), "search_term": feature_search_term})
+
+    # New Commit-Level Analysis Methods
+    def search_commits(
+        self,
+        query: Annotated[str, "Search query for commit messages and metadata"],
+        k: Annotated[int, "Number of commits to return (default: 10)"] = 10,
+        author_filter: Annotated[Optional[str], "Filter by author name (optional)"] = None,
+        file_filter: Annotated[Optional[str], "Filter by file path (optional)"] = None
+    ) -> str:
+        """Search commits using semantic similarity over commit messages and metadata"""
+        try:
+            # If commit index is available, use it
+            if self.commit_index_manager.is_initialized():
+                # Convert file_filter to list if provided
+                file_filter_list = [file_filter] if file_filter else None
+                
+                # Search commits
+                results = asyncio.run(self.commit_index_manager.search_commits(
+                    query,
+                    k=k,
+                    author_filter=author_filter,
+                    file_filter=file_filter_list
+                ))
+                
+                if results:
+                    # Format results
+                    output_lines = [f"Found {len(results)} commits matching '{query}':\n"]
+                    
+                    for i, result in enumerate(results, 1):
+                        commit = result.commit
+                        output_lines.append(f"{i}. **{commit.sha[:12]}** by {commit.author_name}")
+                        output_lines.append(f"   Date: {commit.commit_date}")
+                        output_lines.append(f"   Subject: {commit.subject}")
+                        if commit.body.strip():
+                            # Truncate long bodies
+                            body_preview = commit.body[:200] + "..." if len(commit.body) > 200 else commit.body
+                            output_lines.append(f"   Body: {body_preview}")
+                        output_lines.append(f"   Files changed: {len(commit.files_changed)} files")
+                        if commit.files_changed[:3]:  # Show first few files
+                            output_lines.append(f"   Key files: {', '.join(commit.files_changed[:3])}")
+                        output_lines.append(f"   Changes: +{commit.insertions} -{commit.deletions}")
+                        if commit.pr_number:
+                            output_lines.append(f"   PR: #{commit.pr_number}")
+                        output_lines.append(f"   Similarity: {result.similarity:.3f}")
+                        output_lines.append("")
+                    
+                    output_lines.append("*Source: Commit Index*")
+                    return "\n".join(output_lines)
+            
+            # Fallback to git log search
+            return self._search_commits_fallback(query, k, author_filter, file_filter)
+            
+        except Exception as e:
+            logger.error(f"Error in search_commits: {e}")
+            return f"Error searching commits: {str(e)}"
+    
+    def _search_commits_fallback(self, query: str, k: int, author_filter: Optional[str], file_filter: Optional[str]) -> str:
+        """Fallback commit search using git log"""
+        try:
+            # First try to unshallow the repository if needed
+            from .local_repo_loader import unshallow_repository
+            unshallow_repository(str(self.repo_path))
+            
+            # Build git log command with grep
+            cmd = ["git", "log", "--oneline", "--grep", query, f"-{k}"]
+            
+            if author_filter:
+                cmd.extend(["--author", author_filter])
+            
+            if file_filter:
+                cmd.append("--")
+                cmd.append(file_filter)
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=self.repo_path, check=True)
+            
+            if not result.stdout.strip():
+                return f"No commits found matching query: '{query}'"
+            
+            lines = result.stdout.strip().split('\n')
+            output_lines = [f"Found {len(lines)} commits matching '{query}':\n"]
+            
+            for i, line in enumerate(lines, 1):
+                if line.strip():
+                    sha, subject = line.split(' ', 1) if ' ' in line else (line, "")
+                    output_lines.append(f"{i}. **{sha}** {subject}")
+            
+            output_lines.append("\n*Source: Git Log (Basic Search)*")
+            return "\n".join(output_lines)
+            
+        except subprocess.CalledProcessError as e:
+            return f"Commit search failed. Repository may have limited history. Error: {e}"
+        except Exception as e:
+            return f"Error searching commits: {str(e)}"
+    
+    def get_file_timeline(
+        self,
+        file_path: Annotated[str, "Path to the file to get timeline for"],
+        limit: Annotated[int, "Maximum number of commits to return (default: 20)"] = 20
+    ) -> str:
+        """Get complete timeline of commits that touched a specific file"""
+        try:
+            if not self.commit_index_manager.is_initialized():
+                return "Commit index not initialized. Please initialize it first using the repository's commit history."
+            
+            timeline = self.commit_index_manager.get_file_timeline(file_path, limit=limit)
+            
+            if not timeline:
+                return f"No commits found that modified file: {file_path}"
+            
+            output_lines = [f"Timeline for {file_path} ({len(timeline)} commits):\n"]
+            
+            for i, entry in enumerate(timeline, 1):
+                output_lines.append(f"{i}. **{entry['sha'][:12]}** - {entry['change_type'].upper()}")
+                output_lines.append(f"   Author: {entry['author']}")
+                output_lines.append(f"   Date: {entry['date']}")
+                output_lines.append(f"   Subject: {entry['subject']}")
+                output_lines.append(f"   Changes: +{entry['insertions']} -{entry['deletions']}")
+                if entry['pr_number']:
+                    output_lines.append(f"   PR: #{entry['pr_number']}")
+                output_lines.append("")
+            
+            return "\n".join(output_lines)
+            
+        except Exception as e:
+            logger.error(f"Error in get_file_timeline: {e}")
+            return f"Error getting file timeline: {str(e)}"
+    
+    def get_file_commit_statistics(
+        self,
+        file_path: Annotated[str, "Path to the file to get statistics for"]
+    ) -> str:
+        """Get comprehensive statistics about file changes and contributors"""
+        try:
+            if not self.commit_index_manager.is_initialized():
+                return "Commit index not initialized. Please initialize it first using the repository's commit history."
+            
+            stats = self.commit_index_manager.get_file_statistics(file_path)
+            
+            if not stats:
+                return f"No statistics found for file: {file_path}"
+            
+            output_lines = [f"Statistics for {file_path}:\n"]
+            
+            output_lines.append(f"**Touch Count:** {stats['touch_count']} commits")
+            output_lines.append(f"**Contributors:** {len(stats['authors'])} unique authors")
+            output_lines.append(f"**Total Changes:** +{stats['additions']} -{stats['deletions']}")
+            output_lines.append(f"**First Seen:** {stats['first_seen']}")
+            output_lines.append(f"**Last Seen:** {stats['last_seen']}")
+            output_lines.append("")
+            
+            # Show top contributors
+            output_lines.append("**Contributors:**")
+            for author in stats['authors'][:10]:  # Show top 10
+                output_lines.append(f"  - {author}")
+            if len(stats['authors']) > 10:
+                output_lines.append(f"  ... and {len(stats['authors']) - 10} more")
+            output_lines.append("")
+            
+            # Show recent commits
+            output_lines.append("**Recent Commits:**")
+            recent_commits = sorted(stats['commits'], key=lambda x: x['date'], reverse=True)[:5]
+            for commit in recent_commits:
+                output_lines.append(f"  - {commit['sha'][:12]} by {commit['author']}: {commit['subject']}")
+            
+            return "\n".join(output_lines)
+            
+        except Exception as e:
+            logger.error(f"Error in get_file_commit_statistics: {e}")
+            return f"Error getting file statistics: {str(e)}"
+    
+    def get_commit_details(
+        self,
+        commit_sha: Annotated[str, "Commit SHA to get details for (can be short or full SHA)"]
+    ) -> str:
+        """Get detailed information about a specific commit"""
+        try:
+            # If commit index is available, use it
+            if self.commit_index_manager.is_initialized():
+                # Try to find the commit (handle both short and full SHAs)
+                commit = None
+                for sha, commit_meta in self.commit_index_manager.indexer.commit_metas.items():
+                    if sha.startswith(commit_sha) or commit_sha.startswith(sha[:len(commit_sha)]):
+                        commit = commit_meta
+                        break
+                
+                if commit:
+                    output_lines = [f"Commit Details: {commit.sha}\n"]
+                    
+                    output_lines.append(f"**SHA:** {commit.sha}")
+                    output_lines.append(f"**Author:** {commit.author_name} <{commit.author_email}>")
+                    output_lines.append(f"**Committer:** {commit.committer_name} <{commit.committer_email}>")
+                    output_lines.append(f"**Author Date:** {commit.author_date}")
+                    output_lines.append(f"**Commit Date:** {commit.commit_date}")
+                    output_lines.append(f"**Subject:** {commit.subject}")
+                    
+                    if commit.body.strip():
+                        output_lines.append(f"**Body:**\n{commit.body}")
+                    
+                    output_lines.append(f"**Files Changed:** {len(commit.files_changed)} files")
+                    output_lines.append(f"**Changes:** +{commit.insertions} -{commit.deletions}")
+                    
+                    if commit.is_merge:
+                        output_lines.append(f"**Type:** Merge commit")
+                        output_lines.append(f"**Parent Commits:** {', '.join(commit.parent_shas)}")
+                    
+                    if commit.pr_number:
+                        output_lines.append(f"**Pull Request:** #{commit.pr_number}")
+                    
+                    # Show file changes by type
+                    if commit.files_added:
+                        output_lines.append(f"**Added Files ({len(commit.files_added)}):**")
+                        for file in commit.files_added[:10]:
+                            output_lines.append(f"  + {file}")
+                        if len(commit.files_added) > 10:
+                            output_lines.append(f"  ... and {len(commit.files_added) - 10} more")
+                    
+                    if commit.files_modified:
+                        output_lines.append(f"**Modified Files ({len(commit.files_modified)}):**")
+                        for file in commit.files_modified[:10]:
+                            output_lines.append(f"  ~ {file}")
+                        if len(commit.files_modified) > 10:
+                            output_lines.append(f"  ... and {len(commit.files_modified) - 10} more")
+                    
+                    if commit.files_deleted:
+                        output_lines.append(f"**Deleted Files ({len(commit.files_deleted)}):**")
+                        for file in commit.files_deleted[:10]:
+                            output_lines.append(f"  - {file}")
+                        if len(commit.files_deleted) > 10:
+                            output_lines.append(f"  ... and {len(commit.files_deleted) - 10} more")
+                    
+                    output_lines.append("\n*Source: Commit Index*")
+                    return "\n".join(output_lines)
+            
+            # Fallback to direct git command if index not available or commit not found
+            return self._get_commit_details_fallback(commit_sha)
+            
+        except Exception as e:
+            logger.error(f"Error in get_commit_details: {e}")
+            return f"Error getting commit details: {str(e)}"
+    
+    def _get_commit_details_fallback(self, commit_sha: str) -> str:
+        """Fallback method to get commit details using direct git commands"""
+        try:
+            # First try to unshallow the repository if needed
+            from .local_repo_loader import unshallow_repository
+            unshallow_repository(str(self.repo_path))
+            
+            # Get commit info using git log
+            result = subprocess.run([
+                "git", "log", "-1", "--pretty=format:%H|%an|%ae|%cn|%ce|%cd|%ad|%s|%b", 
+                "--date=iso", commit_sha
+            ], capture_output=True, text=True, cwd=self.repo_path, check=True)
+            
+            if not result.stdout.strip():
+                return f"Commit not found in repository: {commit_sha}\n\nNote: This commit may exist on GitHub but not in the local repository clone."
+            
+            parts = result.stdout.strip().split('|', 8)
+            if len(parts) < 8:
+                return "Invalid git log output format"
+            
+            sha, author_name, author_email, committer_name, committer_email, commit_date, author_date, subject = parts[:8]
+            body = parts[8] if len(parts) > 8 else ""
+            
+            # Get file changes
+            files_result = subprocess.run([
+                "git", "show", "--name-only", "--pretty=format:", commit_sha
+            ], capture_output=True, text=True, cwd=self.repo_path, check=True)
+            
+            files_changed = [f.strip() for f in files_result.stdout.strip().split('\n') if f.strip()]
+            
+            # Get insertions/deletions
+            stat_result = subprocess.run([
+                "git", "show", "--stat", "--pretty=format:", commit_sha
+            ], capture_output=True, text=True, cwd=self.repo_path, check=True)
+            
+            insertions = deletions = 0
+            stat_lines = stat_result.stdout.strip().split('\n')
+            for line in stat_lines:
+                if 'insertion' in line or 'deletion' in line:
+                    import re
+                    numbers = re.findall(r'\d+', line)
+                    if len(numbers) >= 2:
+                        insertions = int(numbers[0])
+                        deletions = int(numbers[1]) if len(numbers) > 1 else 0
+                    break
+            
+            # Check if it's a merge commit
+            parent_result = subprocess.run([
+                "git", "show", "--pretty=format:%P", "--no-patch", commit_sha
+            ], capture_output=True, text=True, cwd=self.repo_path, check=True)
+            
+            parent_shas = parent_result.stdout.strip().split()
+            is_merge = len(parent_shas) > 1
+            
+            # Try to extract PR number from commit message
+            pr_number = None
+            import re
+            pr_match = re.search(r'#(\d+)', subject + ' ' + body)
+            if pr_match:
+                pr_number = int(pr_match.group(1))
+            
+            # Format output
+            output_lines = [f"Commit Details: {sha}\n"]
+            output_lines.append(f"**SHA:** {sha}")
+            output_lines.append(f"**Author:** {author_name} <{author_email}>")
+            output_lines.append(f"**Committer:** {committer_name} <{committer_email}>")
+            output_lines.append(f"**Author Date:** {author_date}")
+            output_lines.append(f"**Commit Date:** {commit_date}")
+            output_lines.append(f"**Subject:** {subject}")
+            
+            if body.strip():
+                output_lines.append(f"**Body:**\n{body}")
+            
+            output_lines.append(f"**Files Changed:** {len(files_changed)} files")
+            output_lines.append(f"**Changes:** +{insertions} -{deletions}")
+            
+            if is_merge:
+                output_lines.append(f"**Type:** Merge commit")
+                output_lines.append(f"**Parent Commits:** {', '.join(parent_shas)}")
+            
+            if pr_number:
+                output_lines.append(f"**Pull Request:** #{pr_number}")
+            
+            if files_changed:
+                output_lines.append(f"**Changed Files:**")
+                for file in files_changed[:10]:
+                    output_lines.append(f"  ~ {file}")
+                if len(files_changed) > 10:
+                    output_lines.append(f"  ... and {len(files_changed) - 10} more")
+            
+            output_lines.append("\n*Source: Git Command (Direct)*")
+            return "\n".join(output_lines)
+            
+        except subprocess.CalledProcessError as e:
+            return f"Commit not found in repository: {commit_sha}\n\nGit command failed: {e}\n\nNote: This commit may exist on GitHub but not be available in the local repository clone."
+        except Exception as e:
+            return f"Error retrieving commit details: {str(e)}"
+    
+    def analyze_commit_patterns(
+        self,
+        analysis_type: Annotated[str, "Type of analysis: 'authors', 'files', 'messages', or 'general'"] = "general"
+    ) -> str:
+        """Find patterns in commit messages, authors, and file changes"""
+        try:
+            if not self.commit_index_manager.is_initialized():
+                return "Commit index not initialized. Please initialize it first using the repository's commit history."
+            
+            stats = self.commit_index_manager.get_statistics()
+            
+            if not stats['initialized']:
+                return "Commit index not properly initialized."
+            
+            output_lines = [f"Commit Pattern Analysis ({analysis_type}):\n"]
+            
+            if analysis_type in ['general', 'authors']:
+                output_lines.append("**Author Patterns:**")
+                output_lines.append(f"  Total unique authors: {stats['total_authors']}")
+                
+                # Analyze author activity
+                author_commits = {}
+                for commit in self.commit_index_manager.indexer.commit_metas.values():
+                    author = commit.author_email
+                    if author not in author_commits:
+                        author_commits[author] = {'count': 0, 'insertions': 0, 'deletions': 0, 'name': commit.author_name}
+                    author_commits[author]['count'] += 1
+                    author_commits[author]['insertions'] += commit.insertions
+                    author_commits[author]['deletions'] += commit.deletions
+                
+                # Top contributors
+                top_authors = sorted(author_commits.items(), key=lambda x: x[1]['count'], reverse=True)[:10]
+                output_lines.append("  Top contributors by commit count:")
+                for author_email, data in top_authors:
+                    output_lines.append(f"    {data['name']}: {data['count']} commits (+{data['insertions']} -{data['deletions']})")
+                output_lines.append("")
+            
+            if analysis_type in ['general', 'files']:
+                output_lines.append("**File Patterns:**")
+                output_lines.append(f"  Total files touched: {stats['total_files_touched']}")
+                
+                # Most changed files
+                file_stats = self.commit_index_manager.indexer.file_touch_stats
+                top_files = sorted(file_stats.items(), key=lambda x: x[1]['touch_count'], reverse=True)[:10]
+                output_lines.append("  Most frequently changed files:")
+                for file_path, file_data in top_files:
+                    output_lines.append(f"    {file_path}: {file_data['touch_count']} changes")
+                output_lines.append("")
+            
+            if analysis_type in ['general', 'messages']:
+                output_lines.append("**Commit Message Patterns:**")
+                
+                # Analyze common commit message patterns
+                subjects = [commit.subject for commit in self.commit_index_manager.indexer.commit_metas.values()]
+                
+                # Common prefixes
+                prefixes = {}
+                for subject in subjects:
+                    if ':' in subject:
+                        prefix = subject.split(':')[0].strip().lower()
+                        prefixes[prefix] = prefixes.get(prefix, 0) + 1
+                
+                if prefixes:
+                    top_prefixes = sorted(prefixes.items(), key=lambda x: x[1], reverse=True)[:10]
+                    output_lines.append("  Common commit prefixes:")
+                    for prefix, count in top_prefixes:
+                        output_lines.append(f"    '{prefix}': {count} commits")
+                output_lines.append("")
+            
+            if analysis_type == 'general':
+                output_lines.append("**General Statistics:**")
+                output_lines.append(f"  Total commits indexed: {stats['total_commits']}")
+                output_lines.append(f"  Merge commits: {stats['merge_commits']}")
+                output_lines.append(f"  Total insertions: {stats['total_insertions']:,}")
+                output_lines.append(f"  Total deletions: {stats['total_deletions']:,}")
+                output_lines.append(f"  Repository path: {stats['repo_path']}")
+            
+            return "\n".join(output_lines)
+            
+        except Exception as e:
+            logger.error(f"Error in analyze_commit_patterns: {e}")
+            return f"Error analyzing commit patterns: {str(e)}"

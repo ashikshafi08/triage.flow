@@ -47,6 +47,31 @@ class AgenticRAGSystem:
             # Issue RAG will be linked later if successfully initialized.
             self.agentic_explorer = AgenticCodebaseExplorer(self.session_id, self.repo_path, issue_rag_system=None)
             
+            # Initialize commit index for commit-level analysis
+            try:
+                logger.info(f"Initializing commit index for session {self.session_id}")
+                # Force rebuild for new sessions to ensure fresh data
+                await self.agentic_explorer.initialize_commit_index(force_rebuild=True)
+                
+                # File statistics will be built automatically during index creation
+                
+                # Verify initialization worked
+                if hasattr(self.agentic_explorer, 'commit_index_manager'):
+                    stats = self.agentic_explorer.commit_index_manager.get_statistics()
+                    logger.info(f"Commit index initialized successfully for session {self.session_id}: {stats}")
+                    
+                    # Check if we got a reasonable number of commits
+                    if stats.get('total_commits', 0) < 10:
+                        logger.warning(f"Suspiciously low commit count ({stats.get('total_commits', 0)}) for session {self.session_id}")
+                else:
+                    logger.warning(f"Commit index manager not available for session {self.session_id}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to initialize commit index for session {self.session_id}: {e}")
+                import traceback
+                logger.warning(f"Full traceback: {traceback.format_exc()}")
+                # Continue without commit index - other tools will still work
+            
             logger.info(f"AgenticRAG core systems initialized for session {self.session_id}.")
             
         except Exception as e:

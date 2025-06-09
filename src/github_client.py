@@ -231,6 +231,42 @@ class GitHubIssueClient:
             page += 1
         return issues
 
+    async def create_issue(self, owner: str, repo: str, title: str, body: str, labels: list = None) -> Dict[str, Any]:
+        """
+        Create a new GitHub issue.
+        
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            title: Issue title
+            body: Issue body
+            labels: List of label names
+            
+        Returns:
+            Dict containing the created issue data
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"https://api.github.com/repos/{owner}/{repo}/issues"
+                
+                issue_data = {
+                    "title": title,
+                    "body": body
+                }
+                
+                if labels:
+                    issue_data["labels"] = labels
+                
+                async with session.post(url, headers=self.headers, json=issue_data) as response:
+                    if response.status == 201:
+                        return await response.json()
+                    else:
+                        error_text = await response.text()
+                        raise Exception(f"Failed to create issue: HTTP {response.status} - {error_text}")
+                        
+        except Exception as e:
+            raise Exception(f"Error creating issue: {str(e)}")
+
     async def list_pull_requests(self, repo_url: str, state: str = "merged", per_page: int = 30, max_pages: int = 5) -> list:
         """
         List pull requests for a given repository URL and state.

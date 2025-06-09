@@ -31,6 +31,7 @@ from .llm_client import LLMClient
 from .models import IssueDoc, IssueSearchResult, IssueContextResponse, PatchSearchResult
 from .cache_manager import rag_cache
 from .patch_linkage import PatchLinkageBuilder
+from .commit_index import CommitIndexManager
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,13 @@ class IssueIndexer:
         
         # Initialize patch linkage builder
         self.patch_builder = PatchLinkageBuilder(repo_owner, repo_name)
+        
+        # Initialize commit index manager (optional enhancement)
+        self.commit_index_manager = CommitIndexManager(
+            repo_path=".",  # Assume we're running from repo root
+            repo_owner=repo_owner,
+            repo_name=repo_name
+        )
         
         # Initialize embedding model
         self.embed_model = OpenAIEmbedding(
@@ -1278,6 +1286,23 @@ class IssueAwareRAG:
         if self._initialized:
             await self.indexer.crawl_and_index_issues()
             self.retriever = IssueRetriever(self.indexer)
+    
+    async def initialize_commit_index(
+        self,
+        max_commits: Optional[int] = None,
+        force_rebuild: bool = False
+    ) -> bool:
+        """Initialize the commit index for enhanced commit-level analysis"""
+        try:
+            await self.commit_index_manager.initialize(
+                max_commits=max_commits,
+                force_rebuild=force_rebuild
+            )
+            logger.info("Commit index initialized successfully")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to initialize commit index: {e}")
+            return False
     
     async def get_prs(
         self,
