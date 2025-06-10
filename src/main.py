@@ -29,11 +29,11 @@ import tempfile
 import shutil
 from pathlib import Path
 from .new_rag import LocalRepoContextExtractor
-from .agentic_tools import AgenticCodebaseExplorer
 from .issue_rag import IssueAwareRAG # Added for the new endpoint
 from .local_repo_loader import get_repo_info # Added for the new endpoint
 from .chunk_store import ChunkStoreFactory, RedisChunkStore
 from .founding_member_agent import FoundingMemberAgent
+from .agent_tools import AgenticCodebaseExplorer
 
 # Enable nested event loops for Jupyter notebooks
 nest_asyncio.apply()

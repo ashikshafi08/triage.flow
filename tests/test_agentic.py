@@ -6,12 +6,16 @@ Test script for the agentic codebase explorer
 import asyncio
 import os
 import sys
+import tempfile
+import pytest
 from pathlib import Path
+import json
+from unittest.mock import Mock, patch, MagicMock
 
-# Add src to path for imports
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+# Add the src directory to the path so we can import from it
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from src.agentic_tools import AgenticCodebaseExplorer
+from src.agent_tools import AgenticCodebaseExplorer
 
 async def test_agentic_explorer():
     """Test the agentic explorer with the current repository"""

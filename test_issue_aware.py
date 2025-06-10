@@ -125,7 +125,7 @@ async def test_issue_aware_system():
         print("-" * 40)
         
         try:
-            from src.agentic_tools import AgenticCodebaseExplorer
+            from src.agent_tools import AgenticCodebaseExplorer
             
             # Create a temporary directory for testing (since we don't have the actual repo cloned)
             import tempfile
