@@ -279,6 +279,10 @@ class AgenticCodebaseExplorer:
         """Delegate to file operations for analyzing file structure."""
         return self.file_ops.analyze_file_structure(file_path)
 
+    def read_file(self, file_path: str) -> str:
+        """Delegate to file operations for reading a file's content."""
+        return self.file_ops.read_file(file_path)
+
     def _extract_technical_requirements(self, issue_data):
         """Extract technical requirements from issue data for enhanced analysis."""
         pass
