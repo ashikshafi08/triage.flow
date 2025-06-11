@@ -2755,9 +2755,126 @@ async def analyze_issue_endpoint(request: AnalyzeIssueRequest):
         # Transform the result to match the expected frontend structure
         session_id = request.session_id or f"analysis_{hash(request.issue_url) % 10000}"
         
+        # Handle PR Detection results properly
+        pr_detection_result = None
+        pr_detection_status = "completed"
+        
+        if analysis_result.get("status") == "skipped" and analysis_result.get("reason") in ["pr_exists", "related_open_prs"]:
+            # Issue has existing PRs or related work
+            pr_info = analysis_result.get("pr_info", {})
+            enhanced_pr_info = analysis_result.get("enhanced_pr_info", {})
+            
+            if analysis_result.get("reason") == "pr_exists":
+                pr_detection_result = {
+                    "has_existing_prs": True,
+                    "pr_state": pr_info.get("state"),
+                    "pr_number": pr_info.get("pr_number"),
+                    "pr_url": pr_info.get("pr_url"),
+                    "message": f"Found existing {pr_info.get('state', 'unknown')} PR #{pr_info.get('pr_number', 'unknown')}"
+                }
+            elif analysis_result.get("reason") == "related_open_prs":
+                # Handle related open PRs case
+                related_open_prs = []
+                if enhanced_pr_info.get("related_open_prs"):
+                    for pr in enhanced_pr_info["related_open_prs"]:
+                        related_open_prs.append({
+                            "pr_number": pr.pr_number,
+                            "title": pr.title,
+                            "author": pr.author,
+                            "url": pr.url,
+                            "draft": pr.draft,
+                            "review_decision": pr.review_decision
+                        })
+                
+                related_merged_prs = []
+                if enhanced_pr_info.get("related_merged_prs"):
+                    for pr in enhanced_pr_info["related_merged_prs"]:
+                        related_merged_prs.append({
+                            "pr_number": pr.pr_number,
+                            "pr_url": pr.pr_url,
+                            "pr_title": pr.pr_title,
+                            "merged_at": pr.merged_at
+                        })
+                
+                pr_detection_result = {
+                    "has_existing_prs": True,
+                    "related_merged_prs": related_merged_prs,
+                    "related_open_prs": related_open_prs,
+                    "message": enhanced_pr_info.get("message", "Found related work in progress")
+                }
+        else:
+            # No existing PRs found - check for related PRs using patch linkage
+            try:
+                from .patch_linkage import PatchLinkageBuilder
+                from .issue_rag import IssueAwareRAG
+                import re
+                
+                # Extract repo info from issue URL
+                match = re.search(r"github\.com/([^/]+)/([^/]+)/issues/(\d+)", request.issue_url)
+                if match:
+                    owner, repo, issue_number = match.groups()
+                    issue_number = int(issue_number)
+                    
+                    # Check for related PRs in our index
+                    patch_builder = PatchLinkageBuilder(owner, repo)
+                    
+                    # Load existing patch links
+                    patch_links = patch_builder.load_patch_links()
+                    related_prs = patch_links.get(issue_number, [])
+                    
+                    # Load open PRs and check for mentions of this issue
+                    open_prs = patch_builder.load_open_prs()
+                    related_open_prs = []
+                    
+                    for pr in open_prs:
+                        # Check if PR body or title mentions this issue
+                        pr_text = f"{pr.title} {pr.body}".lower()
+                        if f"#{issue_number}" in pr_text or f"issue {issue_number}" in pr_text:
+                            related_open_prs.append({
+                                "pr_number": pr.pr_number,
+                                "title": pr.title,
+                                "author": pr.author,
+                                "url": pr.url,
+                                "draft": pr.draft,
+                                "review_decision": pr.review_decision
+                            })
+                    
+                    if related_prs or related_open_prs:
+                        pr_detection_result = {
+                            "has_existing_prs": True,
+                            "related_merged_prs": [
+                                {
+                                    "pr_number": link.pr_number,
+                                    "pr_url": link.pr_url,
+                                    "pr_title": link.pr_title,
+                                    "merged_at": link.merged_at
+                                } for link in related_prs
+                            ],
+                            "related_open_prs": related_open_prs,
+                            "message": f"Found {len(related_prs)} related merged PR(s) and {len(related_open_prs)} related open PR(s)"
+                        }
+                    else:
+                        pr_detection_result = {
+                            "has_existing_prs": False,
+                            "message": "No existing or related PRs found for this issue"
+                        }
+                else:
+                    pr_detection_result = {
+                        "has_existing_prs": False,
+                        "message": "Could not parse issue URL for PR detection"
+                    }
+                    
+            except Exception as e:
+                logger.warning(f"Error during enhanced PR detection: {e}")
+                pr_detection_result = {
+                    "has_existing_prs": False,
+                    "message": "No existing PRs found (basic check)",
+                    "error": str(e)
+                }
+        
         # Create step-by-step structure for UI
         steps = [
-            {"step": "PR Detection", "status": "completed", "result": analysis_result.get("pr_info")},
+            {"step": "PR Detection", "status": pr_detection_status, "result": pr_detection_result},
             {"step": "Issue Classification", "status": "completed", "result": analysis_result.get("classification")},
             {"step": "Codebase Analysis", "status": "completed", "result": analysis_result.get("agentic_analysis")},
             {"step": "Solution Planning", "status": "completed", "result": {"plan_markdown": analysis_result.get("plan_markdown")}}

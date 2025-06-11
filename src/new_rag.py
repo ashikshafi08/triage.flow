@@ -859,12 +859,18 @@ Code:
             
             # Conditionally disable expensive LLM reranker when only a few sources are needed
             if settings.ENABLE_SMART_SIZING and optimal_source_count <= settings.MIN_RAG_SOURCES:
-                # Temporarily remove LLMRerank to avoid extra calls
-                original_postprocessors = self.query_engine.postprocessors
-                self.query_engine.postprocessors = [p for p in original_postprocessors if not isinstance(p, LLMRerank)]
-                response = self.query_engine.query(query)
-                # Restore postprocessors
-                self.query_engine.postprocessors = original_postprocessors
+                # Temporarily remove LLMRerank to avoid extra calls (if supported)
+                if hasattr(self.query_engine, "postprocessors"):
+                    original_postprocessors = self.query_engine.postprocessors
+                    self.query_engine.postprocessors = [p for p in original_postprocessors if not isinstance(p, LLMRerank)]
+                    try:
+                        response = self.query_engine.query(query)
+                    finally:
+                        # Restore postprocessors safely
+                        self.query_engine.postprocessors = original_postprocessors
+                else:
+                    # Fallback: attribute not present in current LlamaIndex version
+                    response = self.query_engine.query(query)
             else:
                 response = self.query_engine.query(query)
             

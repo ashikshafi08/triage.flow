@@ -24,6 +24,7 @@ from ..llm_client import format_rag_context_for_llm
 from .pr_checker import PRChecker
 from .classifier import IssueClassifier
 from .plan_generator import PlanGenerator, PlanInput
+from ..patch_linkage import PatchLinkageBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -40,14 +41,74 @@ def _extract_repo(issue_url: str) -> str:
 async def analyse_issue(issue_url: str) -> Dict[str, Any]:
     """Full agentic pipeline that leverages sophisticated agent tools for deep analysis."""
 
-    # 1. Check for existing PRs
+    # 1. Check for existing PRs using GitHub API
     pr_info = await PRChecker.from_issue_url(issue_url)
+    
+    # 1.5. Enhanced PR detection using patch linkage system
+    enhanced_pr_info = None
+    try:
+        # Extract repo info from issue URL
+        match = re.search(r"github\.com/([^/]+)/([^/]+)/issues/(\d+)", issue_url)
+        if match:
+            owner, repo, issue_number = match.groups()
+            issue_number = int(issue_number)
+            
+            # Check for related PRs in our index
+            patch_builder = PatchLinkageBuilder(owner, repo)
+            
+            # Load existing patch links
+            patch_links = patch_builder.load_patch_links()
+            related_prs = patch_links.get(issue_number, [])
+            
+            # Load open PRs and check for mentions of this issue
+            open_prs = patch_builder.load_open_prs()
+            related_open_prs = []
+            
+            for pr in open_prs:
+                # Check if PR body or title mentions this issue
+                pr_text = f"{pr.title} {pr.body}".lower()
+                if f"#{issue_number}" in pr_text or f"issue {issue_number}" in pr_text:
+                    related_open_prs.append(pr)
+            
+            if related_prs or related_open_prs:
+                enhanced_pr_info = {
+                    "has_related_work": True,
+                    "related_merged_prs": related_prs,
+                    "related_open_prs": related_open_prs,
+                    "message": f"Found {len(related_prs)} related merged PR(s) and {len(related_open_prs)} related open PR(s)"
+                }
+                
+                # If we found significant related work, consider skipping
+                if len(related_open_prs) > 0:
+                    logger.info("Issue %s has related open PRs: %s", issue_url, [pr.pr_number for pr in related_open_prs])
+                    return {
+                        "status": "skipped",
+                        "reason": "related_open_prs",
+                        "pr_info": pr_info.__dict__ if pr_info.state else None,
+                        "enhanced_pr_info": enhanced_pr_info,
+                    }
+            else:
+                enhanced_pr_info = {
+                    "has_related_work": False,
+                    "message": "No related PRs found in patch linkage index"
+                }
+                
+    except Exception as e:
+        logger.warning(f"Enhanced PR detection failed: {e}")
+        enhanced_pr_info = {
+            "has_related_work": False,
+            "message": "Enhanced PR detection unavailable",
+            "error": str(e)
+        }
+    
+    # Original PR check - skip if direct PR exists
     if pr_info.state is not None:
         logger.info("Issue %s already has PR state=%s", issue_url, pr_info.state)
         return {
             "status": "skipped",
             "reason": "pr_exists",
             "pr_info": pr_info.__dict__,
+            "enhanced_pr_info": enhanced_pr_info,
         }
 
     # 2. Fetch issue data
@@ -203,6 +264,7 @@ Provide a comprehensive JSON analysis with technical depth:
         "agentic_analysis": analysis_data,  # Rich agentic analysis results
         "plan_markdown": plan_md,
         "rag": rag_context,
+        "enhanced_pr_info": enhanced_pr_info,
     }
 
 
@@ -214,14 +276,76 @@ async def analyse_issue_with_existing_rag(
     
     logger.info("Using existing RAG system - leveraging agentic tools with optimized performance")
 
-    # 1. Check for existing PRs
+    # 1. Check for existing PRs using GitHub API
     pr_info = await PRChecker.from_issue_url(issue_url)
+    
+    # 1.5. Enhanced PR detection using patch linkage system
+    enhanced_pr_info = None
+    try:
+        import re
+        
+        # Extract repo info from issue URL
+        match = re.search(r"github\.com/([^/]+)/([^/]+)/issues/(\d+)", issue_url)
+        if match:
+            owner, repo, issue_number = match.groups()
+            issue_number = int(issue_number)
+            
+            # Check for related PRs in our index
+            patch_builder = PatchLinkageBuilder(owner, repo)
+            
+            # Load existing patch links
+            patch_links = patch_builder.load_patch_links()
+            related_prs = patch_links.get(issue_number, [])
+            
+            # Load open PRs and check for mentions of this issue
+            open_prs = patch_builder.load_open_prs()
+            related_open_prs = []
+            
+            for pr in open_prs:
+                # Check if PR body or title mentions this issue
+                pr_text = f"{pr.title} {pr.body}".lower()
+                if f"#{issue_number}" in pr_text or f"issue {issue_number}" in pr_text:
+                    related_open_prs.append(pr)
+            
+            if related_prs or related_open_prs:
+                enhanced_pr_info = {
+                    "has_related_work": True,
+                    "related_merged_prs": related_prs,
+                    "related_open_prs": related_open_prs,
+                    "message": f"Found {len(related_prs)} related merged PR(s) and {len(related_open_prs)} related open PR(s)"
+                }
+                
+                # If we found significant related work, consider skipping
+                if len(related_open_prs) > 0:
+                    logger.info("Issue %s has related open PRs: %s", issue_url, [pr.pr_number for pr in related_open_prs])
+                    return {
+                        "status": "skipped",
+                        "reason": "related_open_prs",
+                        "pr_info": pr_info.__dict__ if pr_info.state else None,
+                        "enhanced_pr_info": enhanced_pr_info,
+                    }
+            else:
+                enhanced_pr_info = {
+                    "has_related_work": False,
+                    "message": "No related PRs found in patch linkage index"
+                }
+                
+    except Exception as e:
+        logger.warning(f"Enhanced PR detection failed: {e}")
+        enhanced_pr_info = {
+            "has_related_work": False,
+            "message": "Enhanced PR detection unavailable",
+            "error": str(e)
+        }
+    
+    # Original PR check - skip if direct PR exists
     if pr_info.state is not None:
         logger.info("Issue %s already has PR state=%s", issue_url, pr_info.state)
         return {
             "status": "skipped",
             "reason": "pr_exists", 
             "pr_info": pr_info.__dict__,
+            "enhanced_pr_info": enhanced_pr_info,
         }
 
     # 2. Fetch issue data
@@ -374,4 +498,5 @@ Provide a comprehensive JSON analysis with technical depth:
         "agentic_analysis": analysis_data,
         "plan_markdown": plan_md,
         "rag": rag_context,
+        "enhanced_pr_info": enhanced_pr_info,
     }
