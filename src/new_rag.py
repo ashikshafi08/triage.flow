@@ -715,7 +715,7 @@ Code:
             for file in files:
                 if file.startswith('.'):
                     continue
-                
+                    
                 summary["file_count"] += 1
                 file_path = os.path.join(root, file)
                 metadata = get_language_metadata(file_path)
@@ -857,7 +857,16 @@ Code:
                 if hasattr(self, 'reranker'):
                     self.reranker.top_n = optimal_source_count
             
-            response = self.query_engine.query(query)
+            # Conditionally disable expensive LLM reranker when only a few sources are needed
+            if settings.ENABLE_SMART_SIZING and optimal_source_count <= settings.MIN_RAG_SOURCES:
+                # Temporarily remove LLMRerank to avoid extra calls
+                original_postprocessors = self.query_engine.postprocessors
+                self.query_engine.postprocessors = [p for p in original_postprocessors if not isinstance(p, LLMRerank)]
+                response = self.query_engine.query(query)
+                # Restore postprocessors
+                self.query_engine.postprocessors = original_postprocessors
+            else:
+                response = self.query_engine.query(query)
             
             # Restore original settings if we changed them
             if settings.ENABLE_SMART_SIZING:

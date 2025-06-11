@@ -14,6 +14,8 @@ import shutil
 import json
 import logging
 import aiofiles
+import asyncio
+from src.issue_analysis.analyzer import analyse_issue  # new import
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +36,9 @@ class SessionManager:
             "created_at": datetime.now(),
             "last_accessed": datetime.now(),
             "conversation_history": [],
-            "llm_config": llm_config
+            "llm_config": llm_config,
+            "status": "pending",
+            "result": None
         }
         return session_id
     
@@ -278,3 +282,34 @@ class SessionManager:
         for session_id in expired_sessions:
             logger.info(f"Cleaning up expired session: {session_id}")
             self.delete_session(session_id)
+
+    # ------------------------------------------------------------------
+    # Issue analysis orchestration (agentic pipeline)
+    # ------------------------------------------------------------------
+    async def _run_issue_analysis(self, session_id: str):
+        """Internal helper that executes the analyse_issue pipeline and updates session."""
+        session = self.sessions.get(session_id)
+        if not session or session["type"] != "issue_analysis":
+            logger.error("Session %s not found or not issue_analysis", session_id)
+            return
+
+        issue_url: str = session["issue_url"]
+        try:
+            session["status"] = "running"
+            result = await analyse_issue(issue_url)
+            session["status"] = result.get("status", "completed")
+            session["result"] = result
+        except Exception as exc:
+            logger.exception("Issue analysis failed for session %s", session_id)
+            session["status"] = "error"
+            session["error"] = str(exc)
+
+    def launch_issue_analysis(self, session_id: str) -> None:
+        """Public method to start analysis in background using asyncio.create_task."""
+        if session_id not in self.sessions:
+            raise ValueError(f"Invalid session_id {session_id}")
+        # Ensure not already running
+        if self.sessions[session_id].get("status") in {"running", "completed"}:
+            return
+        # Kick off background task
+        asyncio.create_task(self._run_issue_analysis(session_id))

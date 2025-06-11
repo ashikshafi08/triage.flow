@@ -14,6 +14,7 @@ from datetime import datetime
 
 from .processing import process_repository, get_indexing_status
 from .store import session_manager
+from .analysis_processing import process_issue_analysis
 
 app = FastAPI()
 
@@ -32,6 +33,9 @@ logger = logging.getLogger(__name__)
 class IssueRequest(BaseModel):
     issue_url: str
     prompt_type: str  # "explain", "fix", "test", or "summarize"
+
+class AnalyseIssueRequest(BaseModel):
+    issue_url: str
 
 class RepoRequest(BaseModel):
     repo_url: str
@@ -63,6 +67,13 @@ async def handle_issue(request: IssueRequest, background_tasks: BackgroundTasks)
     background_tasks.add_task(process_issue, job_id, request.issue_url, request.prompt_type)
     
     return {"job_id": job_id, "status": "processing"}
+
+@app.post("/analyse_issue")
+async def analyse_issue_endpoint(request: AnalyseIssueRequest, background_tasks: BackgroundTasks):
+    job_id = f"analysis_{uuid.uuid4().hex}"
+    jobs[job_id] = {"status": "queued", "progress_log": []}
+    background_tasks.add_task(process_issue_analysis, job_id, request.issue_url)
+    return {"job_id": job_id, "status": "queued"}
 
 @app.get("/job_status/{job_id}")
 async def get_job_status(job_id: str):

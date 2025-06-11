@@ -109,8 +109,16 @@ class AgenticCodebaseExplorer:
             chunk_large_output_func=self._chunk_large_output
         )
         
-        self.llm = get_llm_instance()
-        self.code_gen_ops.llm = self.llm 
+        # Two–tier LLM setup: cheap reasoning model for iterative ReAct steps,
+        # higher-quality model for final synthesis / code generation.
+        self.base_llm = get_llm_instance(default_model=settings.cheap_model)
+        self.final_llm = get_llm_instance()  # uses settings.default_model
+
+        # Keep legacy attribute name for downstream components
+        self.llm = self.base_llm
+
+        # Code generation operations benefit from higher-quality model
+        self.code_gen_ops.llm = self.final_llm 
 
         self.pr_ops = PROperations(
             repo_path=self.repo_path,
@@ -137,9 +145,10 @@ class AgenticCodebaseExplorer:
         
         self.memory = ChatMemoryBuffer.from_defaults(token_limit=4000)
         
+        # Use cost-efficient model for the reasoning loop.
         self.agent = ReActAgent.from_tools(
             tools=self.tools,
-            llm=self.llm,
+            llm=self.base_llm,
             memory=self.memory,
             verbose=True,
             max_iterations=settings.AGENTIC_MAX_ITERATIONS,
@@ -160,17 +169,27 @@ class AgenticCodebaseExplorer:
         except Exception as e:
             logger.warning(f"Failed to initialize commit index: {e}")
 
-        self.llm = get_llm_instance()
-        self.code_gen_ops.llm = self.llm 
+        # Two–tier LLM setup: cheap reasoning model for iterative ReAct steps,
+        # higher-quality model for final synthesis / code generation.
+        self.base_llm = get_llm_instance(default_model=settings.cheap_model)
+        self.final_llm = get_llm_instance()  # uses settings.default_model
+
+        # Keep legacy attribute name for downstream components
+        self.llm = self.base_llm
+
+        # Code generation operations benefit from higher-quality model
+        self.code_gen_ops.llm = self.final_llm 
+
         self.pr_ops.llm = self.llm 
 
         self.tools = create_all_tools(self) 
         
         self.memory = ChatMemoryBuffer.from_defaults(token_limit=4000)
         
+        # Use cost-efficient model for the reasoning loop.
         self.agent = ReActAgent.from_tools(
             tools=self.tools,
-            llm=self.llm,
+            llm=self.base_llm,
             memory=self.memory,
             verbose=True,
             max_iterations=settings.AGENTIC_MAX_ITERATIONS,
@@ -251,3 +270,19 @@ class AgenticCodebaseExplorer:
 
     def _chunk_large_output(self, content: str) -> str: 
         return chunk_large_output(content, self.chunk_store)
+
+    def find_issue_related_files(self, issue_description: str, search_depth: str = "surface") -> str:
+        """Delegate to issue operations for finding files related to issues."""
+        return self.issue_ops.find_issue_related_files(issue_description, search_depth)
+
+    def analyze_file_structure(self, file_path: str) -> str:
+        """Delegate to file operations for analyzing file structure."""
+        return self.file_ops.analyze_file_structure(file_path)
+
+    def _extract_technical_requirements(self, issue_data):
+        """Extract technical requirements from issue data for enhanced analysis."""
+        pass
+
+    def _extract_issue_keywords(self, text: str):
+        """Extract keywords from issue text for targeted search."""
+        pass

@@ -13,7 +13,10 @@ class Settings(BaseSettings):
     
     # LLM Configuration
     llm_provider: str = os.getenv("LLM_PROVIDER", "openrouter")  # "openai" or "openrouter"
+    # Primary, high-quality model used for final synthesis
     default_model: str = os.getenv("DEFAULT_MODEL", "google/gemini-2.5-flash-preview-05-20")
+    # Cost-efficient model used for iterative reasoning (ReAct steps)
+    cheap_model: str = os.getenv("CHEAP_MODEL", "google/gemini-2.5-flash-preview-05-20")
     
     # Model configurations
     model_configs: Dict[str, Any] = {
@@ -89,7 +92,8 @@ class Settings(BaseSettings):
     PROMPT_CACHE_MIN_TOKENS: int = int(os.getenv("PROMPT_CACHE_MIN_TOKENS", "1000"))  # Minimum tokens to enable caching
     
     # Agentic System Configuration
-    AGENTIC_MAX_ITERATIONS: int = int(os.getenv("AGENTIC_MAX_ITERATIONS", "50"))  # Increased from 30 to 50
+    # Limit ReAct steps; keeping small reduces token / call count
+    AGENTIC_MAX_ITERATIONS: int = int(os.getenv("AGENTIC_MAX_ITERATIONS", "6"))
     AGENTIC_DEBUG_MODE: bool = os.getenv("AGENTIC_DEBUG_MODE", "false").lower() == "true"  # Enable detailed agentic logging
     FORCE_AGENTIC_APPROACH: bool = os.getenv("FORCE_AGENTIC_APPROACH", "false").lower() == "true"  # Force all queries to use agentic
     

@@ -1,11 +1,11 @@
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, BackgroundTasks
-from pydantic import BaseModel # Added for IssueContextRequest
+from pydantic import BaseModel, Field # Added for IssueContextRequest
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.background import BackgroundTasks
 from .models import PromptRequest, PromptResponse, ChatMessage, SessionResponse, RepoRequest, RepoSessionResponse, SessionListResponse, Issue, IssueContextResponse, PullRequestInfo # Added IssueContextResponse and PullRequestInfo
 from .github_client import GitHubIssueClient
-from .llm_client import LLMClient
+from .llm_client import LLMClient, format_rag_context_for_llm
 from .prompt_generator import PromptGenerator
 from .session_manager import SessionManager
 from .conversation_memory import ConversationContextManager
@@ -34,6 +34,7 @@ from .local_repo_loader import get_repo_info # Added for the new endpoint
 from .chunk_store import ChunkStoreFactory, RedisChunkStore
 from .founding_member_agent import FoundingMemberAgent
 from .agent_tools import AgenticCodebaseExplorer
+from .issue_analysis import analyse_issue
 
 # Enable nested event loops for Jupyter notebooks
 nest_asyncio.apply()
@@ -282,9 +283,6 @@ async def handle_chat_message(
         
         # Use production-grade conversation memory
         history = session.get("conversation_history", [])
-        conversation_context, memory_stats = await conversation_memory.get_conversation_context(
-            history, llm_client, use_compression=True
-        )
         
         # Log context retrieval for monitoring
         if enhanced_context and enhanced_context.get("sources"):
@@ -1845,7 +1843,6 @@ async def sync_repository_data(session_id: str, background_tasks: BackgroundTask
         # If issue_rag is None due to prior init failure, a sync might also fail.
         # The frontend should ideally guide user if initial setup had issues.
         # For now, let's proceed assuming issue_rag should be there for a sync operation.
-        # If it's not, it implies a deeper issue with the session's setup.
         raise HTTPException(status_code=400, detail="Issue RAG system not available for this session. Sync cannot proceed.")
 
 
@@ -2682,6 +2679,240 @@ async def get_timeline_preview_api(
     except Exception as e:
         logger.error(f"Error in get_timeline_preview_api: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get timeline preview: {str(e)}")
+
+from pydantic import BaseModel, Field
+class IssueAnalysisRequest(BaseModel):
+    issue_url: str = Field(..., description="Full URL of the GitHub issue, e.g. https://github.com/owner/repo/issues/123")
+
+class IssueAnalysisResponse(BaseModel):
+    session_id: str
+    status: str
+    result: Optional[dict] = None
+
+@app.post("/api/issue_analysis", response_model=IssueAnalysisResponse)
+async def start_issue_analysis(request: IssueAnalysisRequest):
+    """Kick off the async issue → plan pipeline. Returns a session_id which can be polled."""
+    try:
+        if not request.issue_url.startswith(("https://github.com/", "http://github.com/")):
+            raise HTTPException(status_code=400, detail="Invalid GitHub issue URL")
+
+        # Create session and launch background task
+        session_id = session_manager.create_session(request.issue_url, prompt_type="issue_analysis")
+        session_manager.launch_issue_analysis(session_id)
+
+        return IssueAnalysisResponse(session_id=session_id, status="pending")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to launch issue analysis")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/issue_analysis/{session_id}", response_model=IssueAnalysisResponse)
+async def get_issue_analysis_status(session_id: str):
+    """Poll the status/result of an issue analysis run."""
+    session = session_manager.get_session(session_id)
+    if not session or session.get("type") != "issue_analysis":
+        raise HTTPException(status_code=404, detail="Session not found or not issue analysis")
+
+    return IssueAnalysisResponse(
+        session_id=session_id,
+        status=session.get("status", "unknown"),
+        result=session.get("result"),
+    )
+
+# New Issue Analysis Hub API endpoint
+class AnalyzeIssueRequest(BaseModel):
+    issue_url: str = Field(..., description="Full URL of the GitHub issue")
+    session_id: Optional[str] = Field(None, description="Optional session ID for context")
+
+@app.post("/api/analyze-issue")
+async def analyze_issue_endpoint(request: AnalyzeIssueRequest):
+    """Run comprehensive issue analysis using the agentic issue_analysis pipeline."""
+    try:
+        logger.info(f"Starting issue analysis for: {request.issue_url}")
+        
+        # Try to reuse existing session if provided
+        if request.session_id:
+            session = session_manager.get_session(request.session_id)
+            if session and session.get("agentic_rag"):
+                logger.info(f"Reusing existing RAG system from session {request.session_id}")
+                from .issue_analysis import analyse_issue_with_existing_rag
+                analysis_result = await analyse_issue_with_existing_rag(
+                    request.issue_url, 
+                    session["agentic_rag"]
+                )
+            else:
+                logger.info(f"Session {request.session_id} not found or no RAG system, running full analysis")
+                from .issue_analysis import analyse_issue
+                analysis_result = await analyse_issue(request.issue_url)
+        else:
+            logger.info("No session ID provided, running full analysis")
+            from .issue_analysis import analyse_issue
+            analysis_result = await analyse_issue(request.issue_url)
+        
+        logger.info(f"Issue analysis completed with status: {analysis_result.get('status')}")
+        
+        # Transform the result to match the expected frontend structure
+        session_id = request.session_id or f"analysis_{hash(request.issue_url) % 10000}"
+        
+        # Create step-by-step structure for UI
+        steps = [
+            {"step": "PR Detection", "status": "completed", "result": analysis_result.get("pr_info")},
+            {"step": "Issue Classification", "status": "completed", "result": analysis_result.get("classification")},
+            {"step": "Codebase Analysis", "status": "completed", "result": analysis_result.get("agentic_analysis")},
+            {"step": "Solution Planning", "status": "completed", "result": {"plan_markdown": analysis_result.get("plan_markdown")}}
+        ]
+        
+        # Structure final result for frontend compatibility
+        final_result = {}
+        
+        # Classification data
+        if analysis_result.get("classification"):
+            final_result["classification"] = {
+                "category": analysis_result["classification"].get("label", "unknown"),
+                "confidence": analysis_result["classification"].get("confidence", 0.0),
+                "reasoning": analysis_result["classification"].get("reasoning", "")
+            }
+        
+        # File discovery from agentic analysis
+        agentic_data = analysis_result.get("agentic_analysis", {})
+        if agentic_data.get("key_files", {}).get("primary"):
+            final_result["related_files"] = agentic_data["key_files"]["primary"]
+        elif agentic_data.get("file_discovery", {}).get("primary_files"):
+            final_result["related_files"] = agentic_data["file_discovery"]["primary_files"]
+        
+        # Remediation plan
+        if analysis_result.get("plan_markdown"):
+            final_result["remediation_plan"] = analysis_result["plan_markdown"]
+        
+        # Add agentic insights to the response
+        if agentic_data:
+            final_result["agentic_insights"] = agentic_data
+        
+        response = {
+            "session_id": session_id,
+            "steps": steps,
+            "final_result": final_result,
+            "status": analysis_result.get("status"),
+            "error": analysis_result.get("error")
+        }
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Issue analysis failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+class ApplyPatchRequest(BaseModel):
+    patch_content: str = Field(..., description="Unified diff content to apply")
+    session_id: str = Field(..., description="Session ID to identify the repository")
+
+@app.post("/api/apply-patch")
+async def apply_patch_endpoint(request: ApplyPatchRequest):
+    """Apply a unified diff patch to the repository files."""
+    import subprocess
+    import tempfile
+    import os
+    
+    try:
+        logger.info(f"Applying patch for session: {request.session_id}")
+        
+        # Get session to access repository path
+        session = session_manager.get_session(request.session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        repo_path = session.get("repo_path")
+        if not repo_path:
+            raise HTTPException(status_code=400, detail="Repository path not found in session")
+        
+        # Create temporary patch file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as patch_file:
+            patch_file.write(request.patch_content)
+            patch_file_path = patch_file.name
+        
+        try:
+            # Apply patch using git apply
+            result = subprocess.run(
+                ["git", "apply", "--check", patch_file_path],
+                cwd=repo_path,
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode != 0:
+                # Try to provide helpful error message
+                error_msg = result.stderr.strip()
+                if "does not exist in index" in error_msg:
+                    return {
+                        "success": False,
+                        "error": "Patch cannot be applied - target file not found or has been modified",
+                        "details": error_msg
+                    }
+                elif "patch does not apply" in error_msg:
+                    return {
+                        "success": False,
+                        "error": "Patch does not apply cleanly - file may have changed since analysis",
+                        "details": error_msg
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error": f"Patch validation failed: {error_msg}",
+                        "details": error_msg
+                    }
+            
+            # Actually apply the patch
+            result = subprocess.run(
+                ["git", "apply", patch_file_path],
+                cwd=repo_path,
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode != 0:
+                return {
+                    "success": False,
+                    "error": f"Failed to apply patch: {result.stderr.strip()}",
+                    "details": result.stderr.strip()
+                }
+            
+            # Get list of modified files
+            status_result = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repo_path,
+                capture_output=True,
+                text=True
+            )
+            
+            modified_files = []
+            if status_result.returncode == 0:
+                for line in status_result.stdout.strip().split('\n'):
+                    if line.strip():
+                        # Parse git status format: "XY filename"
+                        status = line[:2]
+                        filename = line[3:]
+                        modified_files.append({
+                            "file": filename,
+                            "status": status.strip()
+                        })
+            
+            return {
+                "success": True,
+                "message": "Patch applied successfully",
+                "modified_files": modified_files
+            }
+            
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(patch_file_path)
+            except:
+                pass
+                
+    except Exception as e:
+        logger.error(f"Error applying patch: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to apply patch: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

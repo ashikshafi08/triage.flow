@@ -150,9 +150,11 @@ venv.bak/
 
 # FAISS index files
 .faiss*
-
+.faiss_commits*
 .faiss_index_*
 storage/
+
+node_modules/
 
 # IDE specific files
 .idea/
@@ -195,5 +197,6 @@ htmlcov/
 
 # Index files/folders
 index*
+index_*
 
 
