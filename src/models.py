@@ -40,6 +40,12 @@ class PromptRequest(BaseModel):
     context: Optional[Dict[str, Any]] = None
     llm_config: Optional[Any] = None
 
+class IssueContextRequest(BaseModel):
+    query: str
+    repo_url: str
+    max_issues: Optional[int] = 5
+    include_patches: Optional[bool] = True
+
 class PromptResponse(BaseModel):
     status: str
     prompt: Optional[str] = None

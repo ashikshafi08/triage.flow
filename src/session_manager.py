@@ -15,7 +15,7 @@ import json
 import logging
 import aiofiles
 import asyncio
-from src.issue_analysis.analyzer import analyse_issue  # new import
+from .issue_analysis.analyzer import analyse_issue  # new import
 
 logger = logging.getLogger(__name__)
 
