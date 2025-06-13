@@ -93,17 +93,28 @@ class SessionManager:
                 if field in storage_data and isinstance(storage_data[field], datetime):
                     storage_data[field] = storage_data[field].isoformat()
             
-            # Remove non-serializable objects before storing
+            # Remove non-serializable objects before storing in Redis
+            # These will be recreated on demand via dependencies
             objects_to_exclude = [
                 "agentic_rag", "agentic_rag_for_issue_repo", "founding_member_agent", 
                 "_code_rag", "_issue_rag"
             ]
             for key in objects_to_exclude:
                 if key in storage_data:
-                    storage_data[key] = f"<{key}_instance>"  # Placeholder
+                    # Store metadata about the object instead of placeholder
+                    if key == "agentic_rag" and hasattr(storage_data[key], 'repo_info'):
+                        repo_info = getattr(storage_data[key], 'repo_info', {})
+                        storage_data[f"{key}_metadata"] = {
+                            "type": "AgenticRAGSystem",
+                            "repo_info": repo_info,
+                            "initialized": True
+                        }
+                    # Remove the actual object from storage
+                    del storage_data[key]
             
             await self.sessions_cache.set(session_id, storage_data)
         else:
+            # In-memory storage can keep all objects
             self.sessions[session_id] = session_data
     
     async def _list_all_sessions(self) -> Dict[str, Dict[str, Any]]:
@@ -215,53 +226,72 @@ class SessionManager:
             return
         
         try:
+            # Extract repo info for caching
+            owner = session["metadata"]["owner"]
+            repo = session["metadata"]["repo"]
+            repo_key = f"{owner}/{repo}"
+            
+            # Check if this repo is already initialized in our global cache
+            from .api.dependencies import agentic_rag_cache
+            if repo_key in agentic_rag_cache:
+                logger.info(f"Found existing AgenticRAG instance for {repo_key}, reusing")
+                existing_instance = agentic_rag_cache[repo_key]
+                
+                # Update session with existing instance data
+                session["agentic_rag"] = existing_instance
+                session["repo_path"] = existing_instance.repo_path
+                session["repo_context"] = {"repo_info": existing_instance.repo_info}
+                session["agentic_enabled"] = True
+                
+                # Mark as ready immediately since we're reusing
+                session["metadata"]["status"] = "ready"
+                session["metadata"]["message"] = "Repository loaded from cache. Full context available."
+                session["metadata"]["issue_rag_ready"] = existing_instance.issue_rag is not None
+                
+                await self._store_session(session_id, session)
+                logger.info(f"Session {session_id} initialized using cached AgenticRAG for {repo_key}")
+                return
+            
+            # If not cached, proceed with fresh initialization
             session["metadata"]["status"] = "cloning"
             session["metadata"]["message"] = "Cloning repository..."
-            # TODO: Persist/notify UI if a mechanism exists to update status progressively
 
-            agentic_rag = AgenticRAGSystem(session_id)
-            session["agentic_rag"] = agentic_rag # Store early
+            agentic_rag = AgenticRAGSystem(repo_key)  # Use repo_key instead of session_id
+            session["agentic_rag"] = agentic_rag
 
             # Initialize core systems (blocking part of this background task)
             await agentic_rag.initialize_core_systems(session["repo_url"])
             
             # Update session with info from core systems
             session["repo_path"] = agentic_rag.get_repo_path()
-            session["repo_context"] = { "repo_info": agentic_rag.get_repo_info() }
-            session["agentic_enabled"] = True # Core agentic tools for code analysis are ready
+            session["repo_context"] = {"repo_info": agentic_rag.get_repo_info()}
+            session["agentic_enabled"] = True
 
             session["metadata"]["status"] = "core_ready"
             session["metadata"]["message"] = "Core repository indexed. Chat ready for code analysis. Issue context loading in background..."
-            # TODO: Persist/notify UI
 
-            # Kick off asynchronous initialization of IssueAwareRAG.
-            # This task will run independently. AgenticRAGSystem.initialize_issue_rag_async
-            # is responsible for updating the session's status upon its completion or failure,
-            # as it receives the 'session' dictionary directly.
+            # Cache the instance for reuse across sessions
+            agentic_rag_cache[repo_key] = agentic_rag
+
+            # Kick off asynchronous initialization of IssueAwareRAG
             asyncio.create_task(agentic_rag.initialize_issue_rag_async(session))
             logger.info(f"Session {session_id}: Kicked off background task for IssueAwareRAG initialization.")
             
-            # IMPORTANT: Save the session with repo_path and other updates back to storage
+            # Save the session with repo_path and other updates back to storage
             await self._store_session(session_id, session)
             
-            # Save metadata to disk for persistence (reflecting core_ready state)
-            # The initialize_issue_rag_async will modify session["metadata"] further.
-            # Subsequent status checks or a dedicated save mechanism would pick up those changes.
+            # Save metadata to disk for persistence
             metadata_path = os.path.join(session["metadata"]["storage_path"], "metadata.json")
             with open(metadata_path, 'w') as f:
-                # Dump the entire session metadata as it stands at this point
                 json.dump(session["metadata"], f, indent=2)
                 
         except Exception as e:
-            logger.error(f"Error during core repository session initialization for {session_id}: {e}")
+            logger.error(f"Error during repository session initialization for {session_id}: {e}")
             session["metadata"]["status"] = "error"
             session["metadata"]["error"] = str(e)
-            session["metadata"]["message"] = f"Failed to initialize core session systems: {str(e)}"
+            session["metadata"]["message"] = f"Failed to initialize session systems: {str(e)}"
             # Save the error status back to storage
             await self._store_session(session_id, session)
-            # TODO: Persist/notify UI of error
-            # Errors in this main background task are critical for core functionality.
-            # Errors in initialize_issue_rag_async are handled within that task to set specific statuses.
     
     async def initialize_session_context(self, session_id: str) -> None:
         """Initialize session context based on session type"""

@@ -23,6 +23,19 @@ from .patch_linkage import PatchLinkageBuilder
 
 logger = logging.getLogger(__name__)
 
+def extract_repo_info_from_url(repo_url: str) -> Dict[str, str]:
+    """Extract owner and repo name from GitHub URL"""
+    # Remove .git suffix and trailing slashes
+    clean_url = repo_url.rstrip('/').replace('.git', '')
+    parts = clean_url.split('/')
+    
+    if len(parts) >= 2:
+        owner = parts[-2]
+        repo = parts[-1]
+        return {"owner": owner, "repo": repo}
+    else:
+        raise ValueError(f"Invalid GitHub URL format: {repo_url}")
+
 class AgenticRAGSystem:
     """
     Enhanced RAG system that combines semantic retrieval with agentic tool capabilities
@@ -39,35 +52,61 @@ class AgenticRAGSystem:
         self._query_cache = {}  # Cache for repeated queries
 
     async def initialize_core_systems(self, repo_url: str, branch: str = "main") -> None:
-        """Initializes the core RAG (LocalRepoContextExtractor) and basic agentic explorer."""
+        """Initialize core RAG systems without issue RAG (that comes later async)"""
         try:
-            # Initialize RAG system (core code RAG)
-            self.rag_extractor = LocalRepoContextExtractor()
-            await self.rag_extractor.load_repository(repo_url, branch)
+            logger.info(f"Initializing AgenticRAG core systems for session {self.session_id}")
             
-            self.repo_path = self.rag_extractor.current_repo_path
-            self.repo_info = self.rag_extractor.repo_info
+            # Check if this repo is already loaded in memory cache
+            repo_info_from_url = extract_repo_info_from_url(repo_url)
+            repo_key = f"{repo_info_from_url['owner']}/{repo_info_from_url['repo']}"
             
-            # Initialize agentic explorer (can function with just code RAG initially)
-            # Issue RAG will be linked later if successfully initialized.
-            self.agentic_explorer = AgenticCodebaseExplorer(self.session_id, self.repo_path, issue_rag_system=None)
+            # Import the global cache to check if instance already exists
+            from .api.dependencies import agentic_rag_cache
+            if repo_key in agentic_rag_cache:
+                existing_instance = agentic_rag_cache[repo_key]
+                logger.info(f"Found existing AgenticRAG instance for {repo_key}, reusing core components")
+                
+                # Copy existing components instead of rebuilding
+                self.repo_path = existing_instance.repo_path
+                self.repo_info = existing_instance.repo_info
+                self.agentic_explorer = existing_instance.agentic_explorer
+                self.issue_rag = existing_instance.issue_rag
+                
+                logger.info(f"AgenticRAG core systems reused from cache for session {self.session_id}")
+                return
             
-            # Initialize commit index for commit-level analysis
+            # If not in cache, proceed with initialization
+            logger.info(f"No cached instance found for {repo_key}, initializing fresh")
+            
+            # Load repository locally  
+            code_rag = LocalRepoContextExtractor()
+            await code_rag.load_repository(repo_url, branch)
+            
+            self.repo_path = code_rag.current_repo_path
+            self.repo_info = repo_info_from_url
+            
+            # Initialize AgenticCodebaseExplorer with the repo path
+            from .agent_tools.core import AgenticCodebaseExplorer
+            self.agentic_explorer = AgenticCodebaseExplorer(
+                self.session_id, 
+                self.repo_path, 
+                issue_rag_system=None  # Will be set later
+            )
+            
+            # Initialize commit index - this should load existing cache when available
             try:
                 logger.info(f"Initializing commit index for session {self.session_id}")
-                # Use existing cache when available for faster initialization
+                # force_rebuild=False means it will load existing cache if available
                 await self.agentic_explorer.initialize_commit_index(force_rebuild=False)
                 
-                # File statistics will be built automatically during index creation
-                
-                # Verify initialization worked
+                # Verify initialization
                 if hasattr(self.agentic_explorer, 'commit_index_manager'):
                     stats = self.agentic_explorer.commit_index_manager.get_statistics()
-                    logger.info(f"Commit index initialized successfully for session {self.session_id}: {stats}")
+                    logger.info(f"Commit index initialized for session {self.session_id}: {stats}")
                     
-                    # Check if we got a reasonable number of commits
+                    # Check if we got reasonable data from cache
                     if stats.get('total_commits', 0) < 10:
-                        logger.warning(f"Suspiciously low commit count ({stats.get('total_commits', 0)}) for session {self.session_id}")
+                        logger.warning(f"Low commit count ({stats.get('total_commits', 0)}) for session {self.session_id} - may indicate cache miss or small repo")
                 else:
                     logger.warning(f"Commit index manager not available for session {self.session_id}")
                     
@@ -77,7 +116,7 @@ class AgenticRAGSystem:
                 logger.warning(f"Full traceback: {traceback.format_exc()}")
                 # Continue without commit index - other tools will still work
             
-            logger.info(f"AgenticRAG core systems initialized for session {self.session_id}.")
+            logger.info(f"AgenticRAG core systems initialized for session {self.session_id}")
             
         except Exception as e:
             logger.error(f"Failed to initialize AgenticRAG core systems: {e}")

@@ -481,7 +481,8 @@ async def get_commit_file_diff_api(
     file_path: str,
     session_id: str = Query(..., description="Session ID to identify the repository"),
     view_type: str = Query("content", description="Type of view: 'content' for file at commit, 'diff' for changes"),
-    session: Dict[str, Any] = Depends(get_session)
+    session: Dict[str, Any] = Depends(get_session),
+    agentic_rag = Depends(get_agentic_rag)
 ):
     """
     🚀 OPTIMIZED: Get file content at a specific commit or the diff for that commit.
@@ -492,11 +493,10 @@ async def get_commit_file_diff_api(
     start_time = time.time()
     
     try:
-        agentic_rag = session.get("agentic_rag")
-        if not agentic_rag:
+        if not agentic_rag or not hasattr(agentic_rag, 'get_repo_path'):
             raise HTTPException(status_code=400, detail="Session not properly initialized")
         
-        repo_path = agentic_rag.get_repo_path() if hasattr(agentic_rag, 'get_repo_path') else session.get("repo_path")
+        repo_path = agentic_rag.get_repo_path()
         if not repo_path or not os.path.exists(repo_path):
             raise HTTPException(status_code=404, detail="Repository not found")
         

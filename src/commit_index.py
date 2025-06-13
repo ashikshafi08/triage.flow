@@ -638,12 +638,13 @@ class CommitIndexer:
     
     async def load_existing_index(self) -> bool:
         """Load existing commit index if available with robust error handling"""
-        if not all([
-            self.commits_file.exists(),
-            self.metadata_file.exists(), 
-            self.file_stats_file.exists()
-        ]):
-            logger.info(f"CommitIndexer.load_existing_index: Essential files missing from {self.index_dir}")
+        
+        # Check if essential files exist
+        essential_files = [self.commits_file, self.metadata_file, self.file_stats_file]
+        missing_files = [f for f in essential_files if not f.exists()]
+        
+        if missing_files:
+            logger.info(f"CommitIndexer.load_existing_index: Missing essential files {[f.name for f in missing_files]} from {self.index_dir}")
             return False
         
         # Check if vector store files exist
@@ -654,50 +655,58 @@ class CommitIndexer:
         ]
         
         vector_store_exists = all(f.exists() for f in vector_store_files)
+        logger.info(f"CommitIndexer.load_existing_index: Vector store files exist: {vector_store_exists}")
         
-        if not vector_store_exists:
-            logger.warning(f"CommitIndexer.load_existing_index: Vector store files missing from {self.index_dir}. Will load commits and rebuild only vector store.")
-        else:
-            logger.info(f"CommitIndexer.load_existing_index: All files exist in {self.index_dir}")
+        # Load metadata to check cache age and validity
+        try:
+            with open(self.metadata_file, 'r') as f:
+                metadata = json.load(f)
+            
+            total_commits = metadata.get("total_commits", 0)
+            created_at = metadata.get("created_at", "unknown")
+            logger.info(f"CommitIndexer.load_existing_index: Found cache with {total_commits} commits created at {created_at}")
+            
+            if total_commits < 5:
+                logger.warning(f"CommitIndexer.load_existing_index: Cache has suspiciously low commit count ({total_commits}), will rebuild")
+                return False
+                
+        except Exception as e:
+            logger.warning(f"CommitIndexer.load_existing_index: Failed to read metadata: {e}")
+            return False
         
         try:
-            # Always load commits and file stats (these are essential)
+            # Always load commits and file stats (these are essential and fast)
+            logger.info(f"Loading commits and file stats from {self.index_dir}")
             await self._load_commits()
             await self._load_file_statistics()
+            
+            commits_loaded = len(self.commit_metas)
+            files_loaded = len(self.file_touch_stats)
+            logger.info(f"Loaded {commits_loaded} commits and {files_loaded} file statistics")
+            
+            if commits_loaded == 0:
+                logger.warning("No commits loaded from cache, will rebuild")
+                return False
             
             # Try to load vector store if files exist
             if vector_store_exists:
                 try:
-                    logger.info(f"Attempting to load VectorStoreIndex from {self.index_dir}")
+                    logger.info(f"Loading VectorStoreIndex from {self.index_dir}")
                     # Ensure embed_model is set in Settings for from_persist_dir
                     Settings.embed_model = self.embed_model
                     storage_context = StorageContext.from_defaults(persist_dir=str(self.index_dir))
-                    self.vector_index = VectorStoreIndex.from_storage(
-                        storage_context,
-                    )
-                    logger.info(f"Successfully loaded VectorStoreIndex from {self.index_dir}")
+                    self.vector_index = VectorStoreIndex.from_storage(storage_context)
+                    logger.info(f"Successfully loaded VectorStoreIndex with {len(self.commit_metas)} commits")
+                    
+                except UnicodeDecodeError as e:
+                    logger.warning(f"Vector store corrupted (UTF-8 decode error): {e}. Cleaning up and will rebuild vector store only.")
+                    self._cleanup_corrupted_vector_store()
+                    self.vector_index = None
+                    
                 except Exception as e:
                     logger.warning(f"Failed to load VectorStoreIndex from {self.index_dir}: {e}. Will rebuild vector store only.")
-                    
-                    # Auto-cleanup corrupted vector store files
-                    corrupted_files = [
-                        "default__vector_store.json",
-                        "docstore.json", 
-                        "index_store.json",
-                        "graph_store.json",
-                        "image__vector_store.json"
-                    ]
-                    
-                    for file_name in corrupted_files:
-                        file_path = self.index_dir / file_name
-                        if file_path.exists():
-                            try:
-                                file_path.unlink()
-                                logger.info(f"Removed corrupted vector store file: {file_name}")
-                            except Exception as cleanup_error:
-                                logger.warning(f"Failed to remove corrupted file {file_name}: {cleanup_error}")
-                    
-                    self.vector_index = None # Will be rebuilt below
+                    self._cleanup_corrupted_vector_store()
+                    self.vector_index = None
             else:
                 logger.info(f"Vector store files missing, will rebuild vector store from existing commits")
                 self.vector_index = None
@@ -709,17 +718,38 @@ class CommitIndexer:
                 await self._build_faiss_index(documents)
                 logger.info(f"Vector store rebuilt successfully")
 
-            # Rebuild BM25 (it's fast enough to rebuild)
+            # Always rebuild BM25 (it's fast and doesn't persist)
             if self.commit_metas:
                 documents = self._create_commit_documents(list(self.commit_metas.values()))
                 await self._build_bm25_index(documents)
             
-            logger.info(f"Loaded existing commit index with {len(self.commit_metas)} commits")
+            logger.info(f"Successfully loaded commit index with {len(self.commit_metas)} commits and {len(self.file_touch_stats)} file stats")
             return True
             
         except Exception as e:
-            logger.warning(f"Failed to load existing commit index: {e}")
+            logger.error(f"Failed to load existing commit index: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return False
+    
+    def _cleanup_corrupted_vector_store(self):
+        """Clean up corrupted vector store files"""
+        corrupted_files = [
+            "default__vector_store.json",
+            "docstore.json", 
+            "index_store.json",
+            "graph_store.json",
+            "image__vector_store.json"
+        ]
+        
+        for file_name in corrupted_files:
+            file_path = self.index_dir / file_name
+            if file_path.exists():
+                try:
+                    file_path.unlink()
+                    logger.info(f"Removed corrupted vector store file: {file_name}")
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to remove corrupted file {file_name}: {cleanup_error}")
     
     async def _load_commits(self) -> None:
         """Load commits from storage"""
