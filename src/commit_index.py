@@ -70,25 +70,30 @@ class CommitIndexer:
         self.repo_name = repo_name
         self.repo_key = f"{repo_owner}/{repo_name}" if repo_owner and repo_name else "unknown"
         
+        logger.info(f"CommitIndexer __init__: Received repo_path='{repo_path}', owner='{repo_owner}', name='{repo_name}', resulting repo_key='{self.repo_key}'")
+
         # Initialize embedding model
         self.embed_model = OpenAIEmbedding(
             model="text-embedding-3-small",
             api_key=settings.openai_api_key
         )
         
-        # Setup storage paths - use both repo key and repo path hash for uniqueness
-        repo_path_hash = str(hash(str(repo_path)))[-8:]  # Last 8 chars of hash
+        # Setup storage paths using a persistent base directory
         safe_repo_key = self.repo_key.replace('/', '_')
-        self.index_dir = Path(f".faiss_commits_{safe_repo_key}_{repo_path_hash}")
-        self.index_dir.mkdir(exist_ok=True)
+        # Use a fixed base path within the project's CWD for persistence
+        persistent_base_path = Path(".") / ".index_cache" / "commit_indexes"
+        self.index_dir = persistent_base_path / safe_repo_key
+        self.index_dir.mkdir(parents=True, exist_ok=True) # Ensure parent dirs are created
+        
+        logger.info(f"CommitIndexer: Using persistent index directory: {self.index_dir.resolve()}")
         
         self.commits_file = self.index_dir / "commits.jsonl"
         self.metadata_file = self.index_dir / "metadata.json"
         self.file_stats_file = self.index_dir / "file_stats.json"
-        self.faiss_index_file = self.index_dir / "index.faiss"
-        
+        # self.faiss_index_file = self.index_dir / "index.faiss" # Not directly used for LlamaIndex StorageContext persistence
+
         # Initialize index components
-        self.faiss_index = None
+        # self.faiss_index = None # Not directly managed
         self.vector_index = None
         self.commit_metas = {}  # sha -> CommitMeta
         self.bm25_retriever = None
@@ -144,13 +149,23 @@ class CommitIndexer:
         # Build BM25 index for keyword search
         await self._build_bm25_index(documents)
         
-        # Save everything
+        # Save non-vector-store components
         await self._save_commits(commits)
         await self._save_file_statistics()
         await self._save_metadata(len(commits))
         
         logger.info(f"Commit index built successfully with {len(commits)} commits")
-    
+        
+        # Log the contents of the index directory after saving
+        try:
+            if self.index_dir.exists() and self.index_dir.is_dir():
+                dir_contents = [str(p.name) for p in self.index_dir.iterdir()]
+                logger.info(f"CommitIndexer: Contents of index directory '{self.index_dir.resolve()}' after build: {dir_contents}")
+            else:
+                logger.warning(f"CommitIndexer: Index directory '{self.index_dir.resolve()}' does not exist after build.")
+        except Exception as e_log:
+            logger.error(f"CommitIndexer: Error listing contents of index directory: {e_log}")
+
     def _clear_cache(self) -> None:
         """Clear existing cache files"""
         import shutil
@@ -622,25 +637,78 @@ class CommitIndexer:
         logger.info("BM25 index built")
     
     async def load_existing_index(self) -> bool:
-        """Load existing commit index if available"""
+        """Load existing commit index if available with robust error handling"""
+        if not all([
+            self.commits_file.exists(),
+            self.metadata_file.exists(), 
+            self.file_stats_file.exists()
+        ]):
+            logger.info(f"CommitIndexer.load_existing_index: Essential files missing from {self.index_dir}")
+            return False
+        
+        # Check if vector store files exist
+        vector_store_files = [
+            self.index_dir / "default__vector_store.json",
+            self.index_dir / "docstore.json",
+            self.index_dir / "index_store.json"
+        ]
+        
+        vector_store_exists = all(f.exists() for f in vector_store_files)
+        
+        if not vector_store_exists:
+            logger.warning(f"CommitIndexer.load_existing_index: Vector store files missing from {self.index_dir}. Will load commits and rebuild only vector store.")
+        else:
+            logger.info(f"CommitIndexer.load_existing_index: All files exist in {self.index_dir}")
+        
         try:
-            if not all([
-                self.commits_file.exists(),
-                self.metadata_file.exists(),
-                self.file_stats_file.exists()
-            ]):
-                return False
-            
-            # Load commits
+            # Always load commits and file stats (these are essential)
             await self._load_commits()
-            
-            # Load file statistics
             await self._load_file_statistics()
             
-            # Load FAISS index if it exists
-            if (self.index_dir / "index.faiss").exists():
-                await self._load_faiss_index()
+            # Try to load vector store if files exist
+            if vector_store_exists:
+                try:
+                    logger.info(f"Attempting to load VectorStoreIndex from {self.index_dir}")
+                    # Ensure embed_model is set in Settings for from_persist_dir
+                    Settings.embed_model = self.embed_model
+                    storage_context = StorageContext.from_defaults(persist_dir=str(self.index_dir))
+                    self.vector_index = VectorStoreIndex.from_storage(
+                        storage_context,
+                    )
+                    logger.info(f"Successfully loaded VectorStoreIndex from {self.index_dir}")
+                except Exception as e:
+                    logger.warning(f"Failed to load VectorStoreIndex from {self.index_dir}: {e}. Will rebuild vector store only.")
+                    
+                    # Auto-cleanup corrupted vector store files
+                    corrupted_files = [
+                        "default__vector_store.json",
+                        "docstore.json", 
+                        "index_store.json",
+                        "graph_store.json",
+                        "image__vector_store.json"
+                    ]
+                    
+                    for file_name in corrupted_files:
+                        file_path = self.index_dir / file_name
+                        if file_path.exists():
+                            try:
+                                file_path.unlink()
+                                logger.info(f"Removed corrupted vector store file: {file_name}")
+                            except Exception as cleanup_error:
+                                logger.warning(f"Failed to remove corrupted file {file_name}: {cleanup_error}")
+                    
+                    self.vector_index = None # Will be rebuilt below
+            else:
+                logger.info(f"Vector store files missing, will rebuild vector store from existing commits")
+                self.vector_index = None
             
+            # Rebuild vector store if needed (using existing commit data)
+            if self.vector_index is None and self.commit_metas:
+                logger.info(f"Rebuilding vector store from {len(self.commit_metas)} existing commits")
+                documents = self._create_commit_documents(list(self.commit_metas.values()))
+                await self._build_faiss_index(documents)
+                logger.info(f"Vector store rebuilt successfully")
+
             # Rebuild BM25 (it's fast enough to rebuild)
             if self.commit_metas:
                 documents = self._create_commit_documents(list(self.commit_metas.values()))
@@ -669,26 +737,14 @@ class CommitIndexer:
             self.file_touch_stats = json.load(f)
     
     async def _load_faiss_index(self) -> None:
-        """Load FAISS index from storage"""
-        try:
-            # Recreate storage context and load
-            vec_size = 1536
-            vector_store = FaissVectorStore(faiss_index=faiss.IndexFlatL2(vec_size))
-            storage_context = StorageContext.from_defaults(
-                vector_store=vector_store,
-                persist_dir=str(self.index_dir)
-            )
-            
-            # Load the index
-            self.vector_index = VectorStoreIndex.from_persist_dir(
-                str(self.index_dir),
-                storage_context=storage_context,
-                embed_model=self.embed_model
-            )
-        except Exception as e:
-            logger.warning(f"Failed to load FAISS index: {e}")
-            self.vector_index = None
-    
+        """Load LlamaIndex VectorStoreIndex from storage (this method is now part of load_existing_index)"""
+        # This specific method is effectively replaced by the logic within load_existing_index
+        # which uses VectorStoreIndex.from_storage(StorageContext.from_defaults(persist_dir=...))
+        # Kept for structural reference if direct FAISS interaction was ever re-introduced, but
+        # for LlamaIndex's default persistence, direct FAISS file loading is not the primary path.
+        logger.debug("_load_faiss_index is deprecated; loading handled by StorageContext in load_existing_index.")
+        pass
+
     async def _save_commits(self, commits: List[CommitMeta]) -> None:
         """Save commits to storage"""
         with open(self.commits_file, 'w', encoding='utf-8') as f:

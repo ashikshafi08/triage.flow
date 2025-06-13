@@ -31,7 +31,7 @@ async def handle_chat_message(
             raise HTTPException(status_code=400, detail="Session not properly initialized with AgenticRAG")
         
         # Add user message to session
-        session_manager.add_message(session_id, "user", message.content)
+        await session_manager.add_message(session_id, "user", message.content)
         
         # Extract @file_path mentions and folder mentions from message.content
         user_file_contexts = []
@@ -155,7 +155,7 @@ async def handle_chat_message(
             cached_response = await response_cache.get(response_cache_key)
             if cached_response:
                 print(f"Response cache hit for query type: {query_type}")
-                session_manager.add_message(session_id, "assistant", cached_response)
+                await session_manager.add_message(session_id, "assistant", cached_response)
                 
                 if stream:
                     # Stream the cached response
@@ -207,7 +207,7 @@ async def handle_chat_message(
                 if buffer:
                     yield f"data: {json.dumps({'choices': [{'delta': {'content': buffer}}]})}\n\n"
                 
-                session_manager.add_message(session_id, "assistant", full_response_content)
+                await session_manager.add_message(session_id, "assistant", full_response_content)
                 
                 if use_cache and full_response_content and response_cache_key:
                     await response_cache.set(response_cache_key, full_response_content, settings.CACHE_TTL_RESPONSE)
@@ -221,7 +221,7 @@ async def handle_chat_message(
                 context=enhanced_context,
                 model=model_name
             )
-            session_manager.add_message(session_id, "assistant", llm_response.prompt)
+            await session_manager.add_message(session_id, "assistant", llm_response.prompt)
             
             # Cache the response if appropriate
             if use_cache and response_cache_key:

@@ -4,6 +4,7 @@ from ...models import ChatMessage
 from ..dependencies import (
     session_manager, get_session, get_agentic_rag, get_chunk_store, logger, settings
 )
+from ...agentic_rag import AgenticRAGSystem # Import AgenticRAGSystem for isinstance check
 from ...chunk_store import RedisChunkStore
 import json
 import asyncio
@@ -73,14 +74,26 @@ async def agentic_query(
     session_id: str, 
     message: ChatMessage,
     stream: bool = Query(False),
-    session: Dict[str, Any] = Depends(get_session)
+    session: Dict[str, Any] = Depends(get_session), # Keep get_session for other session data
+    agentic_rag: Any = Depends(get_agentic_rag) # Use get_agentic_rag for the agentic_rag object
 ):
     """Advanced query processing using AgenticRAG's agentic tools"""
     try:
-        agentic_rag = session.get("agentic_rag")
-        if not agentic_rag or not agentic_rag.agentic_explorer:
-            raise HTTPException(status_code=400, detail="AgenticRAG not properly initialized")
+        logger.info(f"agentic_query for session {session_id}: Received agentic_rag param. Type: {type(agentic_rag)}, Value: {str(agentic_rag)[:100]}")
+
+        if not isinstance(agentic_rag, AgenticRAGSystem):
+            logger.error(f"CRITICAL: agentic_rag param in agentic_query is NOT an AgenticRAGSystem instance. Actual Type: {type(agentic_rag)}. Value: {str(agentic_rag)[:200]}")
+            # Also log what session.get('agentic_rag') shows at this point for comparison
+            session_rag_value = session.get("agentic_rag")
+            logger.error(f"For comparison, session.get('agentic_rag') in agentic_query shows Type: {type(session_rag_value)}, Value: {str(session_rag_value)[:100]}")
+            raise HTTPException(status_code=500, detail=f"Internal server error: AgenticRAG system received as incorrect type: {type(agentic_rag)}.")
+
+        if not agentic_rag.agentic_explorer:
+            logger.error(f"CRITICAL: agentic_rag IS an AgenticRAGSystem instance, but agentic_rag.agentic_explorer is None or Falsy. Explorer: {agentic_rag.agentic_explorer}. Session ID: {session_id}")
+            raise HTTPException(status_code=500, detail="Internal server error: AgenticRAG explorer component not initialized.")
         
+        logger.info(f"agentic_query for session {session_id}: agentic_rag is type {type(agentic_rag)} and agentic_explorer is type {type(agentic_rag.agentic_explorer)}. Proceeding.")
+
         # Extract context files from the message content
         context_files = []
         if message.context_files:
@@ -104,7 +117,7 @@ async def agentic_query(
         }
 
         # Add user message to session history
-        session_manager.add_message(session_id, "user", message.content)
+        await session_manager.add_message(session_id, "user", message.content)
 
         # Prepare query with enhanced context
         query_with_context = message.content
@@ -227,7 +240,7 @@ This issue is currently in the conversation context. Please consider it when ana
                 logger.info(f"[DEBUG] Final content length: {len(content) if content else 0}")
 
                 try:
-                    session_manager.add_message(
+                    await session_manager.add_message(
                         session_id,
                         role="assistant",
                         content=content,
@@ -259,7 +272,7 @@ This issue is currently in the conversation context. Please consider it when ana
                 suggestions = []
             
             # Add assistant response to session history
-            session_manager.add_message(
+            await session_manager.add_message(
                 session_id,
                 role="assistant", 
                 content=content,

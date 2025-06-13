@@ -19,7 +19,7 @@ router = APIRouter(tags=["sessions"])
 async def create_session(request: PromptRequest):
     try:
         # Create new session
-        session_id = session_manager.create_session(
+        session_id = await session_manager.create_session(
             request.issue_url, 
             request.prompt_type,
             request.llm_config
@@ -29,7 +29,7 @@ async def create_session(request: PromptRequest):
         await session_manager.initialize_session_context(session_id)
         
         # Get initial prompt
-        session = session_manager.get_session(session_id)
+        session = await session_manager.get_session(session_id)
         if not session or not session.get("issue_data"):
             raise HTTPException(status_code=404, detail="Issue not found")
             
@@ -50,8 +50,8 @@ async def create_session(request: PromptRequest):
         )
         
         # Add initial messages to session
-        session_manager.add_message(session_id, "system", prompt_response.prompt)
-        session_manager.add_message(session_id, "assistant", llm_response.prompt)
+        await session_manager.add_message(session_id, "system", prompt_response.prompt)
+        await session_manager.add_message(session_id, "assistant", llm_response.prompt)
         
         return {
             "session_id": session_id,
@@ -70,7 +70,7 @@ async def create_assistant_session(request: RepoRequest):
             raise HTTPException(status_code=400, detail="Invalid repository URL. Must be a GitHub repository.")
         
         # Create new repo session
-        session_id, metadata = session_manager.create_repo_session(
+        session_id, metadata = await session_manager.create_repo_session(
             request.repo_url,
             request.initial_file,
             request.session_name
@@ -83,7 +83,7 @@ async def create_assistant_session(request: RepoRequest):
         await asyncio.sleep(0.5)
         
         # Get updated session
-        session = session_manager.get_session(session_id)
+        session = await session_manager.get_session(session_id)
         if not session:
             raise HTTPException(status_code=500, detail="Failed to create session")
         
@@ -101,7 +101,7 @@ async def create_assistant_session(request: RepoRequest):
 async def list_assistant_sessions(session_type: Optional[str] = Query(None)):
     """List all assistant sessions"""
     try:
-        sessions = session_manager.list_sessions(session_type)
+        sessions = await session_manager.list_sessions(session_type)
         return SessionListResponse(
             sessions=sessions,
             total=len(sessions)
@@ -125,7 +125,7 @@ async def get_session_status(session_id: str, session: Dict[str, Any] = Depends(
 @router.delete("/assistant/sessions/{session_id}")
 async def delete_assistant_session(session_id: str):
     """Delete an assistant session and clean up resources"""
-    if session_manager.delete_session(session_id):
+    if await session_manager.delete_session(session_id):
         return {"message": "Session deleted successfully"}
     else:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -194,8 +194,8 @@ async def create_founding_session(request: FounderSessionRequest, background_tas
         from ...issue_rag import IssueAwareRAG
         from ...founding_member_agent import FoundingMemberAgent
         
-        session_id, metadata = session_manager.create_repo_session(request.repo_url, session_name=request.session_name)
-        session = session_manager.get_session(session_id)
+        session_id, metadata = await session_manager.create_repo_session(request.repo_url, session_name=request.session_name)
+        session = await session_manager.get_session(session_id)
         session["metadata"]["status"] = "cloning"
         session["metadata"]["progress"] = 0.1
         session["metadata"]["message"] = "Cloning repository..."
@@ -228,7 +228,7 @@ async def create_founding_session(request: FounderSessionRequest, background_tas
                 try:
                     # Re-initialize issue_rag with full patch linkage
                     await issue_rag.initialize(force_rebuild=False)
-                    session = session_manager.get_session(session_id)
+                    session = await session_manager.get_session(session_id)
                     
                     # Create the agent and store in session
                     agent = FoundingMemberAgent(session_id, code_rag, issue_rag)
@@ -240,7 +240,7 @@ async def create_founding_session(request: FounderSessionRequest, background_tas
                     session["metadata"]["message"] = f"FoundingMemberAgent session for {owner}/{repo} is ready."
                     session["metadata"]["tools_ready"] = ["code_rag", "issue_rag", "patch_linkage", "founding_member_agent"]
                 except Exception as e:
-                    session = session_manager.get_session(session_id)
+                    session = await session_manager.get_session(session_id)
                     session["metadata"]["status"] = "error"
                     session["metadata"]["progress"] = 1.0
                     session["metadata"]["message"] = f"Failed to initialize: {str(e)}"
@@ -255,7 +255,7 @@ async def create_founding_session(request: FounderSessionRequest, background_tas
             session["metadata"]["progress"] = 1.0
             session["metadata"]["message"] = f"Failed to initialize: {str(e)}"
             session["metadata"]["error"] = str(e)
-            session_manager.delete_session(session_id)
+            await session_manager.delete_session(session_id)
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to initialize repository session: {str(e)}"
@@ -308,7 +308,7 @@ async def sync_repository_data(session_id: str, background_tasks: BackgroundTask
             # patch linkage and issue indexing.
             await agentic_rag.issue_rag.initialize(
                 force_rebuild=True, 
-                max_issues_for_patch_linkage=settings.MAX_ISSUES_TO_PROCESS,
+                max_issues_for_patch_linkage=settings.MAX_PATCH_LINKAGE_ISSUES,
                 max_prs_for_patch_linkage=settings.MAX_PR_TO_PROCESS
             )
             session["metadata"]["status"] = "ready" 

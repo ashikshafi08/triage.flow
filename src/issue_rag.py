@@ -29,7 +29,7 @@ from src.config import settings
 from .github_client import GitHubIssueClient
 from .llm_client import LLMClient
 from .models import IssueDoc, IssueSearchResult, IssueContextResponse, PatchSearchResult
-from .cache_manager import rag_cache
+from .cache import rag_cache
 from .patch_linkage import PatchLinkageBuilder
 from .commit_index import CommitIndexManager
 

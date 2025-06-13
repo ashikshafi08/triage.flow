@@ -18,6 +18,14 @@ class Settings(BaseSettings):
     # Cost-efficient model used for iterative reasoning (ReAct steps)
     cheap_model: str = os.getenv("CHEAP_MODEL", "google/gemini-2.5-flash-preview-05-20")
     
+    # Redis Configuration
+    redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    redis_host: str = os.getenv("REDIS_HOST", "localhost")
+    redis_port: int = int(os.getenv("REDIS_PORT", "6379"))
+    redis_db: int = int(os.getenv("REDIS_DB", "0"))
+    redis_password: Optional[str] = os.getenv("REDIS_PASSWORD")
+    redis_ssl: bool = os.getenv("REDIS_SSL", "false").lower() == "true"
+    
     # Model configurations
     model_configs: Dict[str, Any] = {
         "gpt-4": {
@@ -65,6 +73,14 @@ class Settings(BaseSettings):
     MAX_CACHE_SIZE: int = int(os.getenv("MAX_CACHE_SIZE", "1000"))
     MAX_CACHE_MEMORY_MB: int = int(os.getenv("MAX_CACHE_MEMORY_MB", "500"))
     
+    # Index Storage Configuration
+    INDEX_STORAGE_DIR: str = os.getenv("INDEX_STORAGE_DIR", os.path.expanduser("~/.triage_flow/indices"))
+    DISABLE_AUTO_INDEXING: bool = os.getenv("DISABLE_AUTO_INDEXING", "false").lower() == "true"
+
+    # Bot Configuration
+    BOT_NAME: str = os.getenv("BOT_NAME", "Triage.Flow Bot")
+    BOT_REPO_URL: str = os.getenv("BOT_REPO_URL", "https://github.com/ashikshafi08/triage.flow")
+    
     # Feature Flags
     ENABLE_RAG_CACHING: bool = os.getenv("ENABLE_RAG_CACHING", "true").lower() == "true"
     ENABLE_RESPONSE_CACHING: bool = os.getenv("ENABLE_RESPONSE_CACHING", "true").lower() == "true"
@@ -92,9 +108,9 @@ class Settings(BaseSettings):
     PROMPT_CACHE_MIN_TOKENS: int = int(os.getenv("PROMPT_CACHE_MIN_TOKENS", "1000"))  # Minimum tokens to enable caching
     
     # Agentic System Configuration
-    # Limit ReAct steps; keeping small reduces token / call count
-    AGENTIC_MAX_ITERATIONS: int = int(os.getenv("AGENTIC_MAX_ITERATIONS", "6"))
-    AGENTIC_DEBUG_MODE: bool = os.getenv("AGENTIC_DEBUG_MODE", "false").lower() == "true"  # Enable detailed agentic logging
+    # Increased limit for complex analysis like PR reviews
+    AGENTIC_MAX_ITERATIONS: int = int(os.getenv("AGENTIC_MAX_ITERATIONS", "12"))
+    AGENTIC_DEBUG_MODE: bool = os.getenv("AGENTIC_DEBUG_MODE", "true").lower() == "true"  # Enable detailed agentic logging by default
     FORCE_AGENTIC_APPROACH: bool = os.getenv("FORCE_AGENTIC_APPROACH", "false").lower() == "true"  # Force all queries to use agentic
     
     # Content and Response Limits Configuration
@@ -104,8 +120,9 @@ class Settings(BaseSettings):
     MAX_AGENTIC_FILE_SIZE_BYTES: int = int(os.getenv("MAX_AGENTIC_FILE_SIZE_BYTES", "5242880"))  # 5MB for agentic tools (up from 1MB)
 
     # Issue Processing Configuration
-    MAX_ISSUES_TO_PROCESS: Optional[int] = int(os.getenv("MAX_ISSUES_TO_PROCESS", "1000"))  # None means process all issues
-    MAX_PR_TO_PROCESS: Optional[int] = int(os.getenv("MAX_PR_TO_PROCESS", "1000"))  # None means process all PRs
+    MAX_ISSUES_TO_PROCESS: Optional[int] = int(os.getenv("MAX_ISSUES_TO_PROCESS", "300"))  
+    MAX_PR_TO_PROCESS: Optional[int] = int(os.getenv("MAX_PR_TO_PROCESS", "300"))  
+    MAX_PATCH_LINKAGE_ISSUES: int = int(os.getenv("MAX_PATCH_LINKAGE_ISSUES", "100"))  # Conservative limit for diff downloads
 
     # Token-based limits (more intelligent)
     ENABLE_SMART_TRUNCATION: bool = os.getenv("ENABLE_SMART_TRUNCATION", "true").lower() == "true"
@@ -119,15 +136,17 @@ class Settings(BaseSettings):
     ENABLE_CONTENT_STREAMING: bool = os.getenv("ENABLE_CONTENT_STREAMING", "true").lower() == "true"
     STREAM_CHUNK_SIZE: int = int(os.getenv("STREAM_CHUNK_SIZE", "1000"))  # Size of streaming chunks
     
-    # Redis Configuration
-    REDIS_CONFIG: ClassVar[Dict[str, Any]] = {
-        "host": "localhost",  # or your Redis host
-        "port": 6379,
-        "db": 0,
-        "password": None,  # if needed
-        "ssl": False,      # if using SSL
-        "decode_responses": True,  # automatically decode responses to strings
-    }
+    # Redis Configuration (computed property)
+    @property
+    def REDIS_CONFIG(self) -> Dict[str, Any]:
+        return {
+            "host": self.redis_host,
+            "port": self.redis_port,
+            "db": self.redis_db,
+            "password": self.redis_password,
+            "ssl": self.redis_ssl,
+            "decode_responses": True,
+        }
 
     # Chunk Store Configuration
     CHUNK_STORE_CONFIG: ClassVar[Dict[str, Any]] = {

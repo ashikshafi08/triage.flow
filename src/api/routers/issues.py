@@ -4,6 +4,7 @@ from ...models import Issue, IssueContextResponse, PullRequestInfo, IssueContext
 from ..dependencies import github_client, get_session, logger
 from ...issue_rag import IssueAwareRAG
 from ...local_repo_loader import get_repo_info
+from ...config import settings
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 import asyncio
@@ -28,7 +29,7 @@ async def get_issue_context_api(request: IssueContextRequest):
         # For this spike, we use force_rebuild=False to leverage caching if the index exists.
         # max_issues_for_patch_linkage is set to a small number for potentially faster cold starts
         # if the index needs to be built.
-        await issue_rag_system.initialize(force_rebuild=False, max_issues_for_patch_linkage=50)
+        await issue_rag_system.initialize(force_rebuild=False, max_issues_for_patch_linkage=settings.MAX_PATCH_LINKAGE_ISSUES)
 
         if not issue_rag_system.is_initialized():
             # This case should ideally be handled by initialize() raising an error,
@@ -219,18 +220,33 @@ async def analyze_issue_endpoint(request: AnalyzeIssueRequest):
         logger.info(f"Starting issue analysis for: {request.issue_url}")
         
         # Try to reuse existing session if provided
+        analysis_result = None
         if request.session_id:
-            from ..dependencies import session_manager
-            session = session_manager.get_session(request.session_id)
-            if session and session.get("agentic_rag"):
-                logger.info(f"Reusing existing RAG system from session {request.session_id}")
-                from ...issue_analysis import analyse_issue_with_existing_rag
-                analysis_result = await analyse_issue_with_existing_rag(
-                    request.issue_url, 
-                    session["agentic_rag"]
-                )
+            from ..dependencies import session_manager, get_agentic_rag as get_agentic_rag_dependency
+
+            # Fetch the session dictionary first
+            session_dict = await session_manager.get_session(request.session_id)
+
+            if session_dict:
+                try:
+                    reconstructed_agentic_rag = await get_agentic_rag_dependency(request.session_id)
+                    if reconstructed_agentic_rag:
+                        logger.info(f"Reusing existing RAG system from session {request.session_id}")
+                        from ...issue_analysis import analyse_issue_with_existing_rag
+                        analysis_result = await analyse_issue_with_existing_rag(
+                            request.issue_url, 
+                            reconstructed_agentic_rag
+                        )
+                    else:
+                        logger.info(f"Session {request.session_id} found, but AgenticRAG could not be obtained. Running full analysis.")
+                        from ...issue_analysis import analyse_issue
+                        analysis_result = await analyse_issue(request.issue_url)
+                except Exception as e:
+                    logger.warning(f"Failed to use existing session {request.session_id}: {e}. Running full analysis.")
+                    from ...issue_analysis import analyse_issue
+                    analysis_result = await analyse_issue(request.issue_url)
             else:
-                logger.info(f"Session {request.session_id} not found or no RAG system, running full analysis")
+                logger.info(f"Session {request.session_id} not found. Running full analysis.")
                 from ...issue_analysis import analyse_issue
                 analysis_result = await analyse_issue(request.issue_url)
         else:
@@ -238,13 +254,16 @@ async def analyze_issue_endpoint(request: AnalyzeIssueRequest):
             from ...issue_analysis import analyse_issue
             analysis_result = await analyse_issue(request.issue_url)
         
+        if not analysis_result:
+            raise ValueError("Analysis returned no result")
+            
         logger.info(f"Issue analysis completed with status: {analysis_result.get('status')}")
         
         # Transform the result to match the expected frontend structure
-        session_id = request.session_id or f"analysis_{hash(request.issue_url) % 10000}"
+        session_id_for_response = request.session_id or f"analysis_{hash(request.issue_url) % 10000}"
         
-        # Handle PR Detection results properly
-        pr_detection_result = None
+        # Handle PR Detection results
+        pr_detection_result = {"has_existing_prs": False, "message": "No existing PRs found"}
         pr_detection_status = "completed"
         
         if analysis_result.get("status") == "skipped" and analysis_result.get("reason") in ["pr_exists", "related_open_prs"]:
@@ -261,7 +280,6 @@ async def analyze_issue_endpoint(request: AnalyzeIssueRequest):
                     "message": f"Found existing {pr_info.get('state', 'unknown')} PR #{pr_info.get('pr_number', 'unknown')}"
                 }
             elif analysis_result.get("reason") == "related_open_prs":
-                # Handle related open PRs case
                 related_open_prs = []
                 if enhanced_pr_info.get("related_open_prs"):
                     for pr in enhanced_pr_info["related_open_prs"]:
@@ -290,120 +308,51 @@ async def analyze_issue_endpoint(request: AnalyzeIssueRequest):
                     "related_open_prs": related_open_prs,
                     "message": enhanced_pr_info.get("message", "Found related work in progress")
                 }
-        else:
-            # No existing PRs found - check for related PRs using patch linkage
-            try:
-                from ...patch_linkage import PatchLinkageBuilder
-                
-                # Extract repo info from issue URL
-                match = re.search(r"github\.com/([^/]+)/([^/]+)/issues/(\d+)", request.issue_url)
-                if match:
-                    owner, repo, issue_number = match.groups()
-                    issue_number = int(issue_number)
-                    
-                    # Check for related PRs in our index
-                    patch_builder = PatchLinkageBuilder(owner, repo)
-                    
-                    # Load existing patch links
-                    patch_links = patch_builder.load_patch_links()
-                    related_prs = patch_links.get(issue_number, [])
-                    
-                    # Load open PRs and check for mentions of this issue
-                    open_prs = patch_builder.load_open_prs()
-                    related_open_prs = []
-                    
-                    for pr in open_prs:
-                        # Check if PR body or title mentions this issue
-                        pr_text = f"{pr.title} {pr.body}".lower()
-                        if f"#{issue_number}" in pr_text or f"issue {issue_number}" in pr_text:
-                            related_open_prs.append({
-                                "pr_number": pr.pr_number,
-                                "title": pr.title,
-                                "author": pr.author,
-                                "url": pr.url,
-                                "draft": pr.draft,
-                                "review_decision": pr.review_decision
-                            })
-                    
-                    if related_prs or related_open_prs:
-                        pr_detection_result = {
-                            "has_existing_prs": True,
-                            "related_merged_prs": [
-                                {
-                                    "pr_number": link.pr_number,
-                                    "pr_url": link.pr_url,
-                                    "pr_title": link.pr_title,
-                                    "merged_at": link.merged_at
-                                } for link in related_prs
-                            ],
-                            "related_open_prs": related_open_prs,
-                            "message": f"Found {len(related_prs)} related merged PR(s) and {len(related_open_prs)} related open PR(s)"
-                        }
-                    else:
-                        pr_detection_result = {
-                            "has_existing_prs": False,
-                            "message": "No existing or related PRs found for this issue"
-                        }
-                else:
-                    pr_detection_result = {
-                        "has_existing_prs": False,
-                        "message": "Could not parse issue URL for PR detection"
-                    }
-                    
-            except Exception as e:
-                logger.warning(f"Error during enhanced PR detection: {e}")
-                pr_detection_result = {
-                    "has_existing_prs": False,
-                    "message": "No existing PRs found (basic check)",
-                    "error": str(e)
-                }
-        
+
         # Create step-by-step structure for UI
         steps = [
             {"step": "PR Detection", "status": pr_detection_status, "result": pr_detection_result},
-            {"step": "Issue Classification", "status": "completed", "result": analysis_result.get("classification")},
-            {"step": "Codebase Analysis", "status": "completed", "result": analysis_result.get("agentic_analysis")},
-            {"step": "Solution Planning", "status": "completed", "result": {"plan_markdown": analysis_result.get("plan_markdown")}}
+            {"step": "Issue Classification", "status": "completed" if analysis_result.get("classification") else "error", "result": analysis_result.get("classification")},
+            {"step": "Codebase Analysis", "status": "completed" if analysis_result.get("agentic_analysis") else "error", "result": analysis_result.get("agentic_analysis")},
+            {"step": "Solution Planning", "status": "completed" if analysis_result.get("plan_markdown") else "error", "result": {"plan_markdown": analysis_result.get("plan_markdown")}}
         ]
         
         # Structure final result for frontend compatibility
         final_result = {}
         
-        # Classification data
-        if analysis_result.get("classification"):
+        if classification_data := analysis_result.get("classification"):
             final_result["classification"] = {
-                "category": analysis_result["classification"].get("label", "unknown"),
-                "confidence": analysis_result["classification"].get("confidence", 0.0),
-                "reasoning": analysis_result["classification"].get("reasoning", "")
+                "category": classification_data.get("label", "unknown"),
+                "confidence": classification_data.get("confidence", 0.0),
+                "reasoning": classification_data.get("reasoning", "")
             }
         
-        # File discovery from agentic analysis
         agentic_data = analysis_result.get("agentic_analysis", {})
-        if agentic_data.get("key_files", {}).get("primary"):
-            final_result["related_files"] = agentic_data["key_files"]["primary"]
-        elif agentic_data.get("file_discovery", {}).get("primary_files"):
-            final_result["related_files"] = agentic_data["file_discovery"]["primary_files"]
+        if key_files_primary := agentic_data.get("key_files", {}).get("primary"):
+            final_result["related_files"] = key_files_primary
+        elif file_discovery_primary := agentic_data.get("file_discovery", {}).get("primary_files"):
+            final_result["related_files"] = file_discovery_primary
         
-        # Remediation plan
-        if analysis_result.get("plan_markdown"):
-            final_result["remediation_plan"] = analysis_result["plan_markdown"]
+        if plan_markdown := analysis_result.get("plan_markdown"):
+            final_result["remediation_plan"] = plan_markdown
         
-        # Add agentic insights to the response
         if agentic_data:
             final_result["agentic_insights"] = agentic_data
         
-        response = {
-            "session_id": session_id,
+        response_payload = {
+            "session_id": session_id_for_response,
             "steps": steps,
             "final_result": final_result,
             "status": analysis_result.get("status"),
             "error": analysis_result.get("error")
         }
         
-        return response
+        return response_payload
         
     except Exception as e:
         logger.error(f"Issue analysis failed: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
 class ApplyPatchRequest(BaseModel):
@@ -418,11 +367,11 @@ async def apply_patch_endpoint(request: ApplyPatchRequest):
     import os
     
     try:
-        logger.info(f"Applying patch for session: {request.session_id}")
+        logger.info(f"Creating patch for session: {request.session_id}")
         
-        # Get session to access repository path
+        # Get session to access repository path and agentic capabilities
         from ..dependencies import session_manager
-        session = session_manager.get_session(request.session_id)
+        session = await session_manager.get_session(request.session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
         
@@ -517,3 +466,42 @@ async def apply_patch_endpoint(request: ApplyPatchRequest):
     except Exception as e:
         logger.error(f"Error applying patch: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to apply patch: {str(e)}")
+
+class PostToGitHubRequest(BaseModel):
+    issue_url: str = Field(..., description="Full URL of the GitHub issue")
+    analysis_result: dict = Field(..., description="Analysis result data to post")
+    custom_message: Optional[str] = Field(None, description="Optional custom message to prepend")
+
+@router.post("/post-to-github")
+async def post_analysis_to_github(request: PostToGitHubRequest):
+    """Post analysis results as a comment to the GitHub issue."""
+    try:
+        logger.info(f"Posting analysis to GitHub issue: {request.issue_url}")
+        
+        # Import and initialize the triage bot
+        from ...triage_bot import TriageBot
+        triage_bot = TriageBot()
+        
+        # Post the analysis to GitHub
+        result = await triage_bot.post_analysis_to_issue(
+            issue_url=request.issue_url,
+            analysis_result=request.analysis_result,
+            custom_message=request.custom_message
+        )
+        
+        if result["success"]:
+            return {
+                "success": True,
+                "message": result["message"],
+                "comment_url": result["comment_url"],
+                "comment_id": result["comment_id"]
+            }
+        else:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Failed to post to GitHub: {result['error']}"
+            )
+            
+    except Exception as e:
+        logger.error(f"Error posting to GitHub: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to post to GitHub: {str(e)}")

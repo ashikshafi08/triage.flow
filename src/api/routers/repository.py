@@ -11,7 +11,12 @@ router = APIRouter(prefix="/api", tags=["repository"])
 @router.get("/files")
 async def list_files(session_id: str = Query(...), session: Dict[str, Any] = Depends(get_session)):
     if "repo_path" not in session:
-        raise HTTPException(status_code=404, detail="No repo loaded for this session")
+        # Check if session is still initializing
+        status = session.get("metadata", {}).get("status", "unknown")
+        if status in ["initializing", "cloning", "core_ready"]:
+            raise HTTPException(status_code=202, detail=f"Repository still initializing (status: {status})")
+        else:
+            raise HTTPException(status_code=404, detail="No repo loaded for this session")
     repo_path = session["repo_path"]
     file_list = []
     for root, dirs, files in os.walk(repo_path):
@@ -127,7 +132,12 @@ async def stream_file_content(
 async def get_tree_structure(session_id: str = Query(...), session: Dict[str, Any] = Depends(get_session)):
     """Get the tree structure of the repository"""
     if "repo_path" not in session:
-        raise HTTPException(status_code=404, detail="No repo loaded for this session")
+        # Check if session is still initializing
+        status = session.get("metadata", {}).get("status", "unknown")
+        if status in ["initializing", "cloning", "core_ready"]:
+            raise HTTPException(status_code=202, detail=f"Repository still initializing (status: {status})")
+        else:
+            raise HTTPException(status_code=404, detail="No repo loaded for this session")
     
     repo_path = session["repo_path"]
     
@@ -317,7 +327,7 @@ async def sync_repository_data(
             logger.info(f"Starting repository data sync for session {session_id}...")
             await agentic_rag.issue_rag.initialize(
                 force_rebuild=True, 
-                max_issues_for_patch_linkage=settings.MAX_ISSUES_TO_PROCESS,
+                max_issues_for_patch_linkage=settings.MAX_PATCH_LINKAGE_ISSUES,
                 max_prs_for_patch_linkage=settings.MAX_PR_TO_PROCESS
             )
             session["metadata"]["status"] = "ready" 

@@ -246,6 +246,17 @@ def create_all_tools(explorer: 'AgenticCodebaseExplorer') -> List[FunctionTool]:
             name="find_feature_introducing_pr",
             description="Find which PR/issue introduced a specific feature by searching issue/PR data"
         ),
+        # New comprehensive PR analysis tools
+        FunctionTool.from_defaults(
+            fn=explorer.pr_ops.get_pr_details_from_github,
+            name="get_pr_details_from_github",
+            description="Get comprehensive PR details directly from GitHub API including reviews, status checks, and metadata"
+        ),  # Async
+        FunctionTool.from_defaults(
+            fn=explorer.pr_ops.get_pr_analysis,
+            name="get_pr_analysis",
+            description="Get complete PR analysis combining local diff data and GitHub metadata - use this as a one-stop tool for understanding what a PR does"
+        ),  # Async
     ]
     
     return tools

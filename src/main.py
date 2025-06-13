@@ -5,7 +5,7 @@ import logging
 from typing import Optional
 from .api.middleware import setup_cors
 from .api.dependencies import session_manager
-from .cache_manager import cleanup_caches_periodically
+from .cache import cleanup_caches_periodically, initialize_redis_cache
 from .chunk_store import ChunkStoreFactory
 
 # Import routers
@@ -38,13 +38,18 @@ app.include_router(agentic.router)
 # Background task to clean up old sessions
 async def cleanup_sessions_periodically():
     while True:
-        session_manager.cleanup_sessions()
+        await session_manager.cleanup_sessions()
         await asyncio.sleep(600)  # Clean up every 10 minutes
 
 @app.on_event("startup")
 async def startup_event():
+    # Initialize Redis cache system
+    await initialize_redis_cache()
+    
+    # Start background tasks
     asyncio.create_task(cleanup_sessions_periodically())
     asyncio.create_task(cleanup_caches_periodically())
+    
     # Initialize chunk store
     ChunkStoreFactory.get_instance()
 
@@ -54,15 +59,17 @@ async def root():
 
 @app.get("/cache-stats")
 async def get_cache_statistics():
-    """Get cache statistics for monitoring performance"""
-    from .cache_manager import rag_cache, response_cache, folder_cache
+    """Get enhanced cache statistics for monitoring performance"""
+    from .cache import rag_cache, response_cache, folder_cache, issue_cache
     from .config import settings
     
     return {
         "rag_cache": rag_cache.get_stats(),
         "response_cache": response_cache.get_stats(),
         "folder_cache": folder_cache.get_stats(),
+        "issue_cache": issue_cache.get_stats(),
         "cache_enabled": settings.CACHE_ENABLED,
+        "redis_url": settings.REDIS_URL,
         "feature_flags": {
             "rag_caching": settings.ENABLE_RAG_CACHING,
             "response_caching": settings.ENABLE_RESPONSE_CACHING,
@@ -77,7 +84,11 @@ async def get_cache_statistics():
         }
     }
 
-
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup Redis connections on shutdown"""
+    from .cache import redis_manager
+    await redis_manager.close()
 
 if __name__ == "__main__":
     import uvicorn

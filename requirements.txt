@@ -141,3 +141,4 @@ uvicorn==0.34.2
 wrapt==1.17.2
 yarl==1.20.0
 redis>=5.0.0
+redis[hiredis]>=5.0.0  # High-performance Redis client with C parser

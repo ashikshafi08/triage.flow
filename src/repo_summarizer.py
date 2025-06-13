@@ -8,7 +8,7 @@ import asyncio
 from pathlib import Path
 import json
 from .language_config import get_language_metadata
-from .cache_manager import folder_cache
+from .cache import folder_cache
 from .config import settings
 
 class RepositorySummarizer:

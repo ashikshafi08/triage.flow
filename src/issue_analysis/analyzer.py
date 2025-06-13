@@ -134,74 +134,50 @@ async def analyse_issue(issue_url: str) -> Dict[str, Any]:
     # 5. **AGENTIC ANALYSIS** - This is where the magic happens!
     try:
         agentic_prompt = f"""
-You are an expert codebase analysis agent with deep technical expertise. Your goal is to provide the most accurate and comprehensive analysis possible.
+You are an expert codebase analysis agent. Analyze this GitHub issue efficiently and thoroughly.
 
 **ISSUE TO ANALYZE:**
 - **Title:** {issue.title}
 - **Number:** #{issue.number}
 - **Body:** {issue.body or 'No description provided'}
 
-**COMPREHENSIVE ANALYSIS APPROACH:**
-Perform thorough, step-by-step investigation to provide the most accurate solution:
+**ANALYSIS APPROACH:**
+Perform a focused investigation using the most relevant tools:
 
-1. **Deep Issue Analysis**: 
-   - Use `analyze_github_issue` with "#{issue.number}" for detailed classification
-   - Understand the technical nature and underlying cause
+1. **Issue Classification**: Use `analyze_github_issue` with "#{issue.number}" to understand the issue type and context
 
-2. **Comprehensive File Discovery**: 
-   - Use `find_issue_related_files` with depth="deep" to identify all relevant files
-   - Use `analyze_file_structure` on key files to understand their implementation details
-   - Use `search_codebase` to find specific patterns, functions, or concepts mentioned
+2. **Key Files Discovery**: Use `find_issue_related_files` to identify the most relevant files for this issue
 
-3. **Historical Intelligence**: 
-   - Use `related_issues` to find similar past issues and learn from their solutions
-   - Use `regression_detector` to determine if this is a regression
-   - If specific functions/classes are mentioned, use `who_implemented_this` and `get_function_evolution`
+3. **Historical Context**: Use `related_issues` to find similar past issues and their solutions
 
-4. **Technical Deep Dive**:
-   - For code-related issues, examine the actual implementation details
-   - Look for patterns like regex flags, configuration issues, API changes
-   - Understand the root cause at a technical level
-
-5. **Validation & Context**:
-   - Use `check_issue_status_and_linked_pr` for current status
-   - Cross-reference with similar resolved issues using `get_issue_resolution_summary`
+4. **Root Cause Analysis**: Based on the issue description and files found, analyze the technical problem
 
 **OUTPUT FORMAT:**
-Provide a comprehensive JSON analysis with technical depth:
+Provide a structured analysis:
 {{
     "issue_analysis": {{
-        "classification": "Primary issue type with technical details",
-        "confidence": 0.95,
+        "classification": "Primary issue category",
+        "confidence": 0.9,
         "complexity": "low|medium|high",
-        "root_cause": "Detailed technical explanation of the underlying issue",
-        "affected_components": ["component1", "component2"]
+        "root_cause": "Technical explanation of the issue"
     }},
-    "technical_investigation": {{
-        "key_files_analyzed": ["file1.py", "file2.js"],
-        "implementation_details": "What the code actually does and why it fails",
-        "specific_patterns_found": ["regex patterns", "API calls", "configurations"],
-        "technical_root_cause": "Precise technical explanation"
+    "key_files": {{
+        "primary": ["most important files"],
+        "secondary": ["supporting files"]
     }},
-    "solution_strategy": {{
-        "approach": "Detailed technical solution with specific implementation details",
-        "entry_point": "file.py:line123",
-        "specific_changes_needed": ["exact code changes", "configuration updates"],
-        "effort": "low|medium|high",
-        "testing_approach": "How to verify the fix works"
+    "solution_approach": {{
+        "strategy": "High-level solution approach",
+        "entry_point": "specific file or function to start with",
+        "changes_needed": ["key changes required"]
     }},
-    "context": {{
-        "similar_issues": ["#123", "#456"],
-        "is_regression": false,
-        "historical_solutions": "What worked for similar issues"
-    }}
+    "similar_issues": ["related issue numbers if found"]
 }}
 
-**PRIORITY: Technical accuracy and comprehensive analysis over speed. Take the time needed to provide the most precise solution.**
+Focus on accuracy and completeness while being efficient with tool usage.
 """
 
         logger.info("Starting comprehensive agentic issue analysis...")
-        agentic_result = await rag.agentic_explorer.query(agentic_prompt)
+        agentic_result = await rag.agentic_explorer.query(agentic_prompt, use_enhanced_agent=True)
         
         # Parse the agentic analysis result
         try:
@@ -365,74 +341,54 @@ async def analyse_issue_with_existing_rag(
     # 4. **AGENTIC ANALYSIS** using existing RAG system
     try:
         agentic_prompt = f"""
-You are an expert codebase analysis agent with deep technical expertise. Your goal is to provide the most accurate and comprehensive analysis possible.
+Analyze this GitHub issue efficiently:
 
-**ISSUE TO ANALYZE:**
-- **Title:** {issue.title}
-- **Number:** #{issue.number}
-- **Body:** {issue.body or 'No description provided'}
+**ISSUE:** {issue.title} (#{issue.number})
+**DESCRIPTION:** {issue.body or 'No description provided'}
 
-**COMPREHENSIVE ANALYSIS APPROACH:**
-Perform thorough, step-by-step investigation to provide the most accurate solution:
+**TASK:** Provide a focused technical analysis using these steps:
 
-1. **Deep Issue Analysis**: 
-   - Use `analyze_github_issue` with "#{issue.number}" for detailed classification
-   - Understand the technical nature and underlying cause
+1. Use `analyze_github_issue` with "#{issue.number}" to understand the issue context
+2. Use `find_issue_related_files` to identify key files (use "surface" depth for efficiency)
+3. Provide your analysis in this format:
 
-2. **Comprehensive File Discovery**: 
-   - Use `find_issue_related_files` with depth="deep" to identify all relevant files
-   - Use `analyze_file_structure` on key files to understand their implementation details
-   - Use `search_codebase` to find specific patterns, functions, or concepts mentioned
+ANALYSIS:
+- Issue Type: [bug/feature/enhancement/etc]
+- Complexity: [low/medium/high] 
+- Key Files: [list main files involved]
+- Root Cause: [technical explanation]
+- Solution Approach: [high-level strategy]
 
-3. **Historical Intelligence**: 
-   - Use `related_issues` to find similar past issues and learn from their solutions
-   - Use `regression_detector` to determine if this is a regression
-   - If specific functions/classes are mentioned, use `who_implemented_this` and `get_function_evolution`
+3. **Historical Context**: Use `related_issues` to find similar past issues and their solutions
 
-4. **Technical Deep Dive**:
-   - For code-related issues, examine the actual implementation details
-   - Look for patterns like regex flags, configuration issues, API changes
-   - Understand the root cause at a technical level
-
-5. **Validation & Context**:
-   - Use `check_issue_status_and_linked_pr` for current status
-   - Cross-reference with similar resolved issues using `get_issue_resolution_summary`
+4. **Root Cause Analysis**: Based on the issue description and files found, analyze the technical problem
 
 **OUTPUT FORMAT:**
-Provide a comprehensive JSON analysis with technical depth:
+Provide a structured analysis:
 {{
     "issue_analysis": {{
-        "classification": "Primary issue type with technical details",
-        "confidence": 0.95,
+        "classification": "Primary issue category",
+        "confidence": 0.9,
         "complexity": "low|medium|high",
-        "root_cause": "Detailed technical explanation of the underlying issue",
-        "affected_components": ["component1", "component2"]
+        "root_cause": "Technical explanation of the issue"
     }},
-    "technical_investigation": {{
-        "key_files_analyzed": ["file1.py", "file2.js"],
-        "implementation_details": "What the code actually does and why it fails",
-        "specific_patterns_found": ["regex patterns", "API calls", "configurations"],
-        "technical_root_cause": "Precise technical explanation"
+    "key_files": {{
+        "primary": ["most important files"],
+        "secondary": ["supporting files"]
     }},
-    "solution_strategy": {{
-        "approach": "Detailed technical solution with specific implementation details",
-        "entry_point": "file.py:line123",
-        "specific_changes_needed": ["exact code changes", "configuration updates"],
-        "effort": "low|medium|high",
-        "testing_approach": "How to verify the fix works"
+    "solution_approach": {{
+        "strategy": "High-level solution approach",
+        "entry_point": "specific file or function to start with",
+        "changes_needed": ["key changes required"]
     }},
-    "context": {{
-        "similar_issues": ["#123", "#456"],
-        "is_regression": false,
-        "historical_solutions": "What worked for similar issues"
-    }}
+    "similar_issues": ["related issue numbers if found"]
 }}
 
-**PRIORITY: Technical accuracy and comprehensive analysis over speed. Take the time needed to provide the most precise solution.**
+Focus on accuracy and completeness while being efficient with tool usage.
 """
 
         logger.info("Starting comprehensive agentic analysis with existing RAG...")
-        agentic_result = await existing_rag.agentic_explorer.query(agentic_prompt)
+        agentic_result = await existing_rag.agentic_explorer.query(agentic_prompt, use_enhanced_agent=True)
         
         # Parse the agentic analysis result
         try:

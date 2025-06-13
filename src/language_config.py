@@ -165,6 +165,62 @@ LANGUAGE_CONFIG: Dict[str, Dict[str, Any]] = {
         "import_pattern": r'@import\s+url\([\'"]?([^\'"\)]+)[\'"]?\)', # CSS imports
         "display_name": "CSS",
         "description": "A style sheet language used for describing the presentation of a document written in HTML."
+    },
+    "shell": {
+        "extensions": [".sh", ".bash", ".zsh", ".fish"],
+        "doc_pattern": r'#.*?$',
+        "import_pattern": r'^(?:source|\.)\s+([^\s]+)',
+        "display_name": "Shell",
+        "description": "Shell scripting languages for Unix-like operating systems."
+    },
+    "dockerfile": {
+        "extensions": [".dockerfile", "Dockerfile"],
+        "doc_pattern": r'#.*?$',
+        "import_pattern": r'^FROM\s+([^\s]+)',
+        "display_name": "Dockerfile",
+        "description": "Instructions for building Docker container images."
+    },
+    "jinja": {
+        "extensions": [".j2", ".jinja", ".jinja2"],
+        "doc_pattern": r'{#.*?#}',
+        "import_pattern": r'{%\s*(?:import|include)\s+[\'"]([^\'"]+)[\'"]',
+        "display_name": "Jinja",
+        "description": "A templating engine for Python web applications."
+    },
+    "yaml": {
+        "extensions": [".yaml", ".yml"],
+        "doc_pattern": r'#.*?$',
+        "import_pattern": None,
+        "display_name": "YAML",
+        "description": "A human-readable data serialization standard."
+    },
+    "json": {
+        "extensions": [".json"],
+        "doc_pattern": None,
+        "import_pattern": None,
+        "display_name": "JSON",
+        "description": "JavaScript Object Notation, a lightweight data interchange format."
+    },
+    "xml": {
+        "extensions": [".xml"],
+        "doc_pattern": r'<!--.*?-->',
+        "import_pattern": None,
+        "display_name": "XML",
+        "description": "Extensible Markup Language for structured data."
+    },
+    "ini": {
+        "extensions": [".ini", ".cfg", ".conf"],
+        "doc_pattern": r'[;#].*?$',
+        "import_pattern": None,
+        "display_name": "INI",
+        "description": "Configuration file format with key-value pairs."
+    },
+    "toml": {
+        "extensions": [".toml"],
+        "doc_pattern": r'#.*?$',
+        "import_pattern": None,
+        "display_name": "TOML",
+        "description": "Tom's Obvious, Minimal Language for configuration files."
     }
 }
 
@@ -177,7 +233,20 @@ def get_all_extensions() -> list[str]:
 
 def get_language_metadata(file_path: str) -> Dict[str, Any]:
     """Get language metadata for a given file path."""
+    filename = os.path.basename(file_path)
     _, ext = os.path.splitext(file_path)
+    
+    # Handle special cases first (files without extensions)
+    if filename.lower() in ['dockerfile', 'dockerfile.dev', 'dockerfile.prod']:
+        return {
+            "language": "dockerfile",
+            "display_name": "Dockerfile",
+            "description": "Instructions for building Docker container images.",
+            "doc_pattern": r'#.*?$',
+            "import_pattern": r'^FROM\s+([^\s]+)'
+        }
+    
+    # Handle files with extensions
     for lang, config in LANGUAGE_CONFIG.items():
         if ext in config["extensions"]:
             return {
@@ -187,6 +256,7 @@ def get_language_metadata(file_path: str) -> Dict[str, Any]:
                 "doc_pattern": config["doc_pattern"],
                 "import_pattern": config["import_pattern"]
             }
+    
     return {
         "language": "unknown",
         "display_name": "Unknown",

@@ -15,7 +15,7 @@ from .config import settings
 from .local_repo_loader import clone_repo_to_temp, clone_repo_to_temp_persistent
 from .language_config import LANGUAGE_CONFIG, get_all_extensions, get_language_metadata
 from .llm_client import LLMClient
-from .cache_manager import rag_cache, folder_cache
+from .cache import rag_cache, folder_cache
 import re
 import Stemmer
 from llama_index.core.query_engine import RetrieverQueryEngine
@@ -53,8 +53,17 @@ TREE_SITTER_LANGUAGE_MAP = {
     "erlang": "erlang",
     "lua": "lua",
     "perl": "perl",
-    "css": "css",  # Added CSS support
-    "markdown": "markdown",  # Added Markdown support
+    "css": "css",  
+    "markdown": "markdown",     
+    "html": "unknown",  
+    "shell": "unknown",  
+    "dockerfile": "unknown",  
+    "jinja": "unknown",  
+    "yaml": "unknown",  
+    "json": "unknown",  
+    "xml": "unknown",  
+    "ini": "unknown",  
+    "toml": "unknown",  
     # Add more if your language_config has names different from tree-sitter's
 }
 
@@ -518,12 +527,17 @@ Code:
                         )
                         nodes_for_doc = node_parser.get_nodes_from_documents([doc])
                         all_nodes.extend(nodes_for_doc)
-                    except ImportError:
-                        print(f"Warning: tree-sitter-language-pack not installed or language '{tree_sitter_lang}' not supported for CodeHierarchyNodeParser. Falling back to SimpleNodeParser for {doc.metadata.get('file_path')}.")
+                    except ImportError as e:
+                        print(f"Warning: tree-sitter-language-pack not installed or language '{tree_sitter_lang}' not supported for CodeHierarchyNodeParser. Falling back to SimpleNodeParser for {doc.metadata.get('file_path')}. Error: {e}")
                         simple_parser = SimpleNodeParser.from_defaults()
                         all_nodes.extend(simple_parser.get_nodes_from_documents([doc]))
                     except ValueError as e:
                         print(f"Warning: Could not parse code for language '{tree_sitter_lang}' in file {doc.metadata.get('file_path')}: {e}. Falling back to SimpleNodeParser.")
+                        simple_parser = SimpleNodeParser.from_defaults()
+                        all_nodes.extend(simple_parser.get_nodes_from_documents([doc]))
+                    except Exception as e:
+                        # Catch any other exceptions including the "Language not yet supported" error
+                        print(f"Warning: Unexpected error with CodeHierarchyNodeParser for language '{tree_sitter_lang}' in file {doc.metadata.get('file_path')}: {e}. Falling back to SimpleNodeParser.")
                         simple_parser = SimpleNodeParser.from_defaults()
                         all_nodes.extend(simple_parser.get_nodes_from_documents([doc]))
                 else:

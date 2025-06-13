@@ -25,6 +25,8 @@ venv/
 env/
 ENV/
 
+
+
 # IDE
 .idea/
 .vscode/
@@ -198,5 +200,10 @@ htmlcov/
 # Index files/folders
 index*
 index_*
+.index_cache/
 
+
+# cursor rules 
+.cursorrules
+.cursor/
 

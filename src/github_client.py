@@ -233,39 +233,87 @@ class GitHubIssueClient:
 
     async def create_issue(self, owner: str, repo: str, title: str, body: str, labels: list = None) -> Dict[str, Any]:
         """
-        Create a new GitHub issue.
+        Create a new issue in the specified repository.
         
         Args:
             owner: Repository owner
             repo: Repository name
             title: Issue title
-            body: Issue body
-            labels: List of label names
+            body: Issue body/description
+            labels: Optional list of label names
             
         Returns:
-            Dict containing the created issue data
+            Dictionary containing the created issue data
         """
         try:
             async with aiohttp.ClientSession() as session:
                 url = f"https://api.github.com/repos/{owner}/{repo}/issues"
                 
-                issue_data = {
+                payload = {
                     "title": title,
                     "body": body
                 }
                 
                 if labels:
-                    issue_data["labels"] = labels
+                    payload["labels"] = labels
                 
-                async with session.post(url, headers=self.headers, json=issue_data) as response:
+                async with session.post(url, headers=self.headers, json=payload) as response:
                     if response.status == 201:
                         return await response.json()
                     else:
                         error_text = await response.text()
-                        raise Exception(f"Failed to create issue: HTTP {response.status} - {error_text}")
+                        raise Exception(f"Failed to create issue: {response.status} - {error_text}")
                         
         except Exception as e:
             raise Exception(f"Error creating issue: {str(e)}")
+
+    async def post_issue_comment(self, issue_url: str, comment_body: str) -> Dict[str, Any]:
+        """
+        Post a comment to a GitHub issue.
+        
+        Args:
+            issue_url: The full URL of the GitHub issue
+            comment_body: The comment content (supports Markdown)
+            
+        Returns:
+            Dictionary containing the created comment data
+        """
+        # Extract issue information
+        issue_info = self._extract_issue_info(issue_url)
+        if not issue_info:
+            raise ValueError("Invalid GitHub issue URL")
+
+        owner, repo, issue_number = issue_info
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
+                
+                payload = {
+                    "body": comment_body
+                }
+                
+                async with session.post(url, headers=self.headers, json=payload) as response:
+                    if response.status == 201:
+                        comment_data = await response.json()
+                        return {
+                            "id": comment_data["id"],
+                            "url": comment_data["html_url"],
+                            "body": comment_data["body"],
+                            "created_at": comment_data["created_at"],
+                            "user": comment_data["user"]["login"]
+                        }
+                    elif response.status == 403:
+                        error_text = await response.text()
+                        raise Exception(f"Permission denied: Bot may not have write access to this repository. {error_text}")
+                    elif response.status == 404:
+                        raise Exception(f"Issue #{issue_number} not found in {owner}/{repo}")
+                    else:
+                        error_text = await response.text()
+                        raise Exception(f"Failed to post comment: {response.status} - {error_text}")
+                        
+        except Exception as e:
+            raise Exception(f"Error posting comment: {str(e)}")
 
     async def list_pull_requests(self, repo_url: str, state: str = "merged", per_page: int = 30, max_pages: int = 5) -> list:
         """
@@ -788,4 +836,22 @@ class GitHubIssueClient:
                     
         except Exception as e:
             print(f"Error fetching PR details: {e}")
+            return None
+
+    async def create_gist(self, gist_data: dict) -> dict:
+        """Create a GitHub Gist"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = "https://api.github.com/gists"
+                
+                async with session.post(url, json=gist_data, headers=self.headers) as response:
+                    if response.status == 201:
+                        return await response.json()
+                    else:
+                        error_text = await response.text()
+                        print(f"Failed to create gist: HTTP {response.status}: {error_text}")
+                        return None
+                        
+        except Exception as e:
+            print(f"Error creating gist: {e}")
             return None

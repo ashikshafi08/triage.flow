@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query, Depends
 from fastapi.responses import JSONResponse
-from ..dependencies import session_manager, get_session, logger, settings
+from ..dependencies import session_manager, get_session, logger, settings, get_agentic_rag
 import time
 import subprocess
 import os
@@ -16,7 +16,8 @@ async def get_file_timeline_api(
     session_id: str = Query(..., description="Session ID to identify the repository"),
     file_path: str = Query(..., description="Path to the file relative to repository root"),
     limit: int = Query(50, description="Maximum number of commits to return"),
-    session: Dict[str, Any] = Depends(get_session)
+    session: Dict[str, Any] = Depends(get_session),
+    agentic_rag = Depends(get_agentic_rag)  # Use dependency to get proper instance
 ):
     """
     🚀 OPTIMIZED: Get timeline of commits for a specific file.
@@ -25,8 +26,8 @@ async def get_file_timeline_api(
     start_time = time.time()
     
     try:
-        agentic_rag = session.get("agentic_rag")
-        if not agentic_rag:
+        # agentic_rag is now properly injected via dependency
+        if not agentic_rag or not hasattr(agentic_rag, 'agentic_explorer'):
             raise HTTPException(status_code=400, detail="Session not properly initialized")
         
         # 🚀 PERFORMANCE: Simple cache key and fast lookup
@@ -181,15 +182,16 @@ async def get_hunk_timeline_api(
     line_start: int = Query(..., description="Starting line number"),
     line_end: int = Query(..., description="Ending line number"),
     limit: int = Query(20, description="Maximum number of commits to return"),
-    session: Dict[str, Any] = Depends(get_session)
+    session: Dict[str, Any] = Depends(get_session),
+    agentic_rag = Depends(get_agentic_rag)  # Use dependency to get proper instance
 ):
     """
     Get timeline of commits that touched a specific line range in a file.
     More granular than file-level timeline.
     """
     try:
-        agentic_rag = session.get("agentic_rag")
-        if not agentic_rag:
+        # agentic_rag is now properly injected via dependency
+        if not agentic_rag or not hasattr(agentic_rag, 'agentic_explorer'):
             raise HTTPException(status_code=400, detail="Session not properly initialized")
         
         # Get full file timeline first
@@ -229,15 +231,16 @@ async def get_timeline_preview_api(
     sha: str,
     file_path: str,
     session_id: str = Query(..., description="Session ID to identify the repository"),
-    session: Dict[str, Any] = Depends(get_session)
+    session: Dict[str, Any] = Depends(get_session),
+    agentic_rag = Depends(get_agentic_rag)  # Use dependency to get proper instance
 ):
     """
     Lightweight preview for timeline scrubbing - just commit metadata without full diff.
     Much faster for real-time timeline navigation.
     """
     try:
-        agentic_rag = session.get("agentic_rag")
-        if not agentic_rag:
+        # agentic_rag is now properly injected via dependency
+        if not agentic_rag or not hasattr(agentic_rag, 'agentic_explorer'):
             raise HTTPException(status_code=400, detail="Session not properly initialized")
         
         # Get commit details from index (very fast - no git operations)
@@ -300,7 +303,7 @@ async def create_issue_from_timeline(request: TimelineIssueRequest):
     Create a GitHub issue from timeline investigation results.
     """
     try:
-        session = session_manager.get_session(request.session_id)
+        session = await session_manager.get_session(request.session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
         

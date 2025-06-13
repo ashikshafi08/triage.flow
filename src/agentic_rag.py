@@ -55,8 +55,8 @@ class AgenticRAGSystem:
             # Initialize commit index for commit-level analysis
             try:
                 logger.info(f"Initializing commit index for session {self.session_id}")
-                # Force rebuild for new sessions to ensure fresh data
-                await self.agentic_explorer.initialize_commit_index(force_rebuild=True)
+                # Use existing cache when available for faster initialization
+                await self.agentic_explorer.initialize_commit_index(force_rebuild=False)
                 
                 # File statistics will be built automatically during index creation
                 
@@ -148,6 +148,11 @@ class AgenticRAGSystem:
             
             if self.agentic_explorer: 
                 self.agentic_explorer.issue_rag_system = self.issue_rag
+                # Also update the sub-components that depend on issue_rag_system
+                if hasattr(self.agentic_explorer, 'pr_ops'):
+                    self.agentic_explorer.pr_ops.issue_rag_system = self.issue_rag
+                if hasattr(self.agentic_explorer, 'issue_ops'):
+                    self.agentic_explorer.issue_ops.issue_rag_system = self.issue_rag
             
             logger.info(f"Session {self.session_id}: IssueAwareRAG for {owner}/{repo_name} initialized successfully.")
             session["metadata"]["issue_rag_ready"] = True
@@ -502,7 +507,11 @@ class AgenticRAGSystem:
         if analysis["query_type"] == "architecture":
             try:
                 structure_analysis = self.agentic_explorer.analyze_file_structure("")
-                context["structure_analysis"] = json.loads(structure_analysis)
+                if structure_analysis:
+                    try:
+                        context["structure_analysis"] = json.loads(structure_analysis)
+                    except (json.JSONDecodeError, TypeError):
+                        context["structure_analysis"] = {"raw_response": str(structure_analysis)}
             except Exception as e:
                 logger.warning(f"Failed to get structure analysis: {e}")
         
@@ -511,20 +520,29 @@ class AgenticRAGSystem:
             try:
                 related_files_map = {}
                 for source in context["sources"][:3]:  # Limit to top 3 to avoid overhead
-                    related_files = self.agentic_explorer.find_related_files(source["file"])
-                    related_files_map[source["file"]] = json.loads(related_files)
-                context["related_files"] = related_files_map
+                    related_files = self.agentic_explorer.search_ops.find_related_files(source["file"])
+                    if related_files:
+                        try:
+                            related_files_map[source["file"]] = json.loads(related_files)
+                        except (json.JSONDecodeError, TypeError):
+                            related_files_map[source["file"]] = {"raw_response": str(related_files)}
+                if related_files_map:
+                    context["related_files"] = related_files_map
             except Exception as e:
                 logger.warning(f"Failed to get related files: {e}")
         
         # Semantic content search for additional context
-        if analysis["keywords"]["primary"]:
+        if analysis.get("keywords", {}).get("primary"):
             try:
                 for keyword in analysis["keywords"]["primary"][:2]:  # Limit to 2 keywords
-                    semantic_results = self.agentic_explorer.semantic_content_search(keyword)
-                    if "semantic_context" not in context:
-                        context["semantic_context"] = {}
-                    context["semantic_context"][keyword] = json.loads(semantic_results)
+                    semantic_results = self.agentic_explorer.search_ops.semantic_content_search(keyword)
+                    if semantic_results:
+                        if "semantic_context" not in context:
+                            context["semantic_context"] = {}
+                        try:
+                            context["semantic_context"][keyword] = json.loads(semantic_results)
+                        except (json.JSONDecodeError, TypeError):
+                            context["semantic_context"][keyword] = {"raw_response": str(semantic_results)}
             except Exception as e:
                 logger.warning(f"Failed to get semantic context: {e}")
         
@@ -544,10 +562,14 @@ class AgenticRAGSystem:
                 # Generate code examples if sources are available
                 if context.get("sources"):
                     source_files = [source["file"] for source in context["sources"][:3]]
-                    code_example = self.agentic_explorer.generate_code_example(
+                    code_example = self.agentic_explorer.code_gen_ops.generate_code_example(
                         query, source_files
                     )
-                    context["code_examples"] = json.loads(code_example)
+                    if code_example:
+                        try:
+                            context["code_examples"] = json.loads(code_example)
+                        except (json.JSONDecodeError, TypeError):
+                            context["code_examples"] = {"raw_response": str(code_example)}
             except Exception as e:
                 logger.warning(f"Failed to generate code examples: {e}")
         
@@ -558,8 +580,13 @@ class AgenticRAGSystem:
                     analyzed_files = {}
                     for source in context["sources"][:2]:  # Limit to 2 files
                         file_analysis = self.agentic_explorer.analyze_file_structure(source["file"])
-                        analyzed_files[source["file"]] = json.loads(file_analysis)
-                    context["file_analysis"] = analyzed_files
+                        if file_analysis:
+                            try:
+                                analyzed_files[source["file"]] = json.loads(file_analysis)
+                            except (json.JSONDecodeError, TypeError):
+                                analyzed_files[source["file"]] = {"raw_response": str(file_analysis)}
+                    if analyzed_files:
+                        context["file_analysis"] = analyzed_files
             except Exception as e:
                 logger.warning(f"Failed to analyze files: {e}")
         
@@ -574,11 +601,15 @@ class AgenticRAGSystem:
         """Light enhancement with minimal processing overhead"""
         
         # Just add some basic semantic search if keywords are available
-        if analysis["keywords"]["primary"]:
+        if analysis.get("keywords", {}).get("primary"):
             try:
                 primary_keyword = analysis["keywords"]["primary"][0]
-                semantic_results = self.agentic_explorer.semantic_content_search(primary_keyword)
-                context["additional_context"] = json.loads(semantic_results)
+                semantic_results = self.agentic_explorer.search_ops.semantic_content_search(primary_keyword)
+                if semantic_results:
+                    try:
+                        context["additional_context"] = json.loads(semantic_results)
+                    except (json.JSONDecodeError, TypeError):
+                        context["additional_context"] = {"raw_response": str(semantic_results)}
             except Exception as e:
                 logger.warning(f"Failed light semantic search: {e}")
         

@@ -168,39 +168,26 @@ class AgenticCodebaseExplorer:
             logger.info("Commit index initialized successfully")
         except Exception as e:
             logger.warning(f"Failed to initialize commit index: {e}")
-
-        # Two–tier LLM setup: cheap reasoning model for iterative ReAct steps,
-        # higher-quality model for final synthesis / code generation.
-        self.base_llm = get_llm_instance(default_model=settings.cheap_model)
-        self.final_llm = get_llm_instance()  # uses settings.default_model
-
-        # Keep legacy attribute name for downstream components
-        self.llm = self.base_llm
-
-        # Code generation operations benefit from higher-quality model
-        self.code_gen_ops.llm = self.final_llm 
-
-        self.pr_ops.llm = self.llm 
-
-        self.tools = create_all_tools(self) 
         
-        self.memory = ChatMemoryBuffer.from_defaults(token_limit=4000)
-        
-        # Use cost-efficient model for the reasoning loop.
-        self.agent = ReActAgent.from_tools(
+    def create_enhanced_agent(self, max_iterations: int = 30) -> ReActAgent:
+        """Create a specialized agent with higher iteration limit for complex analysis"""
+        return ReActAgent.from_tools(
             tools=self.tools,
             llm=self.base_llm,
             memory=self.memory,
             verbose=True,
-            max_iterations=settings.AGENTIC_MAX_ITERATIONS,
-            system_prompt=COMMIT_INDEX_SYSTEM_PROMPT
+            max_iterations=max_iterations,
+            system_prompt=DEFAULT_SYSTEM_PROMPT
         )
         
-    async def query(self, user_message: str) -> str:
+    async def query(self, user_message: str, use_enhanced_agent: bool = False) -> str:
         try:
             logger.info(f"Starting agentic analysis: {user_message[:100]}...")
             with capture_output() as (stdout_buffer, stderr_buffer):
-                response = await self.agent.achat(user_message)
+                if use_enhanced_agent:
+                    response = await self.create_enhanced_agent().achat(user_message)
+                else:
+                    response = await self.agent.achat(user_message)
             logger.info(f"Agentic analysis completed successfully")
             captured_output = stdout_buffer.getvalue() or stderr_buffer.getvalue()
             captured_output = clean_captured_output(captured_output)
