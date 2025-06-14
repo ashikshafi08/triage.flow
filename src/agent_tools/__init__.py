@@ -15,6 +15,10 @@ from .pr_operations import PROperations
 # Import tool registry for creating tools
 from .tool_registry import create_all_tools
 
+# Import context management components
+from .context_manager import ContextManager, ToolExecution, ExecutionContext
+from .context_aware_tools import ContextAwareTool, ContextAwareToolFactory
+
 # Import utilities
 from .utilities import (
     get_current_head_sha,
@@ -61,6 +65,13 @@ __all__ = [
     
     # Tool registry
     'create_all_tools',
+    
+    # Context management
+    'ContextManager',
+    'ToolExecution',
+    'ExecutionContext',
+    'ContextAwareTool',
+    'ContextAwareToolFactory',
     
     # Utilities
     'get_current_head_sha',

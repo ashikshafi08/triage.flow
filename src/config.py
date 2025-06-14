@@ -113,6 +113,12 @@ class Settings(BaseSettings):
     AGENTIC_DEBUG_MODE: bool = os.getenv("AGENTIC_DEBUG_MODE", "true").lower() == "true"  # Enable detailed agentic logging by default
     FORCE_AGENTIC_APPROACH: bool = os.getenv("FORCE_AGENTIC_APPROACH", "false").lower() == "true"  # Force all queries to use agentic
     
+    # Context-Aware Tools Configuration
+    ENABLE_CONTEXT_AWARE_TOOLS: bool = os.getenv("ENABLE_CONTEXT_AWARE_TOOLS", "true").lower() == "true"  # Enable enhanced context sharing
+    ENABLE_CONTEXT_ENHANCEMENT: bool = os.getenv("ENABLE_CONTEXT_ENHANCEMENT", "true").lower() == "true"  # Enable query context enhancement
+    CONTEXT_CACHE_TTL: int = int(os.getenv("CONTEXT_CACHE_TTL", "300"))  # 5 minutes for context cache
+    MAX_CONTEXT_EXECUTIONS: int = int(os.getenv("MAX_CONTEXT_EXECUTIONS", "50"))  # Maximum executions to track in context
+    
     # Content and Response Limits Configuration
     MAX_FILE_SIZE_BYTES: int = int(os.getenv("MAX_FILE_SIZE_BYTES", "10485760"))  # 10MB default (up from 5MB)
     MAX_USER_FILE_CONTENT_CHARS: int = int(os.getenv("MAX_USER_FILE_CONTENT_CHARS", "50000"))  # 50KB default (up from 20KB)

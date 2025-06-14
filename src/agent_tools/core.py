@@ -54,6 +54,10 @@ from .response_handling import (
     get_natural_error_recovery
 )
 
+# Import context management components
+from .context_manager import ContextManager
+from .context_aware_tools import ContextAwareToolFactory
+
 if TYPE_CHECKING:
     from ..issue_rag import IssueAwareRAG 
     from .pr_operations import PROperations 
@@ -78,6 +82,7 @@ def capture_output():
 class AgenticCodebaseExplorer:
     """
     Agentic system for exploring and analyzing codebases using LlamaIndex tools
+    with enhanced context sharing between tools following Cognition AI principles
     """
     
     def __init__(self, session_id: str, repo_path: str, issue_rag_system: Optional['IssueAwareRAG'] = None):
@@ -85,6 +90,9 @@ class AgenticCodebaseExplorer:
         self.repo_path = Path(repo_path)
         self.issue_rag_system = issue_rag_system
         self.chunk_store = ChunkStoreFactory.get_instance()
+        
+        # Initialize context manager for enhanced tool coordination
+        self.context_manager = ContextManager(session_id, self.repo_path)
         
         self.file_ops = FileOperations(self.repo_path, self.chunk_store)
         self.search_ops = SearchOperations(self.repo_path)
@@ -141,7 +149,16 @@ class AgenticCodebaseExplorer:
         # For example, if IssueOperations has a setter or an attribute:
         # self.issue_ops.pr_operations_dependency = self.pr_ops
 
-        self.tools = create_all_tools(self) 
+        # Create context-aware tools instead of standard tools
+        self.context_aware_factory = ContextAwareToolFactory(self.context_manager)
+        
+        # Check if context-aware tools are enabled (can be disabled for debugging)
+        if getattr(settings, 'ENABLE_CONTEXT_AWARE_TOOLS', True):
+            logger.info(f"Creating context-aware tools for session {session_id}")
+            self.tools = self.context_aware_factory.create_context_aware_tools(self)
+        else:
+            logger.info(f"Using standard tools for session {session_id}")
+            self.tools = create_all_tools(self)
         
         self.memory = ChatMemoryBuffer.from_defaults(token_limit=4000)
         
@@ -183,12 +200,22 @@ class AgenticCodebaseExplorer:
     async def query(self, user_message: str, use_enhanced_agent: bool = False) -> str:
         try:
             logger.info(f"Starting agentic analysis: {user_message[:100]}...")
+            
+            # Start execution context for this query
+            execution_context = self.context_manager.start_execution(user_message)
+            
             with capture_output() as (stdout_buffer, stderr_buffer):
                 if use_enhanced_agent:
                     response = await self.create_enhanced_agent().achat(user_message)
                 else:
                     response = await self.agent.achat(user_message)
+            
             logger.info(f"Agentic analysis completed successfully")
+            
+            # Get execution summary for logging
+            summary = self.context_manager.get_execution_summary()
+            logger.info(f"Execution summary: {summary}")
+            
             captured_output = stdout_buffer.getvalue() or stderr_buffer.getvalue()
             captured_output = clean_captured_output(captured_output)
             full_react_trace = captured_output
@@ -205,7 +232,11 @@ class AgenticCodebaseExplorer:
             if not final_answer and not steps:
                  final_answer = str(response)
             suggestions = [] 
-            return format_agentic_response(steps, final_answer, partial=False, suggestions=suggestions)
+            
+            # Enhance final answer with context information if available
+            enhanced_final_answer = self._enhance_final_answer_with_context(final_answer, execution_context)
+            
+            return format_agentic_response(steps, enhanced_final_answer, partial=False, suggestions=suggestions)
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Error in agentic query: {error_msg}")
@@ -214,9 +245,18 @@ class AgenticCodebaseExplorer:
     async def stream_query(self, user_message: str):
         try:
             logger.info(f"[stream] Starting agentic analysis: {user_message[:100]}...")
+            
+            # Start execution context for this query
+            execution_context = self.context_manager.start_execution(user_message)
+            
             yield json.dumps({"type": "status", "content": "Starting analysis...", "step": 0})
             with capture_output() as (stdout_buffer, stderr_buffer):
                 response = await self.agent.achat(user_message)
+            
+            # Get execution summary
+            summary = self.context_manager.get_execution_summary()
+            logger.info(f"[stream] Execution summary: {summary}")
+            
             captured_output = stdout_buffer.getvalue() or stderr_buffer.getvalue()
             captured_output = clean_captured_output(captured_output)
             full_react_trace = captured_output
@@ -236,9 +276,14 @@ class AgenticCodebaseExplorer:
                 yield json.dumps({"type": "step", "step": step})
                 await asyncio.sleep(0.01)
             suggestions = [] 
+            
+            # Enhance final answer with context information
+            enhanced_final_answer = self._enhance_final_answer_with_context(final_answer, execution_context)
+            
             final_payload = {
-                "type": "final", "final": True, "steps": steps, "final_answer": final_answer,
-                "partial": False, "suggestions": suggestions or [], "total_steps": len(steps)
+                "type": "final", "final": True, "steps": steps, "final_answer": enhanced_final_answer,
+                "partial": False, "suggestions": suggestions or [], "total_steps": len(steps),
+                "execution_summary": summary  # Include execution summary in stream
             }
             yield json.dumps(final_payload)
         except Exception as e:
@@ -250,7 +295,42 @@ class AgenticCodebaseExplorer:
             })
 
     def reset_memory(self):
+        """Reset both agent memory and context manager"""
         self.memory.reset()
+        if hasattr(self, 'context_manager'):
+            self.context_manager.cleanup()
+
+    def get_context_summary(self) -> Dict[str, Any]:
+        """Get a summary of the current execution context"""
+        if hasattr(self, 'context_manager'):
+            return self.context_manager.get_execution_summary()
+        return {"status": "context_manager_not_available"}
+
+    def _enhance_final_answer_with_context(self, final_answer: str, execution_context) -> str:
+        """Enhance the final answer with context information if beneficial"""
+        try:
+            if not execution_context or not hasattr(self, 'context_manager'):
+                return final_answer
+            
+            summary = self.context_manager.get_execution_summary()
+            
+            # Only add context summary if there was significant tool usage
+            if summary.get("total_executions", 0) > 3:
+                context_info = f"\n\n---\n**Analysis Context:**\n"
+                context_info += f"- Tools used: {', '.join(summary.get('tools_used', []))}\n"
+                context_info += f"- Files analyzed: {summary.get('files_discovered', 0)}\n"
+                context_info += f"- Execution steps: {summary.get('total_executions', 0)}\n"
+                
+                if summary.get("conflicts_resolved", 0) > 0:
+                    context_info += f"- Conflicts resolved: {summary.get('conflicts_resolved', 0)}\n"
+                
+                return final_answer + context_info
+            
+            return final_answer
+            
+        except Exception as e:
+            logger.warning(f"Error enhancing final answer with context: {e}")
+            return final_answer
 
     def _get_current_head_sha(self) -> Optional[str]: 
         return get_current_head_sha(self.repo_path)

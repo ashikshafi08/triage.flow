@@ -67,10 +67,25 @@ class AgenticRAGSystem:
                 logger.info(f"Found existing AgenticRAG instance for {repo_key}, reusing core components")
                 
                 # Copy existing components instead of rebuilding
+                self.rag_extractor = existing_instance.rag_extractor
                 self.repo_path = existing_instance.repo_path
                 self.repo_info = existing_instance.repo_info
                 self.agentic_explorer = existing_instance.agentic_explorer
                 self.issue_rag = existing_instance.issue_rag
+                
+                # Ensure rag_extractor has proper state if it exists
+                if self.rag_extractor and (not hasattr(self.rag_extractor, 'query_engine') or not self.rag_extractor.query_engine):
+                    logger.warning(f"RAG extractor from cache missing query_engine, will need fresh initialization")
+                    self.rag_extractor = None  # Force fresh initialization below
+                
+                # If rag_extractor is missing or invalid, create a fresh one
+                if not self.rag_extractor:
+                    logger.info(f"Creating fresh RAG extractor for cached instance {repo_key}")
+                    code_rag = LocalRepoContextExtractor()
+                    await code_rag.load_repository(repo_url, branch)
+                    self.rag_extractor = code_rag
+                    # Update the cache with the fresh rag_extractor
+                    existing_instance.rag_extractor = code_rag
                 
                 logger.info(f"AgenticRAG core systems reused from cache for session {self.session_id}")
                 return
@@ -82,6 +97,7 @@ class AgenticRAGSystem:
             code_rag = LocalRepoContextExtractor()
             await code_rag.load_repository(repo_url, branch)
             
+            self.rag_extractor = code_rag  # Fix: Assign the rag_extractor
             self.repo_path = code_rag.current_repo_path
             self.repo_info = repo_info_from_url
             

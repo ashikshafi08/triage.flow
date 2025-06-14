@@ -9,6 +9,7 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 import asyncio
 import re
+import time
 
 router = APIRouter(prefix="/api", tags=["issues"])
 
@@ -219,6 +220,15 @@ async def analyze_issue_endpoint(request: AnalyzeIssueRequest):
     try:
         logger.info(f"Starting issue analysis for: {request.issue_url}")
         
+        # Check cache first
+        from ...cache import issue_analysis_cache
+        cache_key = f"analysis:{request.issue_url}"
+        cached_result = await issue_analysis_cache.get(cache_key)
+        
+        if cached_result:
+            logger.info(f"Returning cached analysis for: {request.issue_url}")
+            return cached_result
+        
         # Try to reuse existing session if provided
         analysis_result = None
         if request.session_id:
@@ -229,7 +239,8 @@ async def analyze_issue_endpoint(request: AnalyzeIssueRequest):
 
             if session_dict:
                 try:
-                    reconstructed_agentic_rag = await get_agentic_rag_dependency(request.session_id)
+                    # Call get_agentic_rag properly with both session_id and session parameters
+                    reconstructed_agentic_rag = await get_agentic_rag_dependency(request.session_id, session_dict)
                     if reconstructed_agentic_rag:
                         logger.info(f"Reusing existing RAG system from session {request.session_id}")
                         from ...issue_analysis import analyse_issue_with_existing_rag
@@ -339,13 +350,53 @@ async def analyze_issue_endpoint(request: AnalyzeIssueRequest):
         if agentic_data:
             final_result["agentic_insights"] = agentic_data
         
+        # Extract issue title and number from URL for better caching
+        issue_title = None
+        issue_number = None
+        try:
+            import re
+            issue_match = re.search(r'/issues/(\d+)', request.issue_url)
+            if issue_match:
+                issue_number = int(issue_match.group(1))
+                
+                # Try to get issue title from GitHub API if we have access
+                try:
+                    repo_match = re.search(r'github\.com/([^/]+)/([^/]+)', request.issue_url)
+                    if repo_match:
+                        owner, repo = repo_match.groups()
+                        repo = repo.replace('.git', '')
+                        
+                        # Simple GitHub API call to get issue title
+                        import httpx
+                        async with httpx.AsyncClient() as client:
+                            response = await client.get(
+                                f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}",
+                                headers={"Accept": "application/vnd.github.v3+json"}
+                            )
+                            if response.status_code == 200:
+                                issue_data = response.json()
+                                issue_title = issue_data.get("title", f"Issue #{issue_number}")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch issue title from GitHub: {e}")
+                    issue_title = f"Issue #{issue_number}"
+        except Exception as e:
+            logger.warning(f"Failed to extract issue info: {e}")
+
         response_payload = {
             "session_id": session_id_for_response,
             "steps": steps,
             "final_result": final_result,
             "status": analysis_result.get("status"),
-            "error": analysis_result.get("error")
+            "error": analysis_result.get("error"),
+            "cached_at": time.time(),
+            "issue_url": request.issue_url,
+            "issue_title": issue_title,
+            "issue_number": issue_number
         }
+        
+        # Cache the result for future use
+        await issue_analysis_cache.set(cache_key, response_payload)
+        logger.info(f"Cached analysis result for: {request.issue_url}")
         
         return response_payload
         
@@ -354,6 +405,133 @@ async def analyze_issue_endpoint(request: AnalyzeIssueRequest):
         import traceback
         logger.error(f"Full traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+@router.get("/cached-analyses/{session_id}")
+async def get_cached_analyses(session_id: str, session: Dict[str, Any] = Depends(get_session)):
+    """Get all cached issue analyses for a session/repository."""
+    try:
+        from ...cache import issue_analysis_cache
+        
+        # Get repository info from session
+        repo_url = session.get("repo_url") or session.get("metadata", {}).get("repo_url")
+        if not repo_url:
+            return {"cached_analyses": []}
+        
+        # Extract owner/repo from URL for pattern matching
+        import re
+        match = re.search(r'github\.com/([^/]+)/([^/]+)', repo_url)
+        if not match:
+            return {"cached_analyses": []}
+        
+        owner, repo = match.groups()
+        repo = repo.replace('.git', '')
+        repo_pattern = f"{owner}/{repo}"
+        
+        # Get all cached analyses (this is a simplified approach)
+        # In a production system, you'd want to maintain an index
+        cached_analyses = []
+        
+        # Try to get a list of cached keys from Redis if available
+        if hasattr(issue_analysis_cache, 'redis') and issue_analysis_cache.redis.initialized:
+            try:
+                # Scan for keys matching our pattern
+                cursor = 0
+                while True:
+                    cursor, keys = await issue_analysis_cache.redis.redis_client.scan(
+                        cursor, match=f"issue_analysis:analysis:*github.com/{repo_pattern}/issues/*", count=100
+                    )
+                    
+                    for key in keys:
+                        try:
+                            # Get the cached analysis
+                            cached_data = await issue_analysis_cache.redis.redis_client.get(key)
+                            if cached_data:
+                                import json
+                                analysis = json.loads(cached_data)
+                                
+                                # Extract issue info from URL
+                                issue_url = analysis.get("issue_url", "")
+                                issue_match = re.search(r'/issues/(\d+)', issue_url)
+                                issue_number = int(issue_match.group(1)) if issue_match else None
+                                
+                                # Get issue title from stored data or fallback
+                                issue_title = analysis.get("issue_title")
+                                if not issue_title and issue_number:
+                                    issue_title = f"Issue #{issue_number}"
+                                
+                                cached_analyses.append({
+                                    "issue_url": issue_url,
+                                    "cached_at": analysis.get("cached_at", time.time()),
+                                    "status": analysis.get("status", "unknown"),
+                                    "issue_title": issue_title,
+                                    "issue_number": issue_number
+                                })
+                        except Exception as e:
+                            logger.warning(f"Failed to parse cached analysis {key}: {e}")
+                            continue
+                    
+                    if cursor == 0:
+                        break
+                        
+            except Exception as e:
+                logger.warning(f"Failed to scan Redis for cached analyses: {e}")
+        
+        # Sort by cached_at descending (newest first)
+        cached_analyses.sort(key=lambda x: x["cached_at"], reverse=True)
+        
+        return {
+            "cached_analyses": cached_analyses,
+            "repository": repo_pattern,
+            "session_id": session_id
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get cached analyses: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/analysis-cache/{issue_url:path}")
+async def get_cached_analysis(issue_url: str):
+    """Get a specific cached analysis by issue URL."""
+    try:
+        from ...cache import issue_analysis_cache
+        
+        cache_key = f"analysis:{issue_url}"
+        cached_result = await issue_analysis_cache.get(cache_key)
+        
+        if cached_result:
+            return {
+                "found": True,
+                "analysis": cached_result,
+                "cached_at": cached_result.get("cached_at"),
+                "issue_url": issue_url
+            }
+        else:
+            return {
+                "found": False,
+                "issue_url": issue_url
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to get cached analysis: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/analysis-cache/{issue_url:path}")
+async def delete_cached_analysis(issue_url: str):
+    """Delete a specific cached analysis."""
+    try:
+        from ...cache import issue_analysis_cache
+        
+        cache_key = f"analysis:{issue_url}"
+        deleted = await issue_analysis_cache.delete(cache_key)
+        
+        return {
+            "deleted": deleted,
+            "issue_url": issue_url
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to delete cached analysis: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 class ApplyPatchRequest(BaseModel):
     patch_content: str = Field(..., description="Unified diff content to apply")

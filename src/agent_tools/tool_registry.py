@@ -16,7 +16,7 @@ def create_all_tools(explorer: 'AgenticCodebaseExplorer') -> List[FunctionTool]:
         FunctionTool.from_defaults(
             fn=explorer.file_ops.explore_directory, 
             name="explore_directory",
-            description="Explore the contents of a directory in the repository to understand its structure and files"
+            description="Explore the contents of a directory in the repository to understand its structure and files. Use directory_path parameter with path relative to repo root (e.g., 'src' or '' for root)."
         ),
         FunctionTool.from_defaults(
             fn=explorer.file_ops.read_file, 
@@ -35,7 +35,7 @@ def create_all_tools(explorer: 'AgenticCodebaseExplorer') -> List[FunctionTool]:
         FunctionTool.from_defaults(
             fn=explorer.search_ops.search_codebase, 
             name="search_codebase",
-            description="Search through the codebase for specific patterns, functions, classes, or concepts"
+            description="Search through the codebase for specific patterns, functions, classes, or concepts. Use query parameter for search term and file_types parameter for extensions list (e.g., ['.py', '.js'])."
         ),
         FunctionTool.from_defaults(
             fn=explorer.search_ops.find_related_files, 
@@ -152,17 +152,17 @@ def create_all_tools(explorer: 'AgenticCodebaseExplorer') -> List[FunctionTool]:
         FunctionTool.from_defaults(
             fn=explorer.issue_ops.analyze_github_issue, 
             name="analyze_github_issue",
-            description="Analyze a GitHub issue to understand the problem and provide solution approaches"
+            description="Analyze a GitHub issue to understand the problem and provide solution approaches. Use issue_identifier parameter with issue number (e.g., '1440') or full URL."
         ),
         FunctionTool.from_defaults(
             fn=explorer.issue_ops.find_issue_related_files, 
             name="find_issue_related_files",
-            description="Find files in the codebase that are related to a specific issue or problem description"
+            description="Find files in the codebase that are related to a specific issue or problem description. Use issue_description parameter with the issue description text and search_depth parameter ('surface' or 'deep')."
         ),
         FunctionTool.from_defaults(
             fn=explorer.issue_ops.related_issues, 
             name="related_issues",
-            description="Find similar past GitHub issues in the current repository that might provide context or solutions"
+            description="Find similar past GitHub issues in the current repository that might provide context or solutions. Use query parameter with issue title, bug description, or error message to search for similar issues."
         ),
         FunctionTool.from_defaults(
             fn=explorer.issue_ops.get_issue_closing_info, 
@@ -204,17 +204,17 @@ def create_all_tools(explorer: 'AgenticCodebaseExplorer') -> List[FunctionTool]:
         FunctionTool.from_defaults(
             fn=explorer.pr_ops.get_pr_diff, 
             name="get_pr_diff",
-            description="Retrieve the diff for a given pull request number"
+            description="Retrieve the diff for a given pull request number. Use pr_number parameter with the PR number."
         ),
         FunctionTool.from_defaults(
             fn=explorer.pr_ops.get_files_changed_in_pr, 
             name="get_files_changed_in_pr",
-            description="Lists all files that were modified, added, or deleted in a given pull request."
+            description="Lists all files that were modified, added, or deleted in a given pull request. Use pr_number parameter with the PR number."
         ),
         FunctionTool.from_defaults(
             fn=explorer.pr_ops.get_pr_summary, 
             name="get_pr_summary",
-            description="Provides a concise summary of the changes made in a specific pull request, based on its diff."
+            description="Provides a concise summary of the changes made in a specific pull request, based on its diff. Use pr_number parameter with the PR number."
         ),
         FunctionTool.from_defaults(
             fn=explorer.pr_ops.find_open_prs_for_issue, 

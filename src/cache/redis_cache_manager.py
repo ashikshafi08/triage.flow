@@ -361,6 +361,14 @@ issue_cache = EnhancedCacheManager(
     redis_manager=redis_manager
 )
 
+# Issue analysis cache for storing analysis results
+issue_analysis_cache = EnhancedCacheManager(
+    namespace="issue_analysis",
+    max_memory_size=200 * 1024 * 1024,  # 200MB for analysis results
+    default_ttl=24 * 3600,  # 24 hours (analyses are expensive)
+    redis_manager=redis_manager
+)
+
 # Compatibility decorators (maintaining existing interface)
 def cache_rag_result(ttl: Optional[int] = None):
     """Enhanced RAG caching decorator"""
@@ -423,6 +431,7 @@ async def cleanup_caches_periodically():
             await response_cache.clear_expired()
             await folder_cache.clear_expired()
             await issue_cache.clear_expired()
+            await issue_analysis_cache.clear_expired()
         except Exception as e:
             logger.error(f"Cache cleanup error: {e}")
 

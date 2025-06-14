@@ -72,6 +72,12 @@ async def get_agentic_rag(session_id: str, session: Dict[str, Any] = Depends(get
         recreated_agentic_rag.repo_path = session["repo_path"]
         recreated_agentic_rag.repo_info = {"owner": owner, "repo": repo}
         
+        # Initialize the RAG extractor (core RAG component)
+        from ..new_rag import LocalRepoContextExtractor
+        rag_extractor = LocalRepoContextExtractor()
+        rag_extractor.current_repo_path = session["repo_path"]
+        recreated_agentic_rag.rag_extractor = rag_extractor
+        
         # Initialize code explorer with existing indexes if available
         from ..agent_tools import AgenticCodebaseExplorer
         recreated_agentic_rag.agentic_explorer = AgenticCodebaseExplorer(
