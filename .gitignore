@@ -26,6 +26,10 @@ env/
 ENV/
 
 
+.roo/
+.taskmaster/
+
+
 
 # IDE
 .idea/
