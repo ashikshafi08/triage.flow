@@ -239,19 +239,44 @@ async def analyze_issue_endpoint(request: AnalyzeIssueRequest):
 
             if session_dict:
                 try:
-                    # Call get_agentic_rag properly with both session_id and session parameters
-                    reconstructed_agentic_rag = await get_agentic_rag_dependency(request.session_id, session_dict)
-                    if reconstructed_agentic_rag:
-                        logger.info(f"Reusing existing RAG system from session {request.session_id}")
-                        from ...issue_analysis import analyse_issue_with_existing_rag
-                        analysis_result = await analyse_issue_with_existing_rag(
-                            request.issue_url, 
-                            reconstructed_agentic_rag
-                        )
+                    # Extract repository info from the issue URL to verify compatibility
+                    import re
+                    issue_match = re.search(r'github\.com/([^/]+)/([^/]+)/issues/(\d+)', request.issue_url)
+                    if issue_match:
+                        issue_owner, issue_repo, issue_number = issue_match.groups()
+                        issue_repo_key = f"{issue_owner}/{issue_repo}"
+                        
+                        # Check if session is for the same repository
+                        session_repo_info = session_dict.get("repo_context", {}).get("repo_info", {})
+                        session_owner = session_repo_info.get("owner") or session_dict.get("metadata", {}).get("owner")
+                        session_repo = session_repo_info.get("repo") or session_dict.get("metadata", {}).get("repo")
+                        session_repo_key = f"{session_owner}/{session_repo}" if session_owner and session_repo else None
+                        
+                        if session_repo_key == issue_repo_key:
+                            logger.info(f"Session {request.session_id} matches issue repository {issue_repo_key}, attempting reuse")
+                            
+                            # Call get_agentic_rag properly with both session_id and session parameters
+                            reconstructed_agentic_rag = await get_agentic_rag_dependency(request.session_id, session_dict)
+                            if reconstructed_agentic_rag:
+                                logger.info(f"Successfully reused existing RAG system from session {request.session_id}")
+                                from ...issue_analysis import analyse_issue_with_existing_rag
+                                analysis_result = await analyse_issue_with_existing_rag(
+                                    request.issue_url, 
+                                    reconstructed_agentic_rag
+                                )
+                            else:
+                                logger.warning(f"Session {request.session_id} found but AgenticRAG could not be obtained")
+                        else:
+                            logger.info(f"Session {request.session_id} is for different repository ({session_repo_key} vs {issue_repo_key}), running fresh analysis")
                     else:
-                        logger.info(f"Session {request.session_id} found, but AgenticRAG could not be obtained. Running full analysis.")
+                        logger.warning(f"Could not extract repository info from issue URL: {request.issue_url}")
+                        
+                    # If we didn't get a result from reuse, fall back to fresh analysis
+                    if not analysis_result:
+                        logger.info("Falling back to fresh analysis")
                         from ...issue_analysis import analyse_issue
                         analysis_result = await analyse_issue(request.issue_url)
+                        
                 except Exception as e:
                     logger.warning(f"Failed to use existing session {request.session_id}: {e}. Running full analysis.")
                     from ...issue_analysis import analyse_issue

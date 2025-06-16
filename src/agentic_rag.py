@@ -73,12 +73,39 @@ class AgenticRAGSystem:
                 self.agentic_explorer = existing_instance.agentic_explorer
                 self.issue_rag = existing_instance.issue_rag
                 
-                # Ensure rag_extractor has proper state if it exists
-                if self.rag_extractor and (not hasattr(self.rag_extractor, 'query_engine') or not self.rag_extractor.query_engine):
-                    logger.warning(f"RAG extractor from cache missing query_engine, will need fresh initialization")
-                    self.rag_extractor = None  # Force fresh initialization below
+                # More robust check for RAG extractor validity
+                rag_is_valid = (
+                    self.rag_extractor and 
+                    hasattr(self.rag_extractor, 'query_engine') and 
+                    self.rag_extractor.query_engine is not None and
+                    hasattr(self.rag_extractor, 'vector_store') and
+                    self.rag_extractor.vector_store is not None
+                )
                 
-                # If rag_extractor is missing or invalid, create a fresh one
+                if not rag_is_valid:
+                    logger.warning(f"RAG extractor from cache missing critical components, will need fresh initialization")
+                    logger.warning(f"RAG extractor state: query_engine={getattr(self.rag_extractor, 'query_engine', 'missing')}, vector_store={getattr(self.rag_extractor, 'vector_store', 'missing')}")
+                    # Instead of setting to None, try to reinitialize with existing repo path
+                    if existing_instance.repo_path and os.path.exists(existing_instance.repo_path):
+                        logger.info(f"Attempting to reinitialize RAG extractor using existing repo at {existing_instance.repo_path}")
+                        try:
+                            code_rag = LocalRepoContextExtractor()
+                            code_rag.current_repo_path = existing_instance.repo_path
+                            # Try to rebuild indices from existing repository without re-cloning
+                            await code_rag._rebuild_indices_from_existing_repo()
+                            self.rag_extractor = code_rag
+                            # Update the cache with the fixed rag_extractor
+                            existing_instance.rag_extractor = code_rag
+                            logger.info(f"Successfully reinitialized RAG extractor for {repo_key} from existing repo")
+                        except Exception as reinit_error:
+                            logger.error(f"Failed to reinitialize RAG extractor: {reinit_error}")
+                            # Fall back to full re-cloning only as last resort
+                            self.rag_extractor = None
+                    else:
+                        logger.warning(f"No existing repo path or path doesn't exist: {existing_instance.repo_path}")
+                        self.rag_extractor = None
+                
+                # If rag_extractor is still missing or invalid, create a fresh one
                 if not self.rag_extractor:
                     logger.info(f"Creating fresh RAG extractor for cached instance {repo_key}")
                     code_rag = LocalRepoContextExtractor()
@@ -86,6 +113,9 @@ class AgenticRAGSystem:
                     self.rag_extractor = code_rag
                     # Update the cache with the fresh rag_extractor
                     existing_instance.rag_extractor = code_rag
+                    # Also update repo_path in case it changed
+                    existing_instance.repo_path = code_rag.current_repo_path
+                    self.repo_path = code_rag.current_repo_path
                 
                 logger.info(f"AgenticRAG core systems reused from cache for session {self.session_id}")
                 return

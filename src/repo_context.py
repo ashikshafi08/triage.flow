@@ -73,7 +73,7 @@ class RepoContextExtractor:
                 return
 
             # Create nodes with metadata
-            parser = SimpleNodeParser.from_defaults()
+            parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
             nodes = parser.get_nodes_from_documents(documents)
 
             # Add metadata to nodes

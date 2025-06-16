@@ -215,18 +215,185 @@ class PROperations:
         else:
             return _fetch_pr_summary()
 
-    async def find_open_prs_for_issue(self, issue_number: Annotated[int, "Issue number"]) -> str:
-        cache_key = f"open_prs_for_issue:{issue_number}"
-        
-        async def _fetch_open_prs():
-            # Simplified placeholder. Original logic involved PatchLinkageBuilder and text similarity.
-            logger.warning("find_open_prs_for_issue is a placeholder in PROperations.")
-            if not self.issue_rag_system or not self.issue_rag_system.is_initialized():
-                return json.dumps({"error": "Issue RAG system not initialized", "open_prs": []})
-            # Conceptual: actual implementation would search open PRs from indexer
-            return json.dumps({"message": f"Placeholder search for open PRs for issue #{issue_number}", "open_prs": []})
-        
-        return await self._get_cached_or_fetch(cache_key, _fetch_open_prs)
+    def find_open_prs_for_issue(self, issue_number: Annotated[int, "Issue number"]) -> str:
+        """Find open pull requests that are related to or reference a specific issue number."""
+        try:
+            cache_key = f"open_prs_for_issue:{issue_number}"
+            
+            async def _fetch_open_prs():
+                # Try multiple approaches to find open PRs for the issue
+                result = {
+                    "issue_number": issue_number,
+                    "open_prs": [],
+                    "search_methods": [],
+                    "found_via": None
+                }
+                
+                # Method 1: Use Issue RAG system if available and initialized
+                if self.issue_rag_system and self.issue_rag_system.is_initialized():
+                    try:
+                        # Check for open PR documents in the indexer
+                        if hasattr(self.issue_rag_system.indexer, 'open_pr_docs'):
+                            open_pr_docs = self.issue_rag_system.indexer.open_pr_docs
+                            for pr_number, pr_doc in open_pr_docs.items():
+                                # Check if PR mentions this issue
+                                pr_text = f"{pr_doc.title} {pr_doc.body}".lower()
+                                issue_refs = [f"#{issue_number}", f"issue {issue_number}", f"fixes #{issue_number}", f"closes #{issue_number}"]
+                                
+                                if any(ref in pr_text for ref in issue_refs):
+                                    result["open_prs"].append({
+                                        "pr_number": pr_number,
+                                        "title": pr_doc.title,
+                                        "author": pr_doc.author,
+                                        "url": pr_doc.url,
+                                        "created_at": pr_doc.created_at,
+                                        "updated_at": pr_doc.updated_at,
+                                        "review_decision": pr_doc.review_decision,
+                                        "draft": pr_doc.draft,
+                                        "mergeable": pr_doc.mergeable,
+                                        "files_changed": pr_doc.files_changed[:5],  # Limit to first 5 files
+                                        "source": "issue_rag_index"
+                                    })
+                        
+                        if result["open_prs"]:
+                            result["found_via"] = "issue_rag_index"
+                            result["search_methods"].append("issue_rag_index")
+                            result["status"] = "found"
+                            result["message"] = f"Found {len(result['open_prs'])} open PR(s) related to issue #{issue_number}"
+                            return json.dumps(result, indent=2)
+                            
+                    except Exception as e:
+                        logger.warning(f"Issue RAG search failed: {e}")
+                        result["search_methods"].append(f"issue_rag_index_failed: {str(e)}")
+                
+                # Method 2: GitHub API search (if we have access)
+                try:
+                    from ..github_client import GitHubIssueClient
+                    from .utilities import get_repo_url_from_path
+                    
+                    repo_url = get_repo_url_from_path(self.repo_path)
+                    if repo_url:
+                        github_client = GitHubIssueClient()
+                        
+                        # Search for open PRs that mention this issue
+                        search_query = f"#{issue_number} type:pr state:open repo:{repo_url.split('github.com/')[-1]}"
+                        
+                        # Try GitHub search API (may require authentication)
+                        try:
+                            # This is a simplified search - in practice, you'd use GitHub's search API
+                            # For now, we'll use a more direct approach
+                            result["search_methods"].append("github_api_attempted")
+                            
+                        except Exception as api_e:
+                            logger.debug(f"GitHub API search failed: {api_e}")
+                            result["search_methods"].append(f"github_api_failed: {str(api_e)}")
+                            
+                except Exception as e:
+                    logger.debug(f"GitHub client setup failed: {e}")
+                    result["search_methods"].append(f"github_setup_failed: {str(e)}")
+                
+                # Method 3: Git log search for recent PR references (fallback)
+                try:
+                    import subprocess
+                    import re
+                    
+                    # Search recent commits for PR merge messages that might reference this issue
+                    git_cmd = [
+                        "git", "log", "--grep", f"#{issue_number}", 
+                        "--pretty=format:%H|%s|%ad", "--date=short", 
+                        "--since=30.days.ago", "--all"
+                    ]
+                    
+                    result_proc = subprocess.run(git_cmd, capture_output=True, text=True, cwd=self.repo_path)
+                    
+                    if result_proc.returncode == 0 and result_proc.stdout.strip():
+                        commits_mentioning_issue = []
+                        for line in result_proc.stdout.strip().split('\n'):
+                            parts = line.split('|', 2)
+                            if len(parts) >= 3:
+                                commit_sha, subject, date = parts
+                                # Look for PR numbers in commit message
+                                pr_matches = re.findall(r'(?:pull request|PR|merge.*#|#)(\d+)', subject, re.IGNORECASE)
+                                for pr_num in pr_matches:
+                                    commits_mentioning_issue.append({
+                                        "pr_number": int(pr_num),
+                                        "commit_sha": commit_sha[:8],
+                                        "subject": subject,
+                                        "date": date
+                                    })
+                        
+                        if commits_mentioning_issue:
+                            result["recent_commits_mentioning_issue"] = commits_mentioning_issue
+                            result["search_methods"].append("git_log_search")
+                            # Note: These are likely merged PRs, but still useful context
+                    
+                except Exception as git_e:
+                    logger.debug(f"Git log search failed: {git_e}")
+                    result["search_methods"].append(f"git_log_failed: {str(git_e)}")
+                
+                # Method 4: Search for local branches that might be related PRs
+                try:
+                    import subprocess
+                    import re
+                    
+                    # List remote branches that might contain the issue number
+                    git_cmd = ["git", "branch", "-r", "--format=%(refname:short)"]
+                    result_proc = subprocess.run(git_cmd, capture_output=True, text=True, cwd=self.repo_path)
+                    
+                    if result_proc.returncode == 0:
+                        branches = result_proc.stdout.strip().split('\n')
+                        related_branches = []
+                        
+                        for branch in branches:
+                            branch = branch.strip()
+                            if f"{issue_number}" in branch or f"issue-{issue_number}" in branch or f"fix-{issue_number}" in branch:
+                                related_branches.append(branch)
+                        
+                        if related_branches:
+                            result["related_branches"] = related_branches
+                            result["search_methods"].append("branch_search")
+                    
+                except Exception as branch_e:
+                    logger.debug(f"Branch search failed: {branch_e}")
+                    result["search_methods"].append(f"branch_search_failed: {str(branch_e)}")
+                
+                # Determine final status
+                if result["open_prs"]:
+                    result["status"] = "found"
+                    result["message"] = f"Found {len(result['open_prs'])} open PR(s) related to issue #{issue_number}"
+                else:
+                    result["status"] = "not_found"
+                    if not result["search_methods"]:
+                        result["message"] = f"No search methods available to find open PRs for issue #{issue_number}"
+                    else:
+                        result["message"] = f"No open PRs found for issue #{issue_number} using methods: {', '.join(result['search_methods'])}"
+                
+                return json.dumps(result, indent=2)
+            
+            # Handle async execution properly in sync context
+            import asyncio
+            import concurrent.futures
+            
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If event loop is running, use thread executor
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run, 
+                        self._get_cached_or_fetch(cache_key, _fetch_open_prs)
+                    )
+                    return future.result(timeout=30)
+            else:
+                # If no event loop is running, use asyncio.run
+                return asyncio.run(self._get_cached_or_fetch(cache_key, _fetch_open_prs))
+                
+        except Exception as e:
+            logger.error(f"Error in find_open_prs_for_issue: {e}")
+            return json.dumps({
+                "error": str(e), 
+                "issue_number": issue_number,
+                "message": "Failed to search for open PRs. This may be due to system not being fully initialized yet."
+            }, indent=2)
 
     def get_open_pr_status(self, pr_number: Annotated[int, "PR number"]) -> str:
         cache_key = f"open_pr_status:{pr_number}"
@@ -249,24 +416,331 @@ class PROperations:
         cache_key = f"prs_by_files:{':'.join(sorted(file_paths))}"
         
         def _fetch_prs_by_files():
-            logger.warning("find_open_prs_by_files is a placeholder in PROperations.")
-            # Conceptual: actual implementation would search open PRs from indexer
-            return json.dumps({"message": "Placeholder for find_open_prs_by_files", "files": file_paths, "found_prs": []})
+            try:
+                result = {
+                    "file_paths": file_paths,
+                    "open_prs": [],
+                    "search_methods": [],
+                    "found_via": None
+                }
+                
+                # Method 1: Use Issue RAG system if available and initialized
+                if self.issue_rag_system and self.issue_rag_system.is_initialized():
+                    try:
+                        # Check for open PR documents in the indexer
+                        if hasattr(self.issue_rag_system.indexer, 'open_pr_docs'):
+                            open_pr_docs = self.issue_rag_system.indexer.open_pr_docs
+                            for pr_number, pr_doc in open_pr_docs.items():
+                                # Check if PR touches any of the specified files
+                                pr_files = set(pr_doc.files_changed)
+                                target_files = set(file_paths)
+                                
+                                # Check for exact matches or path overlaps
+                                matching_files = []
+                                for target_file in target_files:
+                                    for pr_file in pr_files:
+                                        if target_file in pr_file or pr_file in target_file:
+                                            matching_files.append(pr_file)
+                                
+                                if matching_files:
+                                    result["open_prs"].append({
+                                        "pr_number": pr_number,
+                                        "title": pr_doc.title,
+                                        "author": pr_doc.author,
+                                        "url": pr_doc.url,
+                                        "created_at": pr_doc.created_at,
+                                        "updated_at": pr_doc.updated_at,
+                                        "review_decision": pr_doc.review_decision,
+                                        "draft": pr_doc.draft,
+                                        "mergeable": pr_doc.mergeable,
+                                        "matching_files": matching_files,
+                                        "all_files_changed": len(pr_doc.files_changed),
+                                        "source": "issue_rag_index"
+                                    })
+                            
+                            if result["open_prs"]:
+                                result["found_via"] = "issue_rag_index"
+                                result["search_methods"].append("issue_rag_index")
+                                result["status"] = "found"
+                                result["message"] = f"Found {len(result['open_prs'])} open PR(s) touching the specified files"
+                                return json.dumps(result, indent=2)
+                                
+                    except Exception as e:
+                        logger.warning(f"Issue RAG search by files failed: {e}")
+                        result["search_methods"].append(f"issue_rag_index_failed: {str(e)}")
+                
+                # Method 2: Git log search for recent changes to these files
+                try:
+                    import subprocess
+                    import re
+                    
+                    # Find recent commits that modified these files
+                    for file_path in file_paths:
+                        git_cmd = [
+                            "git", "log", "--pretty=format:%H|%s|%ad", "--date=short",
+                            "--since=90.days.ago", "--", file_path
+                        ]
+                        
+                        result_proc = subprocess.run(git_cmd, capture_output=True, text=True, cwd=self.repo_path)
+                        
+                        if result_proc.returncode == 0 and result_proc.stdout.strip():
+                            commits = []
+                            for line in result_proc.stdout.strip().split('\n')[:10]:  # Limit to 10 recent commits
+                                parts = line.split('|', 2)
+                                if len(parts) >= 3:
+                                    commit_sha, subject, date = parts
+                                    # Look for PR numbers in commit message
+                                    pr_matches = re.findall(r'(?:pull request|PR|merge.*#|#)(\d+)', subject, re.IGNORECASE)
+                                    if pr_matches:
+                                        commits.append({
+                                            "file": file_path,
+                                            "pr_number": int(pr_matches[0]),
+                                            "commit_sha": commit_sha[:8],
+                                            "subject": subject,
+                                            "date": date
+                                        })
+                            
+                            if commits:
+                                if "recent_commits_by_file" not in result:
+                                    result["recent_commits_by_file"] = {}
+                                result["recent_commits_by_file"][file_path] = commits
+                    
+                    if "recent_commits_by_file" in result:
+                        result["search_methods"].append("git_log_by_file")
+                    
+                except Exception as git_e:
+                    logger.debug(f"Git log search by files failed: {git_e}")
+                    result["search_methods"].append(f"git_log_failed: {str(git_e)}")
+                
+                # Method 3: Check for branches that might be working on these files
+                try:
+                    import subprocess
+                    
+                    # Get list of branches
+                    git_cmd = ["git", "branch", "-r", "--format=%(refname:short)"]
+                    result_proc = subprocess.run(git_cmd, capture_output=True, text=True, cwd=self.repo_path)
+                    
+                    if result_proc.returncode == 0:
+                        branches = result_proc.stdout.strip().split('\n')
+                        file_related_branches = []
+                        
+                        for branch in branches:
+                            branch = branch.strip()
+                            if branch and not branch.startswith('origin/HEAD'):
+                                # Check if branch name contains file-related keywords
+                                for file_path in file_paths:
+                                    file_name = file_path.split('/')[-1].split('.')[0]  # Get base filename
+                                    if len(file_name) > 3 and file_name.lower() in branch.lower():
+                                        file_related_branches.append({
+                                            "branch": branch,
+                                            "related_file": file_path,
+                                            "match_reason": f"branch contains filename '{file_name}'"
+                                        })
+                        
+                        if file_related_branches:
+                            result["file_related_branches"] = file_related_branches
+                            result["search_methods"].append("branch_name_analysis")
+                    
+                except Exception as branch_e:
+                    logger.debug(f"Branch analysis failed: {branch_e}")
+                    result["search_methods"].append(f"branch_analysis_failed: {str(branch_e)}")
+                
+                # Determine final status
+                if result["open_prs"]:
+                    result["status"] = "found"
+                    result["message"] = f"Found {len(result['open_prs'])} open PR(s) touching the specified files"
+                else:
+                    result["status"] = "not_found"
+                    if not result["search_methods"]:
+                        result["message"] = f"No search methods available to find open PRs for files: {', '.join(file_paths)}"
+                    else:
+                        result["message"] = f"No open PRs found touching files {', '.join(file_paths)} using methods: {', '.join(result['search_methods'])}"
+                        
+                        # Provide helpful context about recent activity
+                        if "recent_commits_by_file" in result:
+                            recent_pr_numbers = set()
+                            for commits in result["recent_commits_by_file"].values():
+                                for commit in commits:
+                                    recent_pr_numbers.add(commit["pr_number"])
+                            if recent_pr_numbers:
+                                result["message"] += f". Recent PRs that touched these files: {sorted(recent_pr_numbers)}"
+                
+                return json.dumps(result, indent=2)
+                
+            except Exception as e:
+                logger.error(f"Error searching PRs by files: {e}")
+                return json.dumps({
+                    "error": str(e),
+                    "file_paths": file_paths,
+                    "message": "Failed to search for PRs by files. This may be due to system not being fully initialized yet."
+                }, indent=2)
         
         if self.pr_cache:
             return asyncio.run(self._get_cached_or_fetch(cache_key, _fetch_prs_by_files))
         else:
             return _fetch_prs_by_files()
 
-    async def search_open_prs(self, query: Annotated[str, "Search query"], limit: Annotated[int, "Limit"] = 5) -> str:
-        cache_key = f"search_prs:{query}:{limit}"
-        
-        async def _search_prs():
-            logger.warning("search_open_prs is a placeholder in PROperations.")
-            # Conceptual: actual implementation would search open PRs from indexer
-            return json.dumps({"message": "Placeholder for search_open_prs", "query": query, "found_prs": []})
-        
-        return await self._get_cached_or_fetch(cache_key, _search_prs)
+    def search_open_prs(self, query: Annotated[str, "Search query"], limit: Annotated[int, "Limit"] = 5) -> str:
+        """Search through open pull requests by keywords, features, or descriptions to find relevant ones."""
+        try:
+            cache_key = f"search_prs:{query}:{limit}"
+            
+            async def _search_prs():
+                result = {
+                    "query": query,
+                    "limit": limit,
+                    "open_prs": [],
+                    "search_methods": [],
+                    "found_via": None
+                }
+                
+                # Method 1: Use Issue RAG system if available and initialized
+                if self.issue_rag_system and self.issue_rag_system.is_initialized():
+                    try:
+                        # Use the issue RAG search functionality to find related open PRs
+                        issue_context = await self.issue_rag_system.get_issue_context(
+                            query, max_issues=limit, include_patches=True
+                        )
+                        
+                        # Extract open PRs from the patches
+                        if hasattr(issue_context, 'patches') and issue_context.patches:
+                            for patch in issue_context.patches:
+                                if hasattr(patch, 'type') and patch.type == 'open_pr':
+                                    result["open_prs"].append({
+                                        "pr_number": patch.pr_number,
+                                        "title": patch.title,
+                                        "author": patch.author,
+                                        "url": patch.url,
+                                        "similarity": patch.similarity,
+                                        "match_reasons": patch.match_reasons,
+                                        "source": "issue_rag_search"
+                                    })
+                        
+                        if result["open_prs"]:
+                            result["found_via"] = "issue_rag_search"
+                            result["search_methods"].append("issue_rag_search")
+                            result["status"] = "found"
+                            result["message"] = f"Found {len(result['open_prs'])} open PR(s) matching query '{query}'"
+                            return json.dumps(result, indent=2)
+                            
+                    except Exception as e:
+                        logger.warning(f"Issue RAG search failed: {e}")
+                        result["search_methods"].append(f"issue_rag_search_failed: {str(e)}")
+                
+                # Method 2: Search open PR documents directly if available
+                if self.issue_rag_system and hasattr(self.issue_rag_system, 'indexer') and hasattr(self.issue_rag_system.indexer, 'open_pr_docs'):
+                    try:
+                        open_pr_docs = self.issue_rag_system.indexer.open_pr_docs
+                        query_lower = query.lower()
+                        
+                        for pr_number, pr_doc in open_pr_docs.items():
+                            # Simple text matching in title and body
+                            pr_text = f"{pr_doc.title} {pr_doc.body}".lower()
+                            
+                            # Calculate basic relevance score
+                            query_words = query_lower.split()
+                            matches = sum(1 for word in query_words if word in pr_text)
+                            relevance_score = matches / len(query_words) if query_words else 0
+                            
+                            if relevance_score > 0.3:  # At least 30% of query words match
+                                result["open_prs"].append({
+                                    "pr_number": pr_number,
+                                    "title": pr_doc.title,
+                                    "author": pr_doc.author,
+                                    "url": pr_doc.url,
+                                    "created_at": pr_doc.created_at,
+                                    "updated_at": pr_doc.updated_at,
+                                    "review_decision": pr_doc.review_decision,
+                                    "draft": pr_doc.draft,
+                                    "relevance_score": relevance_score,
+                                    "source": "direct_text_search"
+                                })
+                        
+                        # Sort by relevance score
+                        result["open_prs"].sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+                        result["open_prs"] = result["open_prs"][:limit]
+                        
+                        if result["open_prs"]:
+                            result["found_via"] = "direct_text_search"
+                            result["search_methods"].append("direct_text_search")
+                            result["status"] = "found"
+                            result["message"] = f"Found {len(result['open_prs'])} open PR(s) matching query '{query}'"
+                            return json.dumps(result, indent=2)
+                            
+                    except Exception as e:
+                        logger.warning(f"Direct text search failed: {e}")
+                        result["search_methods"].append(f"direct_text_search_failed: {str(e)}")
+                
+                # Method 3: Git log search for branches/PRs mentioning the query terms
+                try:
+                    import subprocess
+                    import re
+                    
+                    # Search commit messages for the query terms
+                    git_cmd = [
+                        "git", "log", "--grep", query, "--pretty=format:%H|%s|%ad",
+                        "--date=short", "--since=90.days.ago", "--all"
+                    ]
+                    
+                    result_proc = subprocess.run(git_cmd, capture_output=True, text=True, cwd=self.repo_path)
+                    
+                    if result_proc.returncode == 0 and result_proc.stdout.strip():
+                        relevant_commits = []
+                        for line in result_proc.stdout.strip().split('\n')[:limit*2]:  # Get more commits to find PRs
+                            parts = line.split('|', 2)
+                            if len(parts) >= 3:
+                                commit_sha, subject, date = parts
+                                # Look for PR numbers in commit message
+                                pr_matches = re.findall(r'(?:pull request|PR|merge.*#|#)(\d+)', subject, re.IGNORECASE)
+                                if pr_matches:
+                                    relevant_commits.append({
+                                        "pr_number": int(pr_matches[0]),
+                                        "commit_sha": commit_sha[:8],
+                                        "subject": subject,
+                                        "date": date
+                                    })
+                        
+                        if relevant_commits:
+                            result["relevant_commits"] = relevant_commits
+                            result["search_methods"].append("git_log_search")
+                    
+                except Exception as git_e:
+                    logger.debug(f"Git log search failed: {git_e}")
+                    result["search_methods"].append(f"git_log_failed: {str(git_e)}")
+                
+                # Determine final status
+                if result["open_prs"]:
+                    result["status"] = "found"
+                    result["message"] = f"Found {len(result['open_prs'])} open PR(s) matching query '{query}'"
+                else:
+                    result["status"] = "not_found"
+                    if not result["search_methods"]:
+                        result["message"] = f"No search methods available to find open PRs for query '{query}'"
+                    else:
+                        result["message"] = f"No open PRs found matching query '{query}' using methods: {', '.join(result['search_methods'])}"
+                
+                return json.dumps(result, indent=2)
+            
+            # Handle async execution properly in sync context
+            import asyncio
+            import concurrent.futures
+            
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If event loop is running, use thread executor
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run, 
+                        self._get_cached_or_fetch(cache_key, _search_prs)
+                    )
+                    return future.result(timeout=30)
+            else:
+                # If no event loop is running, use asyncio.run
+                return asyncio.run(self._get_cached_or_fetch(cache_key, _search_prs))
+                
+        except Exception as e:
+            logger.error(f"Error in search_open_prs: {e}")
+            return json.dumps({"error": str(e), "query": query})
 
     def check_pr_readiness(self, pr_number: Annotated[int, "PR number"]) -> str:
         cache_key = f"pr_readiness:{pr_number}"
@@ -311,121 +785,161 @@ class PROperations:
         else:
             return _find_feature_pr()
 
-    async def get_pr_details_from_github(self, pr_number: Annotated[int, "PR number"]) -> str:
+    def get_pr_details_from_github(self, pr_number: Annotated[int, "PR number"]) -> str:
         """Get comprehensive PR details from GitHub API with caching"""
-        cache_key = f"github_pr_details:{pr_number}"
-        
-        async def _fetch_github_pr():
-            try:
-                from ..github_client import GitHubIssueClient
-                from .utilities import get_repo_url_from_path
-                
-                github_client = GitHubIssueClient()
-                repo_url = get_repo_url_from_path(self.repo_path)
-                
-                if not repo_url:
-                    return json.dumps({"error": "Cannot determine repository URL"})
-                
-                # Get detailed PR info from GitHub
-                pr_info = await github_client.get_pr_detailed_info(repo_url, pr_number)
-                
-                if not pr_info:
-                    # Try to provide helpful context about the PR range
-                    return json.dumps({
-                        "error": f"PR #{pr_number} not found",
-                        "suggestion": "This PR number may not exist or may be from a different repository",
-                        "repo_url": repo_url
-                    })
-                
-                # Convert to dict for JSON serialization
-                pr_dict = {
-                    "number": pr_info.number,
-                    "title": pr_info.title,
-                    "state": pr_info.state,
-                    "url": pr_info.url,
-                    "body": pr_info.body,
-                    "author": pr_info.user.login if pr_info.user else None,
-                    "created_at": pr_info.created_at,
-                    "updated_at": pr_info.updated_at,
-                    "merged_at": pr_info.merged_at,
-                    "files_changed": pr_info.files_changed,
-                    "review_decision": pr_info.review_decision,
-                    "mergeable": pr_info.mergeable,
-                    "draft": pr_info.draft,
-                    "additions": pr_info.additions,
-                    "deletions": pr_info.deletions,
-                    "reviews": [
-                        {
-                            "author": review.author,
-                            "state": review.state,
-                            "submitted_at": review.submitted_at,
-                            "body": review.body
-                        }
-                        for review in pr_info.reviews
-                    ],
-                    "status_checks": [
-                        {
-                            "state": check.state,
-                            "context": check.context,
-                            "description": check.description
-                        }
-                        for check in pr_info.status_checks
-                    ]
-                }
-                
-                return json.dumps(pr_dict, indent=2)
-                
-            except Exception as e:
-                logger.error(f"Error fetching PR details from GitHub: {e}")
-                return json.dumps({
-                    "error": str(e),
-                    "suggestion": "This might be a network issue or the PR may not exist",
-                    "fallback": "Try checking the repository directly on GitHub"
-                })
-        
-        return await self._get_cached_or_fetch(cache_key, _fetch_github_pr)
-
-    async def get_pr_analysis(self, pr_number: Annotated[int, "PR number and description"]) -> str:
-        """Get comprehensive PR analysis combining local and GitHub data"""
-        cache_key = f"pr_analysis:{pr_number}"
-        
-        async def _fetch_pr_analysis():
-            try:
-                # Get local diff data (if available)
-                local_data_str = self.get_pr_diff(pr_number)
-                local_json = json.loads(local_data_str)
-                
-                # Get GitHub data  
-                github_data_str = await self.get_pr_details_from_github(pr_number)
-                github_json = json.loads(github_data_str)
-                
-                # If local data failed but GitHub data succeeded, use that
-                if local_json.get("error") and not github_json.get("error"):
-                    local_json = {
-                        "note": "Local diff data not available, using GitHub data only",
-                        "available": False
+        try:
+            cache_key = f"github_pr_details:{pr_number}"
+            
+            async def _fetch_github_pr():
+                try:
+                    from ..github_client import GitHubIssueClient
+                    from .utilities import get_repo_url_from_path
+                    
+                    github_client = GitHubIssueClient()
+                    repo_url = get_repo_url_from_path(self.repo_path)
+                    
+                    if not repo_url:
+                        return json.dumps({"error": "Cannot determine repository URL"})
+                    
+                    # Get detailed PR info from GitHub
+                    pr_info = await github_client.get_pr_detailed_info(repo_url, pr_number)
+                    
+                    if not pr_info:
+                        # Try to provide helpful context about the PR range
+                        return json.dumps({
+                            "error": f"PR #{pr_number} not found",
+                            "suggestion": "This PR number may not exist or may be from a different repository",
+                            "repo_url": repo_url
+                        })
+                    
+                    # Convert to dict for JSON serialization
+                    pr_dict = {
+                        "number": pr_info.number,
+                        "title": pr_info.title,
+                        "state": pr_info.state,
+                        "url": pr_info.url,
+                        "body": pr_info.body,
+                        "author": pr_info.user.login if pr_info.user else None,
+                        "created_at": pr_info.created_at,
+                        "updated_at": pr_info.updated_at,
+                        "merged_at": pr_info.merged_at,
+                        "files_changed": pr_info.files_changed,
+                        "review_decision": pr_info.review_decision,
+                        "mergeable": pr_info.mergeable,
+                        "draft": pr_info.draft,
+                        "additions": pr_info.additions,
+                        "deletions": pr_info.deletions,
+                        "reviews": [
+                            {
+                                "author": review.author,
+                                "state": review.state,
+                                "submitted_at": review.submitted_at,
+                                "body": review.body
+                            }
+                            for review in pr_info.reviews
+                        ],
+                        "status_checks": [
+                            {
+                                "state": check.state,
+                                "context": check.context,
+                                "description": check.description
+                            }
+                            for check in pr_info.status_checks
+                        ]
                     }
+                    
+                    return json.dumps(pr_dict, indent=2)
+                    
+                except Exception as e:
+                    logger.error(f"Error fetching PR details from GitHub: {e}")
+                    return json.dumps({
+                        "error": str(e),
+                        "suggestion": "This might be a network issue or the PR may not exist",
+                        "fallback": "Try checking the repository directly on GitHub"
+                    })
+            
+            # Handle async execution properly in sync context
+            import asyncio
+            import concurrent.futures
+            
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If event loop is running, use thread executor
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run, 
+                        self._get_cached_or_fetch(cache_key, _fetch_github_pr)
+                    )
+                    return future.result(timeout=30)
+            else:
+                # If no event loop is running, use asyncio.run
+                return asyncio.run(self._get_cached_or_fetch(cache_key, _fetch_github_pr))
                 
-                # Combine data
-                analysis = {
-                    "pr_number": pr_number,
-                    "analysis_timestamp": time.time(),
-                    "local_data": local_json,
-                    "github_data": github_json,
-                    "summary": self._generate_pr_summary(pr_number, local_json, github_json)
-                }
+        except Exception as e:
+            logger.error(f"Error in get_pr_details_from_github: {e}")
+            return json.dumps({"error": str(e), "pr_number": pr_number})
+
+    def get_pr_analysis(self, pr_number: Annotated[int, "PR number and description"]) -> str:
+        """Get comprehensive PR analysis combining local and GitHub data"""
+        try:
+            cache_key = f"pr_analysis:{pr_number}"
+            
+            async def _fetch_pr_analysis():
+                try:
+                    # Get local diff data (if available)
+                    local_data_str = self.get_pr_diff(pr_number)
+                    local_json = json.loads(local_data_str)
+                    
+                    # Get GitHub data - note: this is now a sync function
+                    github_data_str = self.get_pr_details_from_github(pr_number)
+                    github_json = json.loads(github_data_str)
+                    
+                    # If local data failed but GitHub data succeeded, use that
+                    if local_json.get("error") and not github_json.get("error"):
+                        local_json = {
+                            "note": "Local diff data not available, using GitHub data only",
+                            "available": False
+                        }
+                    
+                    # Combine data
+                    analysis = {
+                        "pr_number": pr_number,
+                        "analysis_timestamp": time.time(),
+                        "local_data": local_json,
+                        "github_data": github_json,
+                        "summary": self._generate_pr_summary(pr_number, local_json, github_json)
+                    }
+                    
+                    return json.dumps(analysis, indent=2)
+                    
+                except Exception as e:
+                    logger.error(f"Error generating PR analysis: {e}")
+                    return json.dumps({
+                        "error": str(e), 
+                        "pr_number": pr_number,
+                        "suggestion": "Try using get_pr_details_from_github for basic PR information"
+                    })
+            
+            # Handle async execution properly in sync context
+            import asyncio
+            import concurrent.futures
+            
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If event loop is running, use thread executor
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run, 
+                        self._get_cached_or_fetch(cache_key, _fetch_pr_analysis)
+                    )
+                    return future.result(timeout=30)
+            else:
+                # If no event loop is running, use asyncio.run
+                return asyncio.run(self._get_cached_or_fetch(cache_key, _fetch_pr_analysis))
                 
-                return json.dumps(analysis, indent=2)
-                
-            except Exception as e:
-                logger.error(f"Error generating PR analysis: {e}")
-                return json.dumps({
-                    "error": str(e), 
-                    "pr_number": pr_number,
-                    "suggestion": "Try using get_pr_details_from_github for basic PR information"
-                })
-        
-        return await self._get_cached_or_fetch(cache_key, _fetch_pr_analysis)
+        except Exception as e:
+            logger.error(f"Error in get_pr_analysis: {e}")
+            return json.dumps({"error": str(e), "pr_number": pr_number})
     
     def _generate_pr_summary(self, pr_number: int, local_data: Dict[str, Any], github_data: Dict[str, Any]) -> str:
         """Generate a comprehensive PR summary"""

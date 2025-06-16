@@ -11,13 +11,16 @@ from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core.schema import Document
 from llama_index.retrievers.bm25 import BM25Retriever
 from llama_index.core.postprocessor import LLMRerank
+from llama_index.core.retrievers import QueryFusionRetriever
 from .config import settings
 from .local_repo_loader import clone_repo_to_temp, clone_repo_to_temp_persistent
 from .language_config import LANGUAGE_CONFIG, get_all_extensions, get_language_metadata
 from .llm_client import LLMClient
+from .agent_tools.llm_config import get_llm_instance
 from .cache import rag_cache, folder_cache
 import re
 import Stemmer
+import logging
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.tools import RetrieverTool
 from llama_index.core.schema import IndexNode
@@ -30,6 +33,8 @@ import asyncio
 from pathlib import Path
 import aiofiles # You would need to install aiofiles
 import aiofiles.os as aios
+
+logger = logging.getLogger(__name__)
 
 # Add a mapping for tree-sitter languages if necessary, or assume direct match
 TREE_SITTER_LANGUAGE_MAP = {
@@ -386,33 +391,74 @@ class LocalRepoContextExtractor:
     
     def _process_file_content(self, content: str, metadata: Dict[str, Any], file_path: str) -> str:
         """Process file content based on language-specific patterns."""
+        # Define safe limits for embedding (account for ~1.3x token-to-character ratio)
+        MAX_CONTENT_CHARS = 6000  # Safe limit well below 8192 tokens
+        MAX_SECTION_CHARS = 1000  # Limit for docs/imports sections
+        
         if metadata["language"] == "unknown":
-            return f"FILE_PATH: {file_path}\n{content}"
+            # Truncate unknown content to safe limits
+            truncated_content = content[:MAX_CONTENT_CHARS]
+            if len(content) > MAX_CONTENT_CHARS:
+                truncated_content += "\n... [Content truncated for embedding]"
+            return f"FILE_PATH: {file_path}\n{truncated_content}"
             
-        # Extract documentation
+        # Extract documentation with size limits
+        docs = "No documentation pattern available"
         if metadata["doc_pattern"]:
             doc_matches = re.findall(metadata["doc_pattern"], content, re.DOTALL | re.MULTILINE)
-            docs = "\n".join(doc_matches)
-        else:
-            docs = "No documentation pattern available"
+            if doc_matches:
+                docs_text = "\n".join(doc_matches)
+                if len(docs_text) > MAX_SECTION_CHARS:
+                    docs = docs_text[:MAX_SECTION_CHARS] + "... [Docs truncated]"
+                else:
+                    docs = docs_text
         
-        # Extract imports
+        # Extract imports with size limits
+        imports = "No import pattern available"
         if metadata["import_pattern"]:
             import_matches = re.findall(metadata["import_pattern"], content, re.MULTILINE)
-            # Handle tuples from regex patterns with multiple capture groups
-            if import_matches and isinstance(import_matches[0], tuple):
-                # Flatten tuples and filter out empty strings
-                import_list = []
-                for match in import_matches:
-                    for item in match:
-                        if item.strip():  # Only add non-empty strings
-                            import_list.append(item.strip())
-                imports = "\n".join(import_list)
-            else:
-                imports = "\n".join(import_matches)
-        else:
-            imports = "No import pattern available"
+            if import_matches:
+                # Handle tuples from regex patterns with multiple capture groups
+                if isinstance(import_matches[0], tuple):
+                    # Flatten tuples and filter out empty strings
+                    import_list = []
+                    for match in import_matches:
+                        for item in match:
+                            if item.strip():  # Only add non-empty strings
+                                import_list.append(item.strip())
+                    imports_text = "\n".join(import_list)
+                else:
+                    imports_text = "\n".join(import_matches)
+                
+                if len(imports_text) > MAX_SECTION_CHARS:
+                    imports = imports_text[:MAX_SECTION_CHARS] + "... [Imports truncated]"
+                else:
+                    imports = imports_text
         
+        # Calculate remaining space for actual code content
+        header_size = len(f"""FILE_PATH: {file_path}
+
+Language: {metadata["display_name"]}
+Description: {metadata["description"]}
+
+Imports:
+{imports}
+
+Documentation:
+{docs}
+
+Code:
+""")
+        
+        remaining_chars = MAX_CONTENT_CHARS - header_size
+        if remaining_chars < 500:  # Ensure minimum space for code
+            remaining_chars = 500
+            
+        # Truncate code content if necessary
+        truncated_content = content
+        if len(content) > remaining_chars:
+            truncated_content = content[:remaining_chars] + "\n... [Code truncated for embedding]"
+
         return f"""FILE_PATH: {file_path}
 
 Language: {metadata["display_name"]}
@@ -425,7 +471,7 @@ Documentation:
 {docs}
 
 Code:
-{content}
+{truncated_content}
 """
     
     async def load_repository(self, repo_url: str, branch: str = "main") -> None:
@@ -520,61 +566,101 @@ Code:
                             signature_identifiers=signature_identifiers or {},
                             code_splitter=CodeSplitter(
                                 language=tree_sitter_lang,
-                                chunk_lines=150, # Increased from 40 to show more actual code
-                                chunk_lines_overlap=50, # Increased from 15 for better context
-                                max_chars=8000 # Increased from 1500 to preserve actual code content
+                                chunk_lines=80, # Reduced from 150 to stay within token limits
+                                chunk_lines_overlap=20, # Reduced from 50 to stay within token limits
+                                max_chars=4000 # Reduced from 8000 to stay within OpenAI embedding token limits
                             )
                         )
                         nodes_for_doc = node_parser.get_nodes_from_documents([doc])
                         all_nodes.extend(nodes_for_doc)
                     except ImportError as e:
                         print(f"Warning: tree-sitter-language-pack not installed or language '{tree_sitter_lang}' not supported for CodeHierarchyNodeParser. Falling back to SimpleNodeParser for {doc.metadata.get('file_path')}. Error: {e}")
-                        simple_parser = SimpleNodeParser.from_defaults()
+                        simple_parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
                         all_nodes.extend(simple_parser.get_nodes_from_documents([doc]))
                     except ValueError as e:
                         print(f"Warning: Could not parse code for language '{tree_sitter_lang}' in file {doc.metadata.get('file_path')}: {e}. Falling back to SimpleNodeParser.")
-                        simple_parser = SimpleNodeParser.from_defaults()
+                        simple_parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
                         all_nodes.extend(simple_parser.get_nodes_from_documents([doc]))
                     except Exception as e:
                         # Catch any other exceptions including the "Language not yet supported" error
                         print(f"Warning: Unexpected error with CodeHierarchyNodeParser for language '{tree_sitter_lang}' in file {doc.metadata.get('file_path')}: {e}. Falling back to SimpleNodeParser.")
-                        simple_parser = SimpleNodeParser.from_defaults()
+                        simple_parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
                         all_nodes.extend(simple_parser.get_nodes_from_documents([doc]))
                 else:
                     # Fallback for truly unknown languages or non-code files
-                    simple_parser = SimpleNodeParser.from_defaults()
+                    simple_parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
                     all_nodes.extend(simple_parser.get_nodes_from_documents([doc]))
 
             # Fix any None relationships in nodes to prevent validation errors
             nodes = [fix_node_relationships(node) for node in all_nodes]
             # --- END: Changes for CodeHierarchyNodeParser ---
             
-            # Setup FAISS vector store
+            # Setup FAISS vector store with proper persistence
             persist_dir = f".faiss_index_{owner}_{repo}_{branch}"
-            os.makedirs(persist_dir, exist_ok=True)
-            faiss_index = faiss.IndexFlatL2(d)
-            vector_store = FaissVectorStore(faiss_index=faiss_index)
             
-            # Create storage context
-            storage_context = StorageContext.from_defaults(
-                vector_store=vector_store,
-                docstore=None,
-                index_store=None
-            )
+            # Check if persisted index exists and has required files
+            docstore_path = os.path.join(persist_dir, "docstore.json")
+            index_store_path = os.path.join(persist_dir, "index_store.json")
             
-            # Create vector index with FAISS
-            self.index = VectorStoreIndex(nodes, storage_context=storage_context)
-            self.index.storage_context.persist()
+            if (os.path.exists(persist_dir) and 
+                os.path.exists(docstore_path) and 
+                os.path.exists(index_store_path)):
+                try:
+                    logger.info(f"Loading existing FAISS index from {persist_dir}")
+                    # Load existing index - this should work since we checked files exist
+                    storage_context = StorageContext.from_defaults(persist_dir=persist_dir)
+                    self.vector_store = VectorStoreIndex.load_from_storage(storage_context)
+                    logger.info(f"Successfully loaded existing FAISS index")
+                    
+                    # When loading from storage, we need to recreate BM25 with the same nodes
+                    # Since BM25 retrievers are not persisted, we need the original nodes
+                    # We'll use the nodes we just created for consistency
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to load existing FAISS index: {e}, creating new index")
+                    # Fall back to creating new index - don't use persist_dir in StorageContext 
+                    # since the existing files might be corrupted
+                    faiss_index = faiss.IndexFlatL2(d)
+                    vector_store = FaissVectorStore(faiss_index=faiss_index)
+                    
+                    storage_context = StorageContext.from_defaults(
+                        vector_store=vector_store
+                    )
+                    
+                    logger.info(f"Creating new FAISS index with {len(nodes)} nodes (this will generate embeddings)")
+                    self.vector_store = VectorStoreIndex(nodes, storage_context=storage_context)
+                    self.vector_store.storage_context.persist(persist_dir=persist_dir)
+                    logger.info(f"Persisted new FAISS index to {persist_dir}")
+            else:
+                # Create new index - no existing files found
+                logger.info(f"No existing FAISS index found, creating new index at {persist_dir}")
+                os.makedirs(persist_dir, exist_ok=True)
+                faiss_index = faiss.IndexFlatL2(d)
+                vector_store = FaissVectorStore(faiss_index=faiss_index)
+                
+                # Don't use persist_dir in StorageContext since we're creating fresh
+                storage_context = StorageContext.from_defaults(
+                    vector_store=vector_store
+                )
+                
+                logger.info(f"Creating new FAISS index with {len(nodes)} nodes (this will generate embeddings)")
+                self.vector_store = VectorStoreIndex(nodes, storage_context=storage_context)
+                self.vector_store.storage_context.persist(persist_dir=persist_dir)
+                logger.info(f"Persisted new FAISS index to {persist_dir}")
 
+            # For backwards compatibility, also store as self.index
+            self.index = self.vector_store
+
+            # Create BM25 retriever - we need to recreate this as it's not persisted
             # Dynamically set similarity_top_k based on corpus size
             num_nodes = len(nodes)
             bm25_top_k = min(200, max(1, num_nodes // 3))  # Use 1/3 of nodes or 200, whichever is smaller
             dense_top_k = min(200, max(1, num_nodes // 3))  # Use 1/3 of nodes or 200, whichever is smaller
             
-            print(f"Number of nodes: {num_nodes}, BM25 top_k: {bm25_top_k}, Dense top_k: {dense_top_k}")
+            logger.info(f"Number of nodes: {num_nodes}, BM25 top_k: {bm25_top_k}, Dense top_k: {dense_top_k}")
 
             # Create BM25 retriever with proper configuration
-            bm25_retriever = BM25Retriever.from_defaults(
+            self.bm25_retriever = BM25Retriever.from_defaults(
                 nodes=nodes,
                 similarity_top_k=bm25_top_k,
                 stemmer=Stemmer.Stemmer("english"),
@@ -582,33 +668,21 @@ Code:
                 tokenizer=lambda t: re.split(r'[^A-Za-z0-9]', t.lower())
             )
 
-            # Create dense retriever
-            dense_retriever = self.index.as_retriever(similarity_top_k=dense_top_k)
-
-            # Create IndexNodes for each retriever
-            bm25_node = IndexNode(text="BM25 keyword retriever", index_id="bm25")
-            dense_node = IndexNode(text="Dense vector retriever", index_id="dense")
-
-            # Create a SummaryIndex with both nodes
-            summary_index = SummaryIndex([bm25_node, dense_node])
-
-            # Create a retriever dict
-            retriever_dict = {
-                "bm25": bm25_retriever,
-                "dense": dense_retriever,
-                "root": summary_index.as_retriever()
-            }
-
-            # Create RecursiveRetriever to ensemble both
-            hybrid_retriever = RecursiveRetriever(
-                root_id="root",
-                retriever_dict=retriever_dict
+            # Create hybrid retriever
+            vector_retriever = self.vector_store.as_retriever(similarity_top_k=dense_top_k)
+            self.hybrid_retriever = QueryFusionRetriever(
+                [vector_retriever, self.bm25_retriever],
+                similarity_top_k=200,
+                num_queries=1,
+                mode="reciprocal_rerank",
+                use_async=True,
+                verbose=True,
             )
-
-            # Add reranker for better results - increased top_n for better recall
+            
+            # Create reranker
             reranker = LLMRerank(
-                top_n=10,  
-                llm=self.llm_client._get_openrouter_llm(model="google/gemini-2.5-flash-preview-05-20")  
+                top_n=10,
+                llm=get_llm_instance()  # Use LLM from llm_config
             )
             
             # Store reranker for later access
@@ -616,7 +690,7 @@ Code:
             
             # Create query engine with hybrid retriever and reranker
             self.query_engine = RetrieverQueryEngine(
-                retriever=hybrid_retriever,
+                retriever=self.hybrid_retriever,
                 node_postprocessors=[reranker]
             )
             
@@ -953,3 +1027,161 @@ Code:
             
         except Exception as e:
             raise Exception(f"Failed to get issue context: {str(e)}")
+
+    async def _rebuild_indices_from_existing_repo(self) -> None:
+        """Rebuild RAG indices from an existing repository without re-cloning."""
+        if not self.current_repo_path or not os.path.exists(self.current_repo_path):
+            raise Exception(f"Repository path not found: {self.current_repo_path}")
+        
+        logger.info(f"Rebuilding RAG indices from existing repo at: {self.current_repo_path}")
+        
+        try:
+            # Process repository files (similar to load_repository but without cloning)
+            processed_documents = await self._process_repository_files()
+            logger.info(f"Processed {len(processed_documents)} documents for re-indexing")
+
+            if not processed_documents:
+                raise Exception("No documents found in repository for indexing")
+
+            # Build nodes and index (same logic as in load_repository)
+            all_nodes = []
+            for doc in processed_documents:
+                lang_metadata = get_language_metadata(doc.metadata.get("original_file_path", ""))
+                language_key = lang_metadata["language"]
+                tree_sitter_lang = TREE_SITTER_LANGUAGE_MAP.get(language_key, language_key)
+
+                if tree_sitter_lang != "unknown":
+                    try:
+                        query_file_path = os.path.join(LOCAL_QUERY_FILES_PATH, f"tree-sitter-{tree_sitter_lang}-tags.scm")
+                        
+                        if os.path.exists(query_file_path):
+                            code_splitter = CodeSplitter(
+                                language=tree_sitter_lang,
+                                chunk_lines=80,
+                                chunk_lines_overlap=20,
+                                max_chars=4000
+                            )
+                            parser = CodeHierarchyNodeParser(
+                                language=tree_sitter_lang,
+                                code_splitter=code_splitter
+                            )
+                            nodes = parser.get_nodes_from_documents([doc])
+                            all_nodes.extend(nodes)
+                        else:
+                            fallback_parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
+                            nodes = fallback_parser.get_nodes_from_documents([doc])
+                            all_nodes.extend(nodes)
+                    except Exception as e:
+                        logger.warning(f"Tree-sitter parsing failed for {tree_sitter_lang}: {e}")
+                        fallback_parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
+                        nodes = fallback_parser.get_nodes_from_documents([doc])
+                        all_nodes.extend(nodes)
+                else:
+                    fallback_parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
+                    nodes = fallback_parser.get_nodes_from_documents([doc])
+                    all_nodes.extend(nodes)
+
+            logger.info(f"Created {len(all_nodes)} nodes for vector indexing")
+
+            # Set up vector store
+            embed_model = OpenAIEmbedding(
+                model="text-embedding-3-small",
+                api_key=settings.openai_api_key
+            )
+            Settings.embed_model = embed_model
+
+            # Create hybrid retriever and index
+            self.vector_store = VectorStoreIndex(all_nodes)
+            self.bm25_retriever = BM25Retriever.from_defaults(nodes=all_nodes, similarity_top_k=200)
+            
+            vector_retriever = self.vector_store.as_retriever(similarity_top_k=200)
+            self.hybrid_retriever = QueryFusionRetriever(
+                [vector_retriever, self.bm25_retriever],
+                similarity_top_k=200,
+                num_queries=1,
+                mode="reciprocal_rerank",
+                use_async=True,
+                verbose=True,
+            )
+
+            # Create reranker and query engine
+            self.reranker = LLMRerank(
+                top_n=5,
+                llm=get_llm_instance()
+            )
+            self.query_engine = RetrieverQueryEngine.from_args(
+                retriever=self.hybrid_retriever,
+                node_postprocessors=[self.reranker],
+                llm=get_llm_instance()
+            )
+
+            logger.info(f"Successfully rebuilt RAG indices for repository at {self.current_repo_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to rebuild indices from existing repo: {e}")
+            raise
+
+    async def _process_repository_files(self) -> List[Document]:
+        """Process files from the existing repository path and return processed documents."""
+        if not self.current_repo_path:
+            raise Exception("No repository path set")
+        
+        # Load documents from the local repo using AsyncDirectoryReader
+        reader = AsyncDirectoryReader(
+            self.current_repo_path,
+            exclude_hidden=True,
+            recursive=True,
+            required_exts=self.all_extensions,
+            exclude=["*.png", "*.jpg", "*.jpeg", "*.gif", "*.svg", "*.ico", "*.json", "*.ipynb"]
+        )
+        documents = await reader.load_data()
+        
+        logger.info(f"Loaded {len(documents)} documents from repository")
+        
+        # Extract repo info from current path
+        # Assume repo path ends with owner/repo format
+        path_parts = self.current_repo_path.split(os.path.sep)
+        repo = path_parts[-1] if path_parts else "unknown"
+        owner = "unknown"  # We'll try to extract this from repo_info if available
+        
+        if hasattr(self, 'repo_info') and self.repo_info:
+            owner = self.repo_info.get("owner", "unknown")
+            repo = self.repo_info.get("repo", repo)
+        
+        # Process each document with language-specific metadata and ensure proper file paths
+        processed_documents = []
+        for doc in documents:
+            # Get the original FULL file path (not just filename)
+            original_file_path = doc.metadata.get("file_path", "") or doc.metadata.get("source", "")
+            
+            # Make the file path relative to the repository root
+            if original_file_path.startswith(self.current_repo_path):
+                relative_file_path = os.path.relpath(original_file_path, self.current_repo_path)
+            else:
+                relative_file_path = original_file_path
+            
+            # Get language metadata
+            metadata = get_language_metadata(original_file_path)
+            
+            # Process content based on language
+            processed_content = self._process_file_content(doc.text, metadata, relative_file_path)
+            
+            # Create a new document with processed content and corrected metadata
+            new_doc = Document(
+                text=processed_content,
+                metadata={
+                    **doc.metadata,
+                    "file_path": relative_file_path,  # Store the correct relative path
+                    "file_name": os.path.basename(original_file_path),  # Keep just the filename
+                    "original_file_path": original_file_path,  # Keep original for debugging
+                    "owner": owner,
+                    "repo": repo,
+                    "branch": "main",  # Default branch
+                    "language": metadata["language"],
+                    "display_name": metadata["display_name"],
+                    "description": metadata["description"]
+                }
+            )
+            processed_documents.append(new_doc)
+        
+        return processed_documents

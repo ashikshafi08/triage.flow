@@ -43,23 +43,63 @@ class LocalRepoContextExtractor:
     
     def _process_file_content(self, content: str, metadata: Dict[str, Any], file_path: str) -> str:
         """Process file content based on language-specific patterns."""
+        # Define safe limits for embedding (account for ~1.3x token-to-character ratio)
+        MAX_CONTENT_CHARS = 6000  # Safe limit well below 8192 tokens
+        MAX_SECTION_CHARS = 1000  # Limit for docs/imports sections
+        
         if metadata["language"] == "unknown":
-            return f"FILE_PATH: {file_path}\n{content}"
+            # Truncate unknown content to safe limits
+            truncated_content = content[:MAX_CONTENT_CHARS]
+            if len(content) > MAX_CONTENT_CHARS:
+                truncated_content += "\n... [Content truncated for embedding]"
+            return f"FILE_PATH: {file_path}\n{truncated_content}"
             
-        # Extract documentation
+        # Extract documentation with size limits
+        docs = "No documentation pattern available"
         if metadata["doc_pattern"]:
             doc_matches = re.findall(metadata["doc_pattern"], content, re.DOTALL | re.MULTILINE)
-            docs = "\n".join(doc_matches)
-        else:
-            docs = "No documentation pattern available"
+            if doc_matches:
+                docs_text = "\n".join(doc_matches)
+                if len(docs_text) > MAX_SECTION_CHARS:
+                    docs = docs_text[:MAX_SECTION_CHARS] + "... [Docs truncated]"
+                else:
+                    docs = docs_text
         
-        # Extract imports
+        # Extract imports with size limits
+        imports = "No import pattern available"
         if metadata["import_pattern"]:
             import_matches = re.findall(metadata["import_pattern"], content, re.MULTILINE)
-            imports = "\n".join(import_matches)
-        else:
-            imports = "No import pattern available"
+            if import_matches:
+                imports_text = "\n".join(import_matches)
+                if len(imports_text) > MAX_SECTION_CHARS:
+                    imports = imports_text[:MAX_SECTION_CHARS] + "... [Imports truncated]"
+                else:
+                    imports = imports_text
         
+        # Calculate remaining space for actual code content
+        header_size = len(f"""FILE_PATH: {file_path}
+
+Language: {metadata["display_name"]}
+Description: {metadata["description"]}
+
+Imports:
+{imports}
+
+Documentation:
+{docs}
+
+Code:
+""")
+        
+        remaining_chars = MAX_CONTENT_CHARS - header_size
+        if remaining_chars < 500:  # Ensure minimum space for code
+            remaining_chars = 500
+            
+        # Truncate code content if necessary
+        truncated_content = content
+        if len(content) > remaining_chars:
+            truncated_content = content[:remaining_chars] + "\n... [Code truncated for embedding]"
+
         return f"""FILE_PATH: {file_path}
 
 Language: {metadata["display_name"]}
@@ -72,7 +112,7 @@ Documentation:
 {docs}
 
 Code:
-{content}
+{truncated_content}
 """
     
     async def load_repository(self, repo_url: str, branch: str = "main") -> None:
@@ -144,7 +184,7 @@ Code:
                 processed_documents.append(new_doc)
             
             # Create nodes with metadata
-            parser = SimpleNodeParser.from_defaults()
+            parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
             nodes = parser.get_nodes_from_documents(processed_documents)
             
             # Setup FAISS vector store
