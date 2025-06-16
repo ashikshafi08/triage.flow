@@ -799,6 +799,20 @@ class CommitIndexer:
         with open(self.metadata_file, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, indent=2)
 
+    def get_recent_commits(self, limit: int = 100) -> List[CommitMeta]:
+        """Get recent commits without search, sorted by date"""
+        if not self.commit_metas:
+            return []
+        
+        # Sort commits by date (newest first) and return the requested number
+        sorted_commits = sorted(
+            self.commit_metas.values(),
+            key=lambda c: c.commit_date,
+            reverse=True
+        )
+        
+        return sorted_commits[:limit]
+
 
 class CommitRetriever:
     """Handles commit search and retrieval"""
@@ -851,6 +865,11 @@ class CommitRetriever:
     async def _dense_search(self, query: str, k: int) -> List[Dict]:
         """Perform dense vector search"""
         try:
+            # Handle empty or whitespace-only queries
+            if not query or not query.strip():
+                logger.debug("Dense search: Empty query provided, returning empty results")
+                return []
+            
             retriever = self.indexer.vector_index.as_retriever(similarity_top_k=k)
             nodes = retriever.retrieve(query)
             
@@ -874,6 +893,11 @@ class CommitRetriever:
     async def _sparse_search(self, query: str, k: int) -> List[Dict]:
         """Perform sparse BM25 search"""
         try:
+            # Handle empty or whitespace-only queries
+            if not query or not query.strip():
+                logger.debug("Sparse search: Empty query provided, returning empty results")
+                return []
+            
             nodes = self.indexer.bm25_retriever.retrieve(query)
             
             results = []
@@ -1098,6 +1122,12 @@ class CommitIndexManager:
         if not self.is_initialized():
             return None
         return self.retriever.get_commit_by_sha(sha)
+    
+    def get_recent_commits(self, limit: int = 100) -> List[CommitMeta]:
+        """Get recent commits without search, sorted by date"""
+        if not self._initialized:
+            return []
+        return self.indexer.get_recent_commits(limit)
     
     def get_statistics(self) -> Dict[str, Any]:
         """Get overall index statistics"""

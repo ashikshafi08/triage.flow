@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 import nest_asyncio
 import asyncio
 import logging
+import sys
 from typing import Optional
 from .api.middleware import setup_cors
 from .api.dependencies import session_manager
@@ -9,10 +10,12 @@ from .cache import cleanup_caches_periodically, initialize_redis_cache
 from .chunk_store import ChunkStoreFactory
 
 # Import routers
-from .api.routers import chat, sessions, repository, issues, timeline, agentic
+from .api.routers import chat, sessions, repository, issues, timeline, agentic, prediction
 
-# Enable nested event loops for Jupyter notebooks
-nest_asyncio.apply()
+# Only apply nest_asyncio if not running under uvicorn
+# uvloop (used by uvicorn) doesn't support nest_asyncio
+if 'uvicorn' not in sys.modules:
+    nest_asyncio.apply()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -34,6 +37,7 @@ app.include_router(repository.router)
 app.include_router(issues.router)
 app.include_router(timeline.router)
 app.include_router(agentic.router)
+app.include_router(prediction.router)
 
 # Background task to clean up old sessions
 async def cleanup_sessions_periodically():
