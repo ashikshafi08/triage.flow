@@ -625,18 +625,107 @@ class GitOperations:
 
     def get_commit_details(
         self,
-        commit_sha: Annotated[str, "Commit SHA to get details for (can be short or full SHA)"]
+        commit_sha: Annotated[Optional[str], "Commit SHA to get details for (can be short or full SHA)"] = None,
+        commit_identifier: Annotated[Optional[str], "Alternative commit identifier (SHA, tag, branch, etc.)"] = None,
+        commit_message: Annotated[Optional[str], "Commit message to search for if SHA not provided"] = None
     ) -> str:
+        """Get detailed information about a commit by SHA, identifier, or message pattern"""
         try:
+            # Determine which identifier to use
+            target_identifier = None
+            
+            if commit_sha:
+                target_identifier = commit_sha
+            elif commit_identifier:
+                target_identifier = commit_identifier
+            elif commit_message:
+                # Search for commit by message pattern
+                return self._find_commit_by_message(commit_message)
+            else:
+                return json.dumps({"error": "Must provide either commit_sha, commit_identifier, or commit_message"})
+            
+            # Try using commit index first
             if self.commit_index_manager.is_initialized():
-                commit_doc = self.commit_index_manager.get_commit_by_sha(commit_sha)
+                commit_doc = self.commit_index_manager.get_commit_by_sha(target_identifier)
                 if commit_doc:
                     return json.dumps(commit_doc.to_dict(), indent=2)
             
-            return self._get_commit_details_fallback(commit_sha)
+            return self._get_commit_details_fallback(target_identifier)
         except Exception as e:
             logger.error(f"Error in get_commit_details: {e}")
-            return self._get_commit_details_fallback(commit_sha)
+            return self._get_commit_details_fallback(target_identifier if 'target_identifier' in locals() else "unknown")
+
+    def _find_commit_by_message(self, commit_message: str) -> str:
+        """Find commit(s) by searching commit messages"""
+        try:
+            # First try exact grep match
+            cmd = ["git", "log", "--grep", commit_message, "--pretty=format:%H|%an|%ae|%ad|%s", "--max-count=5"]
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=self.repo_path)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                commits = []
+                for line in result.stdout.strip().split('\n'):
+                    parts = line.split('|', 4)
+                    if len(parts) >= 5:
+                        sha, author, email, date, subject = parts
+                        commits.append({
+                            "sha": sha,
+                            "author": author,
+                            "email": email,
+                            "date": date,
+                            "subject": subject
+                        })
+                
+                if len(commits) == 1:
+                    # If exactly one match, get full details
+                    return self._get_commit_details_fallback(commits[0]["sha"])
+                elif len(commits) > 1:
+                    # Multiple matches, return list
+                    return json.dumps({
+                        "search_message": commit_message,
+                        "multiple_matches": commits,
+                        "message": f"Found {len(commits)} commits matching the message. Use commit_sha with specific SHA for details."
+                    }, indent=2)
+            
+            # If no exact match, try partial matching
+            escaped_message = commit_message.replace('"', '\\"')
+            cmd = ["git", "log", "--grep", escaped_message, "-i", "--pretty=format:%H|%an|%ae|%ad|%s", "--max-count=10"]
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=self.repo_path)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                commits = []
+                for line in result.stdout.strip().split('\n'):
+                    parts = line.split('|', 4)
+                    if len(parts) >= 5:
+                        sha, author, email, date, subject = parts
+                        # Check if message contains our search term (case insensitive)
+                        if commit_message.lower() in subject.lower():
+                            commits.append({
+                                "sha": sha,
+                                "author": author,
+                                "email": email,
+                                "date": date,
+                                "subject": subject
+                            })
+                
+                if commits:
+                    if len(commits) == 1:
+                        return self._get_commit_details_fallback(commits[0]["sha"])
+                    else:
+                        return json.dumps({
+                            "search_message": commit_message,
+                            "partial_matches": commits,
+                            "message": f"Found {len(commits)} commits with similar messages. Use commit_sha with specific SHA for details."
+                        }, indent=2)
+            
+            return json.dumps({
+                "search_message": commit_message,
+                "error": "No commits found matching the message pattern"
+            })
+            
+        except Exception as e:
+            logger.error(f"Error searching commits by message: {e}")
+            return json.dumps({"error": str(e), "search_message": commit_message})
 
     def _get_commit_details_fallback(self, commit_sha: str) -> str:
         """Fallback method to get commit details using git show"""
