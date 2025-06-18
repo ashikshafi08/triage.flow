@@ -102,6 +102,7 @@ async def get_agentic_rag(session_id: str, session: Dict[str, Any] = Depends(get
                 logger.info(f"Restoring issue RAG for {repo_key}")
                 from ..issue_rag import IssueAwareRAG
                 
+                # Create a fresh IssueAwareRAG instance to avoid coroutine reuse issues
                 issue_rag = IssueAwareRAG(owner, repo)
                 # Load existing index without rebuild
                 await issue_rag.initialize(force_rebuild=False)

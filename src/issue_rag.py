@@ -1373,6 +1373,7 @@ class IssueAwareRAG:
         max_prs_for_patch_linkage: Optional[int] = None
     ) -> None:
         """Initialize the RAG system by building or loading the index"""
+        # Always create a fresh indexer to avoid coroutine reuse issues
         self.indexer = IssueIndexer(self.repo_owner, self.repo_name)
         
         # Check if we can load existing index FIRST (before expensive operations)
@@ -1385,7 +1386,7 @@ class IssueAwareRAG:
         # Only do expensive building if we need to rebuild or no cache exists
         logger.info(f"Building new index for {self.repo_owner}/{self.repo_name} (force_rebuild={force_rebuild})")
         
-        # Build patch linkage (expensive)
+        # Build patch linkage (expensive) - always create a fresh builder to avoid coroutine reuse
         builder = PatchLinkageBuilder(self.repo_owner, self.repo_name, self.progress_callback)
         await builder.build_patch_linkage(
             max_issues=max_issues_for_patch_linkage,

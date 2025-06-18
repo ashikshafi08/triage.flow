@@ -2,9 +2,53 @@
 
 from typing import List, TYPE_CHECKING
 from llama_index.core.tools import FunctionTool
+import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .core import AgenticCodebaseExplorer # To access ops instances
+
+def create_async_tool_wrapper(async_func, func_name: str):
+    """Create a synchronous wrapper for async functions to be used in tools"""
+    def sync_wrapper(*args, **kwargs):
+        try:
+            # Check if we're in an async context
+            try:
+                loop = asyncio.get_running_loop()
+                # We're in an async context, but we need to run the coroutine
+                # Use asyncio.create_task to properly handle it
+                import concurrent.futures
+                import threading
+                
+                # Create a new event loop in a separate thread
+                def run_in_thread():
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+                    try:
+                        return new_loop.run_until_complete(async_func(*args, **kwargs))
+                    finally:
+                        new_loop.close()
+                
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(run_in_thread)
+                    return future.result(timeout=60)  # 60 second timeout
+                    
+            except RuntimeError:
+                # No event loop running, we can use asyncio.run
+                return asyncio.run(async_func(*args, **kwargs))
+                
+        except Exception as e:
+            logger.error(f"Error in async tool wrapper for {func_name}: {e}")
+            import json
+            return json.dumps({"error": f"Tool execution failed: {str(e)}"})
+    
+    # Copy function metadata
+    sync_wrapper.__name__ = f"{func_name}_sync_wrapper"
+    sync_wrapper.__doc__ = getattr(async_func, '__doc__', '')
+    
+    return sync_wrapper
 
 def create_all_tools(explorer: 'AgenticCodebaseExplorer') -> List[FunctionTool]:
     """
@@ -110,7 +154,7 @@ def create_all_tools(explorer: 'AgenticCodebaseExplorer') -> List[FunctionTool]:
             fn=explorer.git_ops.search_commits, 
             name="search_commits",
             description="Semantic search over commit messages and metadata for deeper insights into code history"
-        ), # Async, ReAct agent handles this
+        ),
         FunctionTool.from_defaults(
             fn=explorer.git_ops.get_file_timeline, 
             name="get_file_timeline",
@@ -184,16 +228,17 @@ def create_all_tools(explorer: 'AgenticCodebaseExplorer') -> List[FunctionTool]:
             name="get_issue_resolution_summary",
             description="Summarizes how a specific issue was resolved, including linked PRs and a summary of changes."
         ),
+        # ASYNC TOOLS - Use wrapper for proper async handling
         FunctionTool.from_defaults(
-            fn=explorer.issue_ops.check_issue_status_and_linked_pr, 
+            fn=create_async_tool_wrapper(explorer.issue_ops.check_issue_status_and_linked_pr, "check_issue_status_and_linked_pr"), 
             name="check_issue_status_and_linked_pr",
             description="Checks the current status (open/closed) of a GitHub issue and lists any directly linked Pull Requests (both merged and open)."
-        ), # Async
+        ),
         FunctionTool.from_defaults(
-            fn=explorer.issue_ops.regression_detector, 
+            fn=create_async_tool_wrapper(explorer.issue_ops.regression_detector, "regression_detector"), 
             name="regression_detector",
             description="Detect if a new issue is a regression of a past one by analyzing similar closed issues"
-        ), # Async
+        ),
 
         # PROperations (delegates to IssueAwareRAG, GitHistoryTools, LLM)
         FunctionTool.from_defaults(

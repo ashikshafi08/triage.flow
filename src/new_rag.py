@@ -18,6 +18,7 @@ from .language_config import LANGUAGE_CONFIG, get_all_extensions, get_language_m
 from .llm_client import LLMClient
 from .agent_tools.llm_config import get_llm_instance
 from .cache import rag_cache, folder_cache
+from .enhanced_persistence import persistence_manager, IndexMetadata, FileChecksum
 import re
 import Stemmer
 import logging
@@ -33,6 +34,7 @@ import asyncio
 from pathlib import Path
 import aiofiles # You would need to install aiofiles
 import aiofiles.os as aios
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -490,176 +492,106 @@ Code:
             print(f"Cloned repository to: {repo_path}")
             self.current_repo_path = repo_path
             
-            # Load documents from the local repo using AsyncDirectoryReader
-            reader = AsyncDirectoryReader(
-                repo_path,
-                exclude_hidden=True,
-                recursive=True,
-                required_exts=self.all_extensions,
-                exclude=["*.png", "*.jpg", "*.jpeg", "*.gif", "*.svg", "*.ico", "*.json", "*.ipynb"]
-            )
-            documents = await reader.load_data()
-            
-            print(f"Loaded {len(documents)} documents from repository")
-            
             # Extract repo info from URL
             url_parts = repo_url.replace(".git", "").split('/')
             owner = url_parts[-2]
             repo = url_parts[-1]
             
-            # Process each document with language-specific metadata and ensure proper file paths
-            processed_documents = []
-            for doc in documents:
-                # Get the original FULL file path (not just filename)
-                original_file_path = doc.metadata.get("file_path", "") or doc.metadata.get("source", "")
-                
-                # Make the file path relative to the repository root
-                if original_file_path.startswith(repo_path):
-                    relative_file_path = os.path.relpath(original_file_path, repo_path)
-                else:
-                    relative_file_path = original_file_path
-                
-                # Get language metadata
-                metadata = get_language_metadata(original_file_path)
-                
-                # Process content based on language
-                processed_content = self._process_file_content(doc.text, metadata, relative_file_path)
-                
-                # Create a new document with processed content and corrected metadata
-                new_doc = Document(
-                    text=processed_content,
-                    metadata={
-                        **doc.metadata,
-                        "file_path": relative_file_path,  # Store the correct relative path
-                        "file_name": os.path.basename(original_file_path),  # Keep just the filename
-                        "original_file_path": original_file_path,  # Keep original for debugging
-                        "owner": owner,
-                        "repo": repo,
-                        "branch": branch,
-                        "language": metadata["language"],
-                        "display_name": metadata["display_name"],
-                        "description": metadata["description"]
-                    }
-                )
-                processed_documents.append(new_doc)
+            # Use enhanced persistence manager
+            index_dir = persistence_manager.get_index_dir(repo_url, branch)
             
-            # --- START: Changes for CodeHierarchyNodeParser ---
-            all_nodes = []
-            for doc in processed_documents:
-                lang_metadata = get_language_metadata(doc.metadata.get("original_file_path", ""))
-                language_key = lang_metadata["language"] # e.g., "python", "javascript"
-                tree_sitter_lang = TREE_SITTER_LANGUAGE_MAP.get(language_key, language_key)
-
-                if tree_sitter_lang != "unknown": # Only try CodeHierarchyNodeParser for known languages
+            # Check if we can load existing index
+            existing_metadata = persistence_manager.load_metadata(index_dir)
+            should_rebuild = True
+            
+            if existing_metadata and persistence_manager.validate_index_integrity(index_dir):
+                logger.info(f"Found existing index for {owner}/{repo}")
+                should_rebuild, change_info = persistence_manager.should_rebuild_index(
+                    existing_metadata, 
+                    Path(repo_path), 
+                    self.all_extensions
+                )
+                
+                if not should_rebuild:
+                    logger.info(f"Loading existing index: {change_info.get('reason', 'no changes detected')}")
                     try:
-                        # Check if we have a local query file for this language
-                        query_file_path = os.path.join(LOCAL_QUERY_FILES_PATH, f"tree-sitter-{tree_sitter_lang}-tags.scm")
-                        has_query_file = os.path.exists(query_file_path)
+                        # Load existing index
+                        storage_context = StorageContext.from_defaults(persist_dir=str(index_dir))
+                        self.vector_store = VectorStoreIndex.load_from_storage(storage_context)
+                        self.index = self.vector_store  # For backwards compatibility
                         
-                        # Get custom signature identifiers if available
-                        signature_identifiers = CUSTOM_SIGNATURE_IDENTIFIERS.get(tree_sitter_lang)
+                        # We still need to create BM25 and other components since they're not persisted
+                        await self._setup_retrievers_from_existing_index(existing_metadata, repo_path)
                         
-                        # Initialize CodeHierarchyNodeParser with the specific language
-                        # Provide empty dict as fallback for signature_identifiers to prevent pydantic validation errors
-                        node_parser = CodeHierarchyNodeParser(
-                            language=tree_sitter_lang,
-                            signature_identifiers=signature_identifiers or {},
-                            code_splitter=CodeSplitter(
-                                language=tree_sitter_lang,
-                                chunk_lines=80, # Reduced from 150 to stay within token limits
-                                chunk_lines_overlap=20, # Reduced from 50 to stay within token limits
-                                max_chars=4000 # Reduced from 8000 to stay within OpenAI embedding token limits
-                            )
-                        )
-                        nodes_for_doc = node_parser.get_nodes_from_documents([doc])
-                        all_nodes.extend(nodes_for_doc)
-                    except ImportError as e:
-                        print(f"Warning: tree-sitter-language-pack not installed or language '{tree_sitter_lang}' not supported for CodeHierarchyNodeParser. Falling back to SimpleNodeParser for {doc.metadata.get('file_path')}. Error: {e}")
-                        simple_parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
-                        all_nodes.extend(simple_parser.get_nodes_from_documents([doc]))
-                    except ValueError as e:
-                        print(f"Warning: Could not parse code for language '{tree_sitter_lang}' in file {doc.metadata.get('file_path')}: {e}. Falling back to SimpleNodeParser.")
-                        simple_parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
-                        all_nodes.extend(simple_parser.get_nodes_from_documents([doc]))
+                        # Update repo info
+                        self.repo_info = {
+                            "owner": owner,
+                            "repo": repo,
+                            "branch": branch,
+                            "url": repo_url,
+                            "languages": existing_metadata.to_dict().get("languages", {}),
+                            "repo_path": repo_path
+                        }
+                        
+                        # Invalidate file pattern cache when repo is reloaded
+                        self._invalidate_file_cache()
+                        
+                        logger.info(f"Successfully loaded existing index with {existing_metadata.total_nodes} nodes")
+                        return
+                        
                     except Exception as e:
-                        # Catch any other exceptions including the "Language not yet supported" error
-                        print(f"Warning: Unexpected error with CodeHierarchyNodeParser for language '{tree_sitter_lang}' in file {doc.metadata.get('file_path')}: {e}. Falling back to SimpleNodeParser.")
-                        simple_parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
-                        all_nodes.extend(simple_parser.get_nodes_from_documents([doc]))
+                        logger.warning(f"Failed to load existing index: {e}, rebuilding...")
+                        persistence_manager.cleanup_corrupted_index(index_dir)
+                        should_rebuild = True
                 else:
-                    # Fallback for truly unknown languages or non-code files
-                    simple_parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
-                    all_nodes.extend(simple_parser.get_nodes_from_documents([doc]))
-
-            # Fix any None relationships in nodes to prevent validation errors
-            nodes = [fix_node_relationships(node) for node in all_nodes]
-            # --- END: Changes for CodeHierarchyNodeParser ---
+                    logger.info(f"Rebuilding index: {change_info.get('reason', 'unknown')}")
+                    if change_info.get('total_changes', 0) > 0:
+                        logger.info(f"Changes: {change_info['total_changes']} files affected")
             
-            # Setup FAISS vector store with proper persistence
-            persist_dir = f".faiss_index_{owner}_{repo}_{branch}"
-            
-            # Check if persisted index exists and has required files
-            docstore_path = os.path.join(persist_dir, "docstore.json")
-            index_store_path = os.path.join(persist_dir, "index_store.json")
-            
-            if (os.path.exists(persist_dir) and 
-                os.path.exists(docstore_path) and 
-                os.path.exists(index_store_path)):
+            # Build new index if needed
+            if should_rebuild:
+                await self._build_new_index(repo_url, branch, repo_path, owner, repo, index_dir)
+                
+        except Exception as e:
+            raise Exception(f"Failed to load repository: {str(e)}")
+    
+    async def _setup_retrievers_from_existing_index(self, metadata: IndexMetadata, repo_path: str) -> None:
+        """Setup retrievers and query engine from existing index metadata"""
+        # We need to recreate the nodes for BM25 since it's not persisted
+        # But we can do this efficiently by only reading the files we know about
+        logger.info("Setting up retrievers from existing index...")
+        
+        # Create minimal documents for BM25 (we don't need full processing)
+        documents = []
+        for file_path, checksum in metadata.file_checksums.items():
+            full_path = Path(repo_path) / file_path
+            if full_path.exists():
                 try:
-                    logger.info(f"Loading existing FAISS index from {persist_dir}")
-                    # Load existing index - this should work since we checked files exist
-                    storage_context = StorageContext.from_defaults(persist_dir=persist_dir)
-                    self.vector_store = VectorStoreIndex.load_from_storage(storage_context)
-                    logger.info(f"Successfully loaded existing FAISS index")
+                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
                     
-                    # When loading from storage, we need to recreate BM25 with the same nodes
-                    # Since BM25 retrievers are not persisted, we need the original nodes
-                    # We'll use the nodes we just created for consistency
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to load existing FAISS index: {e}, creating new index")
-                    # Fall back to creating new index - don't use persist_dir in StorageContext 
-                    # since the existing files might be corrupted
-                    faiss_index = faiss.IndexFlatL2(d)
-                    vector_store = FaissVectorStore(faiss_index=faiss_index)
-                    
-                    storage_context = StorageContext.from_defaults(
-                        vector_store=vector_store
+                    # Create a simplified document
+                    doc = Document(
+                        text=content[:4000],  # Truncate for BM25
+                        metadata={
+                            "file_path": file_path,
+                            "file_name": Path(file_path).name,
+                        }
                     )
-                    
-                    logger.info(f"Creating new FAISS index with {len(nodes)} nodes (this will generate embeddings)")
-                    self.vector_store = VectorStoreIndex(nodes, storage_context=storage_context)
-                    self.vector_store.storage_context.persist(persist_dir=persist_dir)
-                    logger.info(f"Persisted new FAISS index to {persist_dir}")
-            else:
-                # Create new index - no existing files found
-                logger.info(f"No existing FAISS index found, creating new index at {persist_dir}")
-                os.makedirs(persist_dir, exist_ok=True)
-                faiss_index = faiss.IndexFlatL2(d)
-                vector_store = FaissVectorStore(faiss_index=faiss_index)
-                
-                # Don't use persist_dir in StorageContext since we're creating fresh
-                storage_context = StorageContext.from_defaults(
-                    vector_store=vector_store
-                )
-                
-                logger.info(f"Creating new FAISS index with {len(nodes)} nodes (this will generate embeddings)")
-                self.vector_store = VectorStoreIndex(nodes, storage_context=storage_context)
-                self.vector_store.storage_context.persist(persist_dir=persist_dir)
-                logger.info(f"Persisted new FAISS index to {persist_dir}")
-
-            # For backwards compatibility, also store as self.index
-            self.index = self.vector_store
-
-            # Create BM25 retriever - we need to recreate this as it's not persisted
-            # Dynamically set similarity_top_k based on corpus size
-            num_nodes = len(nodes)
-            bm25_top_k = min(200, max(1, num_nodes // 3))  # Use 1/3 of nodes or 200, whichever is smaller
-            dense_top_k = min(200, max(1, num_nodes // 3))  # Use 1/3 of nodes or 200, whichever is smaller
+                    documents.append(doc)
+                except Exception as e:
+                    logger.warning(f"Failed to read {file_path} for BM25: {e}")
+        
+        if documents:
+            # Create nodes for BM25
+            parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
+            nodes = parser.get_nodes_from_documents(documents)
             
-            logger.info(f"Number of nodes: {num_nodes}, BM25 top_k: {bm25_top_k}, Dense top_k: {dense_top_k}")
-
-            # Create BM25 retriever with proper configuration
+            # Setup BM25 retriever
+            num_nodes = len(nodes)
+            bm25_top_k = min(200, max(1, num_nodes // 3))
+            dense_top_k = min(200, max(1, num_nodes // 3))
+            
             self.bm25_retriever = BM25Retriever.from_defaults(
                 nodes=nodes,
                 similarity_top_k=bm25_top_k,
@@ -667,7 +599,7 @@ Code:
                 language="english",
                 tokenizer=lambda t: re.split(r'[^A-Za-z0-9]', t.lower())
             )
-
+            
             # Create hybrid retriever
             vector_retriever = self.vector_store.as_retriever(similarity_top_k=dense_top_k)
             self.hybrid_retriever = QueryFusionRetriever(
@@ -679,44 +611,202 @@ Code:
                 verbose=True,
             )
             
-            # Create reranker
-            reranker = LLMRerank(
+            # Create reranker and query engine
+            self.reranker = LLMRerank(
                 top_n=10,
-                llm=get_llm_instance()  # Use LLM from llm_config
+                llm=get_llm_instance()
             )
             
-            # Store reranker for later access
-            self.reranker = reranker
-            
-            # Create query engine with hybrid retriever and reranker
             self.query_engine = RetrieverQueryEngine(
                 retriever=self.hybrid_retriever,
-                node_postprocessors=[reranker]
+                node_postprocessors=[self.reranker]
             )
             
-            
-            # Get unique languages with their display names
-            languages = {}
-            for doc in processed_documents:
-                lang = doc.metadata.get("language")
-                if lang != "unknown":
-                    languages[lang] = doc.metadata.get("display_name", lang)
-            
-            self.repo_info = {
-                "owner": owner,
-                "repo": repo,
-                "branch": branch,
-                "url": repo_url,
-                "languages": languages,
-                "repo_path": repo_path  # Store the repo path for reference
-            }
-            
-            # Invalidate file pattern cache when repo is reloaded
-            self._invalidate_file_cache()
+            logger.info(f"Successfully setup retrievers with {len(nodes)} nodes")
+        else:
+            logger.warning("No documents found for BM25 setup")
     
-        except Exception as e:
-            raise Exception(f"Failed to load repository: {str(e)}")
-    
+    async def _build_new_index(self, repo_url: str, branch: str, repo_path: str, owner: str, repo: str, index_dir: Path) -> None:
+        """Build a completely new index"""
+        logger.info(f"Building new index for {owner}/{repo}")
+        
+        # Load documents from the local repo using AsyncDirectoryReader
+        reader = AsyncDirectoryReader(
+            repo_path,
+            exclude_hidden=True,
+            recursive=True,
+            required_exts=self.all_extensions,
+            exclude=["*.png", "*.jpg", "*.jpeg", "*.gif", "*.svg", "*.ico", "*.json", "*.ipynb"]
+        )
+        documents = await reader.load_data()
+        
+        print(f"Loaded {len(documents)} documents from repository")
+        
+        # Process each document with language-specific metadata and ensure proper file paths
+        processed_documents = []
+        for doc in documents:
+            # Get the original FULL file path (not just filename)
+            original_file_path = doc.metadata.get("file_path", "") or doc.metadata.get("source", "")
+            
+            # Make the file path relative to the repository root
+            if original_file_path.startswith(repo_path):
+                relative_file_path = os.path.relpath(original_file_path, repo_path)
+            else:
+                relative_file_path = original_file_path
+            
+            # Get language metadata
+            metadata = get_language_metadata(original_file_path)
+            
+            # Process content based on language
+            processed_content = self._process_file_content(doc.text, metadata, relative_file_path)
+            
+            # Create a new document with processed content and corrected metadata
+            new_doc = Document(
+                text=processed_content,
+                metadata={
+                    **doc.metadata,
+                    "file_path": relative_file_path,  # Store the correct relative path
+                    "file_name": os.path.basename(original_file_path),  # Keep just the filename
+                    "original_file_path": original_file_path,  # Keep original for debugging
+                    "owner": owner,
+                    "repo": repo,
+                    "branch": branch,
+                    "language": metadata["language"],
+                    "display_name": metadata["display_name"],
+                    "description": metadata["description"]
+                }
+            )
+            processed_documents.append(new_doc)
+        
+        # Create nodes using CodeHierarchyNodeParser
+        all_nodes = []
+        for doc in processed_documents:
+            lang_metadata = get_language_metadata(doc.metadata.get("original_file_path", ""))
+            language_key = lang_metadata["language"]
+            tree_sitter_lang = TREE_SITTER_LANGUAGE_MAP.get(language_key, language_key)
+
+            if tree_sitter_lang != "unknown":
+                try:
+                    signature_identifiers = CUSTOM_SIGNATURE_IDENTIFIERS.get(tree_sitter_lang)
+                    
+                    node_parser = CodeHierarchyNodeParser(
+                        language=tree_sitter_lang,
+                        signature_identifiers=signature_identifiers or {},
+                        code_splitter=CodeSplitter(
+                            language=tree_sitter_lang,
+                            chunk_lines=80,
+                            chunk_lines_overlap=20,
+                            max_chars=4000
+                        )
+                    )
+                    nodes_for_doc = node_parser.get_nodes_from_documents([doc])
+                    all_nodes.extend(nodes_for_doc)
+                except Exception as e:
+                    print(f"Warning: CodeHierarchyNodeParser failed for {tree_sitter_lang}: {e}. Using SimpleNodeParser.")
+                    simple_parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
+                    all_nodes.extend(simple_parser.get_nodes_from_documents([doc]))
+            else:
+                simple_parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
+                all_nodes.extend(simple_parser.get_nodes_from_documents([doc]))
+
+        # Fix any None relationships in nodes
+        nodes = [fix_node_relationships(node) for node in all_nodes]
+        
+        # Create FAISS vector store
+        d = 1536  # text-embedding-3-small dimensions
+        faiss_index = faiss.IndexFlatL2(d)
+        vector_store = FaissVectorStore(faiss_index=faiss_index)
+        
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        
+        logger.info(f"Creating new FAISS index with {len(nodes)} nodes (this will generate embeddings)")
+        self.vector_store = VectorStoreIndex(nodes, storage_context=storage_context)
+        
+        # Persist to the enhanced persistence directory
+        self.vector_store.storage_context.persist(persist_dir=str(index_dir))
+        logger.info(f"Persisted new FAISS index to {index_dir}")
+
+        # For backwards compatibility
+        self.index = self.vector_store
+
+        # Create BM25 retriever
+        num_nodes = len(nodes)
+        bm25_top_k = min(200, max(1, num_nodes // 3))
+        dense_top_k = min(200, max(1, num_nodes // 3))
+        
+        logger.info(f"Number of nodes: {num_nodes}, BM25 top_k: {bm25_top_k}, Dense top_k: {dense_top_k}")
+
+        self.bm25_retriever = BM25Retriever.from_defaults(
+            nodes=nodes,
+            similarity_top_k=bm25_top_k,
+            stemmer=Stemmer.Stemmer("english"),
+            language="english",
+            tokenizer=lambda t: re.split(r'[^A-Za-z0-9]', t.lower())
+        )
+
+        # Create hybrid retriever
+        vector_retriever = self.vector_store.as_retriever(similarity_top_k=dense_top_k)
+        self.hybrid_retriever = QueryFusionRetriever(
+            [vector_retriever, self.bm25_retriever],
+            similarity_top_k=200,
+            num_queries=1,
+            mode="reciprocal_rerank",
+            use_async=True,
+            verbose=True,
+        )
+        
+        # Create reranker and query engine
+        self.reranker = LLMRerank(
+            top_n=10,
+            llm=get_llm_instance()
+        )
+        
+        self.query_engine = RetrieverQueryEngine(
+            retriever=self.hybrid_retriever,
+            node_postprocessors=[self.reranker]
+        )
+        
+        # Get unique languages with their display names
+        languages = {}
+        for doc in processed_documents:
+            lang = doc.metadata.get("language")
+            if lang != "unknown":
+                languages[lang] = doc.metadata.get("display_name", lang)
+        
+        # Update repo info
+        self.repo_info = {
+            "owner": owner,
+            "repo": repo,
+            "branch": branch,
+            "url": repo_url,
+            "languages": languages,
+            "repo_path": repo_path
+        }
+        
+        # Save enhanced metadata
+        file_checksums = persistence_manager.scan_repository_files(Path(repo_path), self.all_extensions)
+        
+        metadata = IndexMetadata(
+            repo_url=repo_url,
+            branch=branch,
+            owner=owner,
+            repo=repo,
+            total_files=len(processed_documents),
+            total_nodes=len(nodes),
+            created_at=datetime.now().isoformat(),
+            last_updated=datetime.now().isoformat(),
+            index_version="2.0",
+            embedding_model="text-embedding-3-small",
+            file_checksums=file_checksums
+        )
+        
+        persistence_manager.save_metadata(index_dir, metadata)
+        
+        # Invalidate file pattern cache
+        self._invalidate_file_cache()
+        
+        logger.info(f"Successfully built and saved new index for {owner}/{repo}")
+
     def _calculate_query_complexity(self, query: str, restrict_files: Optional[List[str]] = None) -> int:
         """Calculate query complexity score to determine optimal retrieval depth."""
         complexity = 0

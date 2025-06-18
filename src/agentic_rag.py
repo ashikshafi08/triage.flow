@@ -227,9 +227,20 @@ class AgenticRAGSystem:
             session["metadata"]["status"] = "issue_linking" 
             session["metadata"]["message"] = f"Starting issue linking and indexing for {owner}/{repo_name}..."
             
-            # Create IssueAwareRAG with progress callback
+            # Create fresh IssueAwareRAG with progress callback to avoid coroutine reuse
             self.issue_rag = IssueAwareRAG(owner, repo_name, progress_callback)
-            await self.issue_rag.initialize(force_rebuild=False) 
+            
+            # Initialize with explicit error handling for coroutine reuse
+            try:
+                await self.issue_rag.initialize(force_rebuild=False) 
+            except RuntimeError as re:
+                if "cannot reuse already awaited coroutine" in str(re):
+                    logger.warning(f"Session {self.session_id}: Coroutine reuse detected, retrying with force rebuild...")
+                    # Create a completely fresh instance and force rebuild
+                    self.issue_rag = IssueAwareRAG(owner, repo_name, progress_callback)
+                    await self.issue_rag.initialize(force_rebuild=True)
+                else:
+                    raise re
             
             if self.agentic_explorer: 
                 self.agentic_explorer.issue_rag_system = self.issue_rag
@@ -251,6 +262,11 @@ class AgenticRAGSystem:
 
         except Exception as e:
             logger.error(f"Session {self.session_id}: Failed to initialize IssueAwareRAG for {owner}/{repo_name}: {e}")
+            
+            # Log more detailed error information for debugging
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            
             self.issue_rag = None # Ensure it's None if init failed
             session["metadata"]["issue_rag_ready"] = False
             session["metadata"]["status"] = "warning_issue_rag_failed"

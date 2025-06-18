@@ -51,10 +51,15 @@ async def get_issue_context_api(request: IssueContextRequest):
         raise HTTPException(status_code=500, detail=f"An internal server error occurred: {str(e)}")
 
 @router.get("/issues")
-async def list_issues(repo_url: str, state: str = "open"):
+async def list_issues(
+    repo_url: str, 
+    state: str = "open",
+    per_page: int = Query(30, description="Number of issues per page (max 100)", ge=1, le=100),
+    max_pages: int = Query(10, description="Maximum number of pages to fetch", ge=1, le=50)
+):
     """List issues for a given repository URL and state (open/closed/all)."""
     try:
-        issues = await github_client.list_issues(repo_url, state)
+        issues = await github_client.list_issues(repo_url, state, per_page=per_page, max_pages=max_pages)
         # Convert Issue objects to dicts for JSON serialization
         return [issue.model_dump() for issue in issues]
     except Exception as e:

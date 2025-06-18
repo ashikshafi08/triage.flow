@@ -161,6 +161,12 @@ class Settings(BaseSettings):
         "max_chunk_size": 8192,  # 8KB max chunk size
     }
     
+    # Enhanced Persistence Settings
+    ENABLE_ENHANCED_PERSISTENCE: bool = True
+    PERSISTENCE_BASE_DIR: str = ".index_cache"
+    INDEX_REBUILD_THRESHOLD: float = 0.1  # Rebuild if >10% of files changed
+    INDEX_REBUILD_MIN_FILES: int = 50  # Or if >50 files changed
+    
     class Config:
         env_file = ".env"
 

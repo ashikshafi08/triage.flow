@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from tqdm.auto import tqdm
 from collections import defaultdict
 import re
+import uuid
 
 from src.config import settings
 
@@ -120,10 +121,12 @@ class PatchLinkageBuilder:
         self.diffs_dir = self.index_dir / "diffs"
         self.diffs_dir.mkdir(exist_ok=True)
         
-        # Cache for PR data to avoid duplicate fetches
+        # Cache for PR data to avoid duplicate fetches - ensure isolation per instance
         self.pr_cache = {}
+        # Add instance-specific ID to help with debugging coroutine reuse issues
+        self.instance_id = str(uuid.uuid4())[:8]
         
-        logger.info(f"Initialized PatchLinkageBuilder for {self.repo_key}")
+        logger.info(f"Initialized PatchLinkageBuilder for {self.repo_key} (instance: {self.instance_id})")
         logger.info(f"Index directory: {self.index_dir}")
         logger.info(f"Diffs directory: {self.diffs_dir}")
         
@@ -310,11 +313,13 @@ class PatchLinkageBuilder:
                 
                 # Prepare all diff download tasks
                 diff_tasks = []
+                task_sources = []  # Track what each task index corresponds to
                 
                 # Add tasks for issue-linked PRs
                 for link in all_patch_links:
                     task = self._download_single_diff(session, link)
                     diff_tasks.append(task)
+                    task_sources.append(('patch_link', link))
                 
                 # Add tasks for standalone merged PRs (avoid duplicates)
                 linked_pr_numbers = {link.pr_number for link in all_patch_links}
@@ -332,6 +337,7 @@ class PatchLinkageBuilder:
                         )
                         task = self._download_single_diff(session, link)
                         diff_tasks.append(task)
+                        task_sources.append(('merged_pr', link))
                 
                 # Download diffs in batches to avoid overwhelming the API
                 batch_size = 10  # Reduced from 20 to be more conservative
@@ -397,9 +403,21 @@ class PatchLinkageBuilder:
                                 total_items=total_diffs,
                                 current_item=f"Retry {idx_num + 1}/{len(failed_downloads)}"
                             )
-                            result = await diff_tasks[idx]
-                            if result and not isinstance(result, Exception):
-                                all_diff_docs.append(result)
+                            
+                            # Create a fresh coroutine for retry instead of reusing the awaited one
+                            if idx < len(task_sources):
+                                source_type, link = task_sources[idx]
+                                fresh_task = self._download_single_diff(session, link)
+                            else:
+                                logger.warning(f"Invalid retry index {idx}, skipping")
+                                continue
+                            
+                            try:
+                                result = await fresh_task
+                                if result and not isinstance(result, Exception):
+                                    all_diff_docs.append(result)
+                            except Exception as e:
+                                logger.warning(f"Retry failed for diff {idx}: {e}")
                 
                 self._report_progress(
                     stage="processing_diffs",
