@@ -446,12 +446,33 @@ class IssueIndexer:
         except Exception as e:
             logger.warning(f"Error during index cleanup: {e}")
 
-    def _save_faiss_index(self, nodes):
+    def _save_faiss_index(self, nodes, append: bool = False):
         """Save the FAISS index and node data to disk."""
         # Access the internal _faiss_index attribute of FaissVectorStore
         faiss.write_index(self.vector_index.vector_store._faiss_index, str(self.faiss_index_file))
-        with open(self.faiss_nodes_file, "w") as f:
-            json.dump([n.dict() for n in nodes], f)
+        
+        # Handle node data - append or overwrite
+        if append and self.faiss_nodes_file.exists():
+            # Load existing nodes and append new ones
+            try:
+                with open(self.faiss_nodes_file, "r") as f:
+                    existing_nodes = json.load(f)
+                
+                # Append new nodes
+                all_nodes = existing_nodes + [n.dict() for n in nodes]
+                
+                with open(self.faiss_nodes_file, "w") as f:
+                    json.dump(all_nodes, f)
+                    
+                logger.info(f"Appended {len(nodes)} nodes to existing {len(existing_nodes)} nodes")
+            except Exception as e:
+                logger.warning(f"Failed to append nodes, overwriting: {e}")
+                with open(self.faiss_nodes_file, "w") as f:
+                    json.dump([n.dict() for n in nodes], f)
+        else:
+            # Overwrite with new nodes
+            with open(self.faiss_nodes_file, "w") as f:
+                json.dump([n.dict() for n in nodes], f)
 
     async def _save_metadata(self, total_issues: int, total_docs: int) -> None:
         """Save metadata about the index"""
@@ -1478,6 +1499,235 @@ class IssueAwareRAG:
         if self._initialized:
             await self.indexer.crawl_and_index_issues()
             self.retriever = IssueRetriever(self.indexer)
+    
+    async def incremental_sync(self, max_new_issues: Optional[int] = None, max_new_prs: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Perform incremental sync to update only new/changed issues and PRs
+        Returns sync statistics
+        """
+        if not self._initialized:
+            # If not initialized, do full initialization
+            await self.initialize()
+            return {"status": "full_initialization", "reason": "system_not_initialized"}
+        
+        from .enhanced_persistence import persistence_manager
+        
+        logger.info(f"Starting incremental sync for {self.repo_owner}/{self.repo_name}")
+        
+        # Get existing sync metadata
+        index_dir = self.indexer.index_dir
+        sync_metadata = persistence_manager.load_sync_metadata(index_dir)
+        
+        # Check if we should sync
+        should_sync, sync_info = persistence_manager.should_sync_issues(sync_metadata, force_sync=False)
+        
+        if not should_sync:
+            logger.info(f"Skipping sync: {sync_info.get('reason')} (last sync {sync_info.get('hours_since_sync', 0):.1f} hours ago)")
+            return {
+                "status": "skipped",
+                "reason": sync_info.get("reason"),
+                "hours_since_last_sync": sync_info.get("hours_since_sync", 0),
+                "last_sync": sync_metadata.get("last_issue_sync")
+            }
+        
+        try:
+            # Perform incremental issue sync
+            new_issues_count = await self._sync_new_issues(max_new_issues)
+            
+            # Perform incremental PR sync
+            new_prs_count = await self._sync_new_prs(max_new_prs)
+            
+            # Update sync metadata
+            persistence_manager.save_sync_metadata(
+                index_dir, 
+                self.repo_owner, 
+                self.repo_name,
+                issues_synced=new_issues_count,
+                prs_synced=new_prs_count
+            )
+            
+            # Rebuild retriever if we added new content
+            if new_issues_count > 0 or new_prs_count > 0:
+                logger.info("Rebuilding retriever with new content...")
+                self.retriever = IssueRetriever(self.indexer)
+            
+            sync_result = {
+                "status": "completed",
+                "reason": sync_info.get("reason"),
+                "new_issues": new_issues_count,
+                "new_prs": new_prs_count,
+                "total_new_items": new_issues_count + new_prs_count,
+                "sync_time": datetime.now().isoformat()
+            }
+            
+            logger.info(f"Incremental sync completed: {new_issues_count} new issues, {new_prs_count} new PRs")
+            return sync_result
+            
+        except Exception as e:
+            logger.error(f"Error during incremental sync: {e}")
+            return {
+                "status": "error",
+                "error": str(e),
+                "sync_time": datetime.now().isoformat()
+            }
+    
+    async def _sync_new_issues(self, max_new_issues: Optional[int] = None) -> int:
+        """Sync new issues that aren't in our index yet"""
+        try:
+            # Get current issues from our index
+            existing_issue_ids = set(self.indexer.issue_docs.keys())
+            
+            # Fetch recent issues from GitHub
+            repo_url = f"https://github.com/{self.repo_owner}/{self.repo_name}"
+            recent_issues = await self.indexer.github_client.list_issues(
+                repo_url, 
+                state="all", 
+                max_pages=5  # Limit to recent issues for incremental sync
+            )
+            
+            # Filter to only new issues
+            new_issues = []
+            for issue in recent_issues:
+                if issue.id not in existing_issue_ids:
+                    new_issues.append(issue)
+            
+            # Limit if requested
+            if max_new_issues and len(new_issues) > max_new_issues:
+                new_issues = new_issues[:max_new_issues]
+                logger.info(f"Limited new issues to {max_new_issues} (found {len(new_issues)} total)")
+            
+            if not new_issues:
+                logger.info("No new issues found during incremental sync")
+                return 0
+            
+            logger.info(f"Found {len(new_issues)} new issues to index")
+            
+            # Add new issues to our index
+            await self._add_issues_to_index(new_issues)
+            
+            return len(new_issues)
+            
+        except Exception as e:
+            logger.error(f"Error syncing new issues: {e}")
+            return 0
+    
+    async def _sync_new_prs(self, max_new_prs: Optional[int] = None) -> int:
+        """Sync new PRs that aren't in our patch linkage yet"""
+        try:
+            # Get existing PR numbers from patch linkage
+            existing_diff_docs = self.indexer.patch_builder.load_diff_docs()
+            existing_pr_numbers = {doc.pr_number for doc in existing_diff_docs}
+            
+            # For incremental sync, we'll fetch recent merged PRs and check which are new
+            logger.info("Checking for new merged PRs...")
+            
+            # Use the patch builder to check for new PRs
+            # This is a simplified approach - in a full implementation, you'd want
+            # to fetch recent PRs from GitHub API and compare
+            
+            # For now, we'll trigger a limited patch linkage build for recent PRs
+            max_prs_to_check = max_new_prs or 50  # Check recent PRs
+            
+            # Create a new patch builder instance for incremental sync
+            from .patch_linkage import PatchLinkageBuilder
+            patch_builder = PatchLinkageBuilder(self.repo_owner, self.repo_name)
+            
+            # Build patch linkage for recent PRs only
+            await patch_builder.build_patch_linkage(
+                max_issues=max_prs_to_check,  # Limit scope for incremental
+                max_prs=max_prs_to_check,
+                download_diffs=True,
+                include_open_prs=True
+            )
+            
+            # Count new PRs added
+            new_diff_docs = patch_builder.load_diff_docs()
+            new_pr_numbers = {doc.pr_number for doc in new_diff_docs}
+            
+            truly_new_prs = new_pr_numbers - existing_pr_numbers
+            new_prs_count = len(truly_new_prs)
+            
+            if new_prs_count > 0:
+                logger.info(f"Found {new_prs_count} new PRs: {list(truly_new_prs)}")
+                # The patch builder already saved the new data, so we just need to
+                # reload our indexer's patch data
+                self.indexer.patch_builder = patch_builder
+            else:
+                logger.info("No new PRs found during incremental sync")
+            
+            return new_prs_count
+            
+        except Exception as e:
+            logger.error(f"Error syncing new PRs: {e}")
+            return 0
+    
+    async def _add_issues_to_index(self, new_issues: List[Any]) -> None:
+        """Add new issues to the existing index"""
+        if not new_issues:
+            return
+        
+        logger.info(f"Adding {len(new_issues)} new issues to index...")
+        
+        try:
+            # Convert issues to documents
+            new_documents = []
+            
+            for issue in new_issues:
+                # Add to issue_docs dict
+                issue_doc = IssueDoc(
+                    id=issue.id,
+                    title=issue.title,
+                    body=issue.body or "",
+                    state=issue.state,
+                    labels=[label.name for label in issue.labels],
+                    created_at=issue.created_at,
+                    updated_at=issue.updated_at,
+                    closed_at=issue.closed_at,
+                    user=issue.user.login if issue.user else "unknown",
+                    comments=getattr(issue, 'comments', 0),
+                    url=issue.url,
+                    assignees=[assignee.login for assignee in getattr(issue, 'assignees', [])]
+                )
+                
+                self.indexer.issue_docs[issue.id] = issue_doc
+                
+                # Create document for vector indexing
+                content = f"Title: {issue.title}\n\nBody: {issue.body or ''}"
+                if issue.labels:
+                    content += f"\n\nLabels: {', '.join([label.name for label in issue.labels])}"
+                
+                doc = Document(
+                    text=content,
+                    metadata={
+                        "type": "issue",
+                        "issue_id": issue.id,
+                        "title": issue.title,
+                        "state": issue.state,
+                        "created_at": issue.created_at.isoformat() if issue.created_at else None,
+                        "labels": [label.name for label in issue.labels],
+                        "url": issue.url
+                    }
+                )
+                new_documents.append(doc)
+            
+            if new_documents:
+                # Add documents to vector index
+                from llama_index.core.node_parser import SimpleNodeParser
+                node_parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
+                new_nodes = node_parser.get_nodes_from_documents(new_documents)
+                
+                # Insert nodes into existing vector index
+                self.indexer.vector_index.insert_nodes(new_nodes)
+                
+                # Save updated issues and index
+                await self.indexer._save_issues()
+                await self.indexer._save_faiss_index(new_nodes, append=True)
+                
+                logger.info(f"Successfully added {len(new_issues)} issues to index")
+            
+        except Exception as e:
+            logger.error(f"Error adding issues to index: {e}")
+            raise
     
     async def initialize_commit_index(
         self,

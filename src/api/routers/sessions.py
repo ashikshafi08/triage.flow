@@ -6,7 +6,7 @@ from ...models import (
 )
 from ..dependencies import (
     session_manager, github_client, prompt_generator, 
-    llm_client, get_session, logger, settings
+    llm_client, get_session, get_agentic_rag, logger, settings
 )
 import asyncio
 from typing import Optional, Dict, Any
@@ -282,12 +282,20 @@ async def get_founding_session_status(session_id: str, session: Dict[str, Any] =
     }
 
 @router.post("/assistant/sessions/{session_id}/sync-repository")
-async def sync_repository_data(session_id: str, background_tasks: BackgroundTasks, session: Dict[str, Any] = Depends(get_session)):
+async def sync_repository_data(
+    session_id: str, 
+    background_tasks: BackgroundTasks, 
+    force_full_sync: bool = Query(False, description="Force full rebuild instead of incremental sync"),
+    max_new_issues: int = Query(5, description="Maximum new issues to sync in incremental mode"),
+    max_new_prs: int = Query(5, description="Maximum new PRs to sync in incremental mode"),
+    session: Dict[str, Any] = Depends(get_session),
+    agentic_rag = Depends(get_agentic_rag)
+):
     """
-    Triggers a re-sync of the repository's issue and patch data.
-    This involves re-running patch linkage and issue indexing.
+    Triggers a sync of the repository's issue and patch data.
+    By default, performs incremental sync to only fetch new/changed content.
+    Use force_full_sync=true to rebuild everything from scratch.
     """
-    agentic_rag = session.get("agentic_rag")
     if not agentic_rag:
         raise HTTPException(status_code=400, detail="AgenticRAG system not initialized for this session.")
     
@@ -298,22 +306,53 @@ async def sync_repository_data(session_id: str, background_tasks: BackgroundTask
     # Update session status to indicate syncing
     if "metadata" not in session:
         session["metadata"] = {}
+    
+    sync_type = "full rebuild" if force_full_sync else "incremental sync"
     session["metadata"]["status"] = "syncing_issues"
-    session["metadata"]["message"] = "Re-syncing repository issues, PRs, and patches..."
+    session["metadata"]["message"] = f"Starting {sync_type} of repository data..."
 
     async def _sync_task():
         try:
-            logger.info(f"Starting repository data sync for session {session_id}...")
-            # Calling initialize with force_rebuild=True will re-trigger
-            # patch linkage and issue indexing.
-            await agentic_rag.issue_rag.initialize(
-                force_rebuild=True, 
-                max_issues_for_patch_linkage=settings.MAX_PATCH_LINKAGE_ISSUES,
-                max_prs_for_patch_linkage=settings.MAX_PR_TO_PROCESS
-            )
-            session["metadata"]["status"] = "ready" 
-            session["metadata"]["message"] = "Repository data sync complete. Full context updated."
-            logger.info(f"Repository data sync complete for session {session_id}.")
+            logger.info(f"Starting repository data sync ({sync_type}) for session {session_id}...")
+            
+            if force_full_sync:
+                # Full rebuild - re-initialize everything
+                await agentic_rag.issue_rag.initialize(
+                    force_rebuild=True, 
+                    max_issues_for_patch_linkage=settings.MAX_PATCH_LINKAGE_ISSUES,
+                    max_prs_for_patch_linkage=settings.MAX_PR_TO_PROCESS
+                )
+                session["metadata"]["status"] = "ready" 
+                session["metadata"]["message"] = "Full repository rebuild complete. All context updated."
+                logger.info(f"Full repository rebuild complete for session {session_id}.")
+            else:
+                # Incremental sync - only fetch new/changed content
+                sync_result = await agentic_rag.issue_rag.incremental_sync(
+                    max_new_issues=max_new_issues,
+                    max_new_prs=max_new_prs
+                )
+                
+                if sync_result["status"] == "completed":
+                    new_items = sync_result["total_new_items"]
+                    session["metadata"]["status"] = "ready"
+                    session["metadata"]["message"] = f"Incremental sync complete. Added {new_items} new items ({sync_result['new_issues']} issues, {sync_result['new_prs']} PRs)."
+                    session["metadata"]["last_sync_result"] = sync_result
+                elif sync_result["status"] == "skipped":
+                    session["metadata"]["status"] = "ready"
+                    session["metadata"]["message"] = f"Sync skipped: {sync_result['reason']}. Last sync was {sync_result.get('hours_since_last_sync', 0):.1f} hours ago."
+                    session["metadata"]["last_sync_result"] = sync_result
+                elif sync_result["status"] == "full_initialization":
+                    session["metadata"]["status"] = "ready"
+                    session["metadata"]["message"] = "System was not initialized, performed full initialization instead."
+                    session["metadata"]["last_sync_result"] = sync_result
+                else:
+                    # Error case
+                    session["metadata"]["status"] = "warning_sync_error"
+                    session["metadata"]["message"] = f"Incremental sync encountered an error: {sync_result.get('error', 'Unknown error')}"
+                    session["metadata"]["last_sync_result"] = sync_result
+                
+                logger.info(f"Incremental sync result for session {session_id}: {sync_result}")
+                
         except Exception as e:
             logger.error(f"Error during repository data sync for session {session_id}: {e}", exc_info=True)
             session["metadata"]["status"] = "error_syncing"
@@ -322,4 +361,10 @@ async def sync_repository_data(session_id: str, background_tasks: BackgroundTask
 
     background_tasks.add_task(_sync_task)
     
-    return {"message": "Repository data sync process started in the background."}
+    return {
+        "message": f"Repository {sync_type} started in the background.",
+        "sync_type": sync_type,
+        "force_full_sync": force_full_sync,
+        "max_new_issues": max_new_issues if not force_full_sync else None,
+        "max_new_prs": max_new_prs if not force_full_sync else None
+    }

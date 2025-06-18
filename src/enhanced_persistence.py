@@ -290,5 +290,101 @@ class EnhancedPersistenceManager:
                 except Exception as e:
                     logger.warning(f"Failed to remove {file_name}: {e}")
 
+    def detect_issue_changes(self, 
+                           old_metadata: Dict[str, Any], 
+                           repo_owner: str, 
+                           repo_name: str) -> Dict[str, Any]:
+        """Detect changes in GitHub issues and PRs since last sync"""
+        logger.info(f"Detecting issue/PR changes for {repo_owner}/{repo_name}")
+        
+        changes = {
+            "new_issues": [],
+            "updated_issues": [],
+            "new_prs": [],
+            "updated_prs": [],
+            "total_changes": 0,
+            "last_issue_sync": old_metadata.get("last_issue_sync"),
+            "last_pr_sync": old_metadata.get("last_pr_sync"),
+            "current_sync": datetime.now().isoformat()
+        }
+        
+        return changes
+    
+    def should_sync_issues(self, 
+                          old_metadata: Dict[str, Any], 
+                          force_sync: bool = False) -> Tuple[bool, Dict[str, Any]]:
+        """Determine if issues/PRs should be synced"""
+        if force_sync:
+            return True, {"reason": "force_sync", "total_changes": -1}
+        
+        # Check if we have never synced before
+        if not old_metadata.get("last_issue_sync"):
+            return True, {"reason": "never_synced", "total_changes": -1}
+        
+        # Check time since last sync (sync if >24 hours)
+        try:
+            last_sync = datetime.fromisoformat(old_metadata["last_issue_sync"])
+            time_since_sync = datetime.now() - last_sync
+            
+            if time_since_sync.total_seconds() > 24 * 3600:  # 24 hours
+                return True, {"reason": "time_threshold", "hours_since_sync": time_since_sync.total_seconds() / 3600}
+            else:
+                return False, {"reason": "recent_sync", "hours_since_sync": time_since_sync.total_seconds() / 3600}
+                
+        except Exception as e:
+            logger.warning(f"Error parsing last sync time: {e}")
+            return True, {"reason": "invalid_sync_time", "total_changes": -1}
+    
+    def save_sync_metadata(self, 
+                          index_dir: Path, 
+                          repo_owner: str, 
+                          repo_name: str,
+                          issues_synced: int = 0,
+                          prs_synced: int = 0) -> None:
+        """Save sync metadata for incremental updates"""
+        sync_metadata_file = index_dir / "sync_metadata.json"
+        
+        try:
+            # Load existing sync metadata if it exists
+            existing_metadata = {}
+            if sync_metadata_file.exists():
+                with open(sync_metadata_file, 'r', encoding='utf-8') as f:
+                    existing_metadata = json.load(f)
+            
+            # Update with current sync info
+            sync_metadata = {
+                **existing_metadata,
+                "repo_owner": repo_owner,
+                "repo_name": repo_name,
+                "last_full_sync": datetime.now().isoformat(),
+                "last_issue_sync": datetime.now().isoformat(),
+                "last_pr_sync": datetime.now().isoformat(),
+                "issues_synced": issues_synced,
+                "prs_synced": prs_synced,
+                "sync_count": existing_metadata.get("sync_count", 0) + 1
+            }
+            
+            with open(sync_metadata_file, 'w', encoding='utf-8') as f:
+                json.dump(sync_metadata, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"Saved sync metadata: {issues_synced} issues, {prs_synced} PRs")
+            
+        except Exception as e:
+            logger.error(f"Failed to save sync metadata: {e}")
+    
+    def load_sync_metadata(self, index_dir: Path) -> Dict[str, Any]:
+        """Load sync metadata for incremental updates"""
+        sync_metadata_file = index_dir / "sync_metadata.json"
+        
+        if not sync_metadata_file.exists():
+            return {}
+        
+        try:
+            with open(sync_metadata_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load sync metadata: {e}")
+            return {}
+
 # Global instance
 persistence_manager = EnhancedPersistenceManager() 

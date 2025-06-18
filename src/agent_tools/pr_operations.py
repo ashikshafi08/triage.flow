@@ -90,7 +90,13 @@ class PROperations:
         await self.pr_cache.set(cache_key, result)
         return result
 
-    def get_pr_for_issue(self, issue_number: Annotated[int, "Issue number"]) -> str:
+    def get_pr_for_issue(self, issue_identifier: Annotated[str, "Issue identifier (number or #number)"]) -> str:
+        # Handle different issue identifier formats
+        if issue_identifier.startswith('#'):
+            issue_number = int(issue_identifier[1:])
+        else:
+            issue_number = int(issue_identifier)
+            
         cache_key = f"pr_for_issue:{issue_number}"
         
         def _fetch_pr_for_issue():
@@ -100,7 +106,19 @@ class PROperations:
                     patch_builder = self.issue_rag_system.indexer.patch_builder
                     links = patch_builder.load_patch_links().get(issue_number, [])
                     if links:
-                        return json.dumps({"issue_number": issue_number, "found_prs": [l.to_dict() for l in links]})
+                        # Convert PatchLink objects to dictionaries
+                        pr_data = []
+                        for link in links:
+                            pr_data.append({
+                                "issue_id": link.issue_id,
+                                "pr_number": link.pr_number,
+                                "merged_at": link.merged_at,
+                                "pr_title": link.pr_title,
+                                "pr_url": link.pr_url,
+                                "pr_diff_url": link.pr_diff_url,
+                                "files_changed": link.files_changed
+                            })
+                        return json.dumps({"issue_number": issue_number, "found_prs": pr_data})
                 except Exception as e:
                     logger.warning(f"Issue RAG patch_builder failed: {e}")
             
