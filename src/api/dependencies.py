@@ -44,23 +44,39 @@ async def get_agentic_rag(session_id: str, session: Dict[str, Any] = Depends(get
     # Use repository-based cache key for sharing AgenticRAG instances across sessions
     repo_key = f"{owner}/{repo}"
     
-    logger.info(f"[GET_AGENTIC_RAG] session_id={session_id}, repo_key={repo_key}")
+    # Get current repository path for validation
+    current_repo_path = session.get("repo_path")
+    if not current_repo_path:
+        raise HTTPException(status_code=400, detail="Repository not initialized for this session")
     
-    # Check repository-based cache first (survives session recreation)
+    logger.info(f"[GET_AGENTIC_RAG] session_id={session_id}, repo_key={repo_key}, repo_path={current_repo_path}")
+    
+    # Check repository-based cache first, but validate the repo path matches
     if repo_key in agentic_rag_cache:
         cached_instance = agentic_rag_cache[repo_key]
-        logger.info(f"[CACHE_HIT] Using cached AgenticRAG for {repo_key}")
-        return cached_instance
+        cached_repo_path = getattr(cached_instance, 'repo_path', None)
+        
+        # Validate that the cached instance is for the same repository path
+        if cached_repo_path and cached_repo_path == current_repo_path:
+            logger.info(f"[CACHE_HIT] Using cached AgenticRAG for {repo_key} with matching repo path")
+            return cached_instance
+        else:
+            logger.warning(f"[CACHE_MISMATCH] Cached instance for {repo_key} has different repo path: {cached_repo_path} vs {current_repo_path}")
+            # Remove the invalid cached instance
+            del agentic_rag_cache[repo_key]
 
-    # If we have a valid AgenticRAG instance in session, cache it by repo and return
+    # If we have a valid AgenticRAG instance in session, validate and cache it
     if current_agentic_rag_value and not isinstance(current_agentic_rag_value, str):
-        logger.info(f"[CACHE_STORE] Caching existing AgenticRAG instance for {repo_key}")
-        agentic_rag_cache[repo_key] = current_agentic_rag_value
-        return current_agentic_rag_value
-
-    # Need to recreate AgenticRAG - this should only happen on first load or after restart
-    if not session.get("repo_path"):
-        raise HTTPException(status_code=400, detail="Repository not initialized for this session")
+        session_instance_repo_path = getattr(current_agentic_rag_value, 'repo_path', None)
+        
+        # Only cache if the session instance matches the current repository path
+        if session_instance_repo_path == current_repo_path:
+            logger.info(f"[CACHE_STORE] Caching existing AgenticRAG instance for {repo_key}")
+            agentic_rag_cache[repo_key] = current_agentic_rag_value
+            return current_agentic_rag_value
+        else:
+            logger.warning(f"[SESSION_MISMATCH] Session AgenticRAG instance has different repo path: {session_instance_repo_path} vs {current_repo_path}")
+            # Don't cache the mismatched instance
     
     logger.info(f"[RECREATE] Creating new AgenticRAG instance for {repo_key}")
     
@@ -85,6 +101,10 @@ async def get_agentic_rag(session_id: str, session: Dict[str, Any] = Depends(get
             session["repo_path"], 
             issue_rag_system=None 
         )
+        
+        # Initialize composite retriever after core systems are ready
+        logger.info(f"Initializing composite retriever for {repo_key}")
+        await recreated_agentic_rag._initialize_composite_retriever()
         
         # Initialize commit index (should load from existing cache if available)
         try:
@@ -116,6 +136,11 @@ async def get_agentic_rag(session_id: str, session: Dict[str, Any] = Depends(get
                         recreated_agentic_rag.agentic_explorer.pr_ops.issue_rag_system = issue_rag
                     if hasattr(recreated_agentic_rag.agentic_explorer, 'issue_ops'):
                         recreated_agentic_rag.agentic_explorer.issue_ops.issue_rag_system = issue_rag
+                    
+                    # Update composite retriever with issue RAG
+                    if recreated_agentic_rag._use_composite and recreated_agentic_rag.composite_retriever:
+                        recreated_agentic_rag.composite_retriever.indices["issues"] = issue_rag
+                        logger.info(f"Updated composite retriever with issue RAG for {repo_key}")
                         
                     logger.info(f"Issue RAG restored successfully for {repo_key}")
                 else:

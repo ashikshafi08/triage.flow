@@ -68,6 +68,23 @@ class PROperations:
             )
         else:
             self.pr_cache = None
+        
+        # Cache repository context for consistent cache keys
+        self._repo_context = None
+    
+    def _get_repo_context(self) -> str:
+        """Get repository context for cache keys"""
+        if self._repo_context is None:
+            repo_info = self._extract_repo_info(self.repo_path) if self._extract_repo_info else (None, None)
+            repo_owner, repo_name = repo_info
+            self._repo_context = f"{repo_owner}/{repo_name}" if repo_owner and repo_name else str(self.repo_path)
+        return self._repo_context
+    
+    def _make_cache_key(self, key_type: str, *args) -> str:
+        """Create repository-aware cache key"""
+        repo_context = self._get_repo_context()
+        args_str = ":".join(str(arg) for arg in args)
+        return f"{key_type}:{repo_context}:{args_str}" if args_str else f"{key_type}:{repo_context}"
 
     async def _get_cached_or_fetch(self, cache_key: str, fetch_func, *args, **kwargs):
         """Get data from cache or fetch and cache it"""
@@ -97,7 +114,8 @@ class PROperations:
         else:
             issue_number = int(issue_identifier)
             
-        cache_key = f"pr_for_issue:{issue_number}"
+        # Create repository-aware cache key
+        cache_key = self._make_cache_key("pr_for_issue", issue_number)
         
         def _fetch_pr_for_issue():
             # First try the issue RAG system if available
@@ -171,7 +189,7 @@ class PROperations:
             return _fetch_pr_for_issue()
 
     def get_pr_diff(self, pr_number: Annotated[int, "PR number"]) -> str:
-        cache_key = f"pr_diff:{pr_number}"
+        cache_key = self._make_cache_key("pr_diff", pr_number)
         
         def _fetch_pr_diff():
             if not self.issue_rag_system or not hasattr(self.issue_rag_system.indexer, 'diff_docs'):
@@ -194,7 +212,7 @@ class PROperations:
             return _fetch_pr_diff()
 
     def get_files_changed_in_pr(self, pr_number: Annotated[int, "PR number"]) -> str:
-        cache_key = f"pr_files:{pr_number}"
+        cache_key = self._make_cache_key("pr_files", pr_number)
         
         def _fetch_pr_files():
             if not self.issue_rag_system or not hasattr(self.issue_rag_system.indexer, 'diff_docs'):
@@ -209,7 +227,7 @@ class PROperations:
             return _fetch_pr_files()
 
     def get_pr_summary(self, pr_number: Annotated[int, "PR number"]) -> str:
-        cache_key = f"pr_summary:{pr_number}"
+        cache_key = self._make_cache_key("pr_summary", pr_number)
         
         def _fetch_pr_summary():
             # Simplified: original logic for LLM summarization needs careful porting

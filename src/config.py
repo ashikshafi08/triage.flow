@@ -167,6 +167,15 @@ class Settings(BaseSettings):
     INDEX_REBUILD_THRESHOLD: float = 0.1  # Rebuild if >10% of files changed
     INDEX_REBUILD_MIN_FILES: int = 50  # Or if >50 files changed
     
+    # NEW: Composite Agentic Retrieval Settings
+    ENABLE_COMPOSITE_RETRIEVAL: bool = os.getenv("ENABLE_COMPOSITE_RETRIEVAL", "true").lower() == "true"
+    COMPOSITE_MAX_CONCURRENT_QUERIES: int = int(os.getenv("COMPOSITE_MAX_CONCURRENT_QUERIES", "5"))
+    COMPOSITE_MAX_RESULTS_PER_INDEX: int = int(os.getenv("COMPOSITE_MAX_RESULTS_PER_INDEX", "10"))
+    COMPOSITE_ENABLE_RERANKING: bool = os.getenv("COMPOSITE_ENABLE_RERANKING", "true").lower() == "true"
+    COMPOSITE_CACHE_ROUTING_DECISIONS: bool = os.getenv("COMPOSITE_CACHE_ROUTING_DECISIONS", "true").lower() == "true"
+    COMPOSITE_CONFIDENCE_MIN_THRESHOLD: float = float(os.getenv("COMPOSITE_CONFIDENCE_MIN_THRESHOLD", "0.4"))
+    COMPOSITE_AGENTIC_THRESHOLD: float = float(os.getenv("COMPOSITE_AGENTIC_THRESHOLD", "0.5"))
+    
     class Config:
         env_file = ".env"
 

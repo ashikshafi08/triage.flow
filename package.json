@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "@anthropic-ai/claude-code": "^1.0.29",
     "eventsource-parser": "^3.0.2",
     "fuse.js": "^7.1.0"
   }

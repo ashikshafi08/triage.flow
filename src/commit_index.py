@@ -70,7 +70,12 @@ class CommitIndexer:
         self.repo_name = repo_name
         self.repo_key = f"{repo_owner}/{repo_name}" if repo_owner and repo_name else "unknown"
         
-        logger.info(f"CommitIndexer __init__: Received repo_path='{repo_path}', owner='{repo_owner}', name='{repo_name}', resulting repo_key='{self.repo_key}'")
+        # Generate a hash of the absolute repository path for uniqueness
+        import hashlib
+        repo_path_hash = hashlib.md5(str(self.repo_path.resolve()).encode()).hexdigest()[:8]
+        self.unique_repo_key = f"{self.repo_key}_{repo_path_hash}"
+        
+        logger.info(f"CommitIndexer __init__: Received repo_path='{repo_path}', owner='{repo_owner}', name='{repo_name}', resulting repo_key='{self.repo_key}', unique_key='{self.unique_repo_key}'")
 
         # Initialize embedding model
         self.embed_model = OpenAIEmbedding(
@@ -78,11 +83,11 @@ class CommitIndexer:
             api_key=settings.openai_api_key
         )
         
-        # Setup storage paths using a persistent base directory
-        safe_repo_key = self.repo_key.replace('/', '_')
+        # Setup storage paths using a persistent base directory with unique repo key
+        safe_unique_key = self.unique_repo_key.replace('/', '_')
         # Use a fixed base path within the project's CWD for persistence
         persistent_base_path = Path(".") / ".index_cache" / "commit_indexes"
-        self.index_dir = persistent_base_path / safe_repo_key
+        self.index_dir = persistent_base_path / safe_unique_key
         self.index_dir.mkdir(parents=True, exist_ok=True) # Ensure parent dirs are created
         
         logger.info(f"CommitIndexer: Using persistent index directory: {self.index_dir.resolve()}")
@@ -664,6 +669,14 @@ class CommitIndexer:
             
             total_commits = metadata.get("total_commits", 0)
             created_at = metadata.get("created_at", "unknown")
+            cached_repo_path = metadata.get("repo_path", "")
+            
+            # Validate that cached data is for the same repository path
+            current_repo_path = str(self.repo_path.resolve())
+            if cached_repo_path and cached_repo_path != current_repo_path:
+                logger.warning(f"CommitIndexer.load_existing_index: Cache repo path mismatch. Cache: {cached_repo_path}, Current: {current_repo_path}")
+                return False
+            
             logger.info(f"CommitIndexer.load_existing_index: Found cache with {total_commits} commits created at {created_at}")
             
             if total_commits < 5:

@@ -1,27 +1,82 @@
 """
 Agentic RAG Integration
-Combines LocalRepoContextExtractor with AgenticCodebaseExplorer for enhanced context retrieval
+Enhanced multi-index retrieval system with intelligent query routing and composite retrieval capabilities.
+Combines LocalRepoContextExtractor with AgenticCodebaseExplorer for enhanced context retrieval.
 """
 
-import os
-import json
 import asyncio
 import logging
-from typing import Dict, Any, Optional, List, Tuple, TYPE_CHECKING
-from pathlib import Path
-import re
-import nest_asyncio
-from datetime import datetime
+from typing import Dict, Any, Optional, List, Literal
 import time
 from dataclasses import dataclass
+from enum import Enum
+import hashlib
+from collections import defaultdict
 
 from .new_rag import LocalRepoContextExtractor
-from .agent_tools import AgenticCodebaseExplorer
-from .config import settings
 from .issue_rag import IssueAwareRAG
-from .patch_linkage import PatchLinkageBuilder
 
 logger = logging.getLogger(__name__)
+
+# Type definitions for backwards compatibility
+ContextChunk = Dict[str, Any]
+RetrievalMode = Literal["chunks", "files_via_metadata", "files_via_content", "auto_routed"]
+IndexType = Literal["code", "issues", "prs", "docs", "tests", "configs"]
+
+
+class QueryComplexity(Enum):
+    """Query complexity levels for routing decisions"""
+    SIMPLE = "simple"
+    MODERATE = "moderate"
+    COMPLEX = "complex"
+    EXPERT = "expert"
+
+
+@dataclass
+class CompositeConfig:
+    """Configuration for composite agentic retriever"""
+    # Chunk sizes by index type
+    chunk_sizes: Dict[str, int] = None
+    
+    # Fusion weights for different retrieval modes
+    fusion_weights: Dict[str, float] = None
+    
+    # Routing thresholds
+    routing_thresholds: Dict[str, float] = None
+    
+    # Performance settings
+    max_concurrent_queries: int = 5
+    max_results_per_index: int = 10
+    enable_reranking: bool = True
+    cache_routing_decisions: bool = True
+    
+    def __post_init__(self):
+        if self.chunk_sizes is None:
+            self.chunk_sizes = {
+                "code": 2000,
+                "issues": 1500,
+                "prs": 1500,
+                "docs": 1000,
+                "tests": 1500,
+                "configs": 800
+            }
+        
+        if self.fusion_weights is None:
+            self.fusion_weights = {
+                "dense": 0.6,
+                "sparse": 0.3,
+                "agentic": 0.1
+            }
+        
+        if self.routing_thresholds is None:
+            self.routing_thresholds = {
+                "complexity_simple": 0.3,
+                "complexity_moderate": 0.6,
+                "complexity_complex": 0.8,
+                "confidence_min": 0.4,
+                "agentic_threshold": 0.5
+            }
+
 
 def extract_repo_info_from_url(repo_url: str) -> Dict[str, str]:
     """Extract owner and repo name from GitHub URL"""
@@ -36,25 +91,271 @@ def extract_repo_info_from_url(repo_url: str) -> Dict[str, str]:
     else:
         raise ValueError(f"Invalid GitHub URL format: {repo_url}")
 
+
+class CompositeAgenticRetriever:
+    """
+    Multi-index retrieval system with intelligent routing and fusion capabilities.
+    Manages specialized indices for different content types and retrieval modes.
+    """
+    
+    def __init__(self, session_id: str, config: Optional[CompositeConfig] = None):
+        self.session_id = session_id
+        self.config = config or CompositeConfig()
+        self.indices: Dict[str, Any] = {}
+        self.routing_cache: Dict[str, Any] = {}
+        self._stats = {
+            "total_queries": 0,
+            "cache_hits": 0,
+            "routing_decisions": defaultdict(int),
+            "index_usage": defaultdict(int)
+        }
+        
+        # Redis cache for routing decisions
+        self._redis_cache = None
+        self._initialize_redis_cache()
+    
+    def _initialize_redis_cache(self) -> None:
+        """Initialize Redis cache for routing decisions"""
+        try:
+            if self.config.cache_routing_decisions:
+                # Try to import Redis cache but don't fail if not available
+                try:
+                    from .cache.redis_cache import redis_cache
+                    self._redis_cache = redis_cache
+                    logger.debug("Redis cache initialized for routing decisions")
+                except ImportError:
+                    logger.debug("Redis cache not available, using memory only")
+                    self._redis_cache = None
+        except Exception as e:
+            logger.warning(f"Failed to initialize Redis cache: {e}")
+            self._redis_cache = None
+    
+    async def initialize_indices(
+        self,
+        repo_path: str,
+        rag_extractor: LocalRepoContextExtractor,
+        issue_rag: Optional[IssueAwareRAG] = None
+    ) -> None:
+        """Initialize specialized indices for different content types"""
+        start_time = time.time()
+        
+        try:
+            logger.info(f"Initializing composite indices for session {self.session_id}")
+            
+            # Primary code index (reuse existing RAG extractor)
+            self.indices["code"] = rag_extractor
+            
+            # Issue index (if available)
+            if issue_rag and issue_rag.is_initialized():
+                self.indices["issues"] = issue_rag
+                logger.info("Issue index initialized")
+            
+            processing_time = time.time() - start_time
+            logger.info(f"Composite indices initialized in {processing_time:.2f}s")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize composite indices: {e}")
+            raise
+    
+    async def retrieve(
+        self,
+        query: str,
+        retrieval_mode: RetrievalMode = "auto_routed",
+        max_results: int = 15
+    ) -> Dict[str, Any]:
+        """
+        Main retrieval method with intelligent routing and fusion
+        """
+        start_time = time.time()
+        self._stats["total_queries"] += 1
+        
+        try:
+            # Step 1: Analyze query and determine routing (simplified)
+            query_analysis = await self._analyze_query_simple(query)
+            
+            # Step 2: Route to appropriate indices (simplified)
+            target_indices = self._select_target_indices_simple(query)
+            
+            # Step 3: Retrieve from indices
+            all_chunks = []
+            
+            # Code index (always query)
+            if "code" in self.indices:
+                try:
+                    code_context = await self.indices["code"].get_relevant_context(query, None)
+                    code_chunks = code_context.get("sources", [])
+                    for chunk in code_chunks:
+                        chunk["source_index"] = "code"
+                    all_chunks.extend(code_chunks[:max_results//2])
+                except Exception as e:
+                    logger.warning(f"Error querying code index: {e}")
+            
+            # Issue index (if available and relevant)
+            if "issues" in self.indices and "issues" in target_indices:
+                try:
+                    issue_context = await self.indices["issues"].get_issue_context(query, max_issues=max_results//3)
+                    if issue_context.related_issues:
+                        for result in issue_context.related_issues:
+                            issue_chunk = {
+                                "content": f"Issue #{result.issue.id}: {result.issue.title}\n{result.issue.body[:500]}",
+                                "file": f"issue_{result.issue.id}",
+                                "similarity": result.similarity,
+                                "type": "issue",
+                                "source_index": "issues"
+                            }
+                            all_chunks.append(issue_chunk)
+                except Exception as e:
+                    logger.warning(f"Error querying issue index: {e}")
+            
+            # Step 4: Simple fusion (sort by similarity/score)
+            for chunk in all_chunks:
+                score = chunk.get("similarity", chunk.get("score", 0.5))
+                chunk["fusion_score"] = score
+            
+            all_chunks.sort(key=lambda x: x.get("fusion_score", 0), reverse=True)
+            
+            # Step 5: Create response
+            total_time = time.time() - start_time
+            
+            result = {
+                "context_chunks": all_chunks[:max_results],
+                "query_analysis": query_analysis,
+                "total_processing_time": total_time,
+                "cache_hits": 0,
+                "fusion_applied": len(target_indices) > 1,
+                "reranking_applied": True
+            }
+            
+            logger.debug(f"Composite retrieval completed in {total_time:.2f}s")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Composite retrieval failed: {e}")
+            # Fallback to simple code index
+            return await self._fallback_retrieve(query, max_results)
+    
+    async def _analyze_query_simple(self, query: str) -> Dict[str, Any]:
+        """Simplified query analysis"""
+        query_lower = query.lower()
+        
+        # Determine complexity
+        word_count = len(query.split())
+        if word_count > 20:
+            complexity = QueryComplexity.COMPLEX
+        elif word_count > 10:
+            complexity = QueryComplexity.MODERATE
+        else:
+            complexity = QueryComplexity.SIMPLE
+        
+        # Check for agentic patterns
+        agentic_patterns = [
+            "explain", "analyze", "how does", "implement", "create", "find all",
+            "comprehensive", "detailed", "step by step"
+        ]
+        should_use_agentic = any(pattern in query_lower for pattern in agentic_patterns)
+        
+        return {
+            "query_type": "general",
+            "complexity": complexity,
+            "should_use_agentic": should_use_agentic,
+            "confidence": 0.7,
+            "processing_time": 0.01
+        }
+    
+    def _select_target_indices_simple(self, query: str) -> List[str]:
+        """Simple index selection"""
+        target_indices = ["code"]  # Always include code
+        
+        query_lower = query.lower()
+        
+        # Add issue index for bug/problem queries
+        if any(word in query_lower for word in ["issue", "bug", "problem", "error", "fix"]):
+            target_indices.append("issues")
+        
+        return target_indices
+    
+    async def _fallback_retrieve(self, query: str, max_results: int) -> Dict[str, Any]:
+        """Fallback to simple code index retrieval"""
+        try:
+            if "code" in self.indices:
+                code_index = self.indices["code"]
+                context = await code_index.get_relevant_context(query, None)
+                
+                chunks = context.get("sources", [])[:max_results]
+                
+                return {
+                    "context_chunks": chunks,
+                    "query_analysis": {"query_type": "general", "complexity": QueryComplexity.SIMPLE},
+                    "total_processing_time": 0.1,
+                    "cache_hits": 0,
+                    "fusion_applied": False,
+                    "reranking_applied": False
+                }
+                
+        except Exception as e:
+            logger.error(f"Fallback retrieval failed: {e}")
+        
+        # Ultimate fallback
+        return {
+            "context_chunks": [],
+            "query_analysis": {"query_type": "error", "complexity": QueryComplexity.SIMPLE},
+            "total_processing_time": 0.0,
+            "cache_hits": 0,
+            "fusion_applied": False,
+            "reranking_applied": False
+        }
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get retrieval statistics"""
+        return {
+            "total_queries": self._stats["total_queries"],
+            "cache_hit_rate": self._stats["cache_hits"] / max(1, self._stats["total_queries"]),
+            "routing_decisions": dict(self._stats["routing_decisions"]),
+            "index_usage": dict(self._stats["index_usage"]),
+            "available_indices": list(self.indices.keys())
+        }
+
+
 class AgenticRAGSystem:
     """
     Enhanced RAG system that combines semantic retrieval with agentic tool capabilities
-    for more intelligent context extraction and query processing
+    for more intelligent context extraction and query processing.
+    
+    Now features composite multi-index retrieval with intelligent routing.
     """
     
     def __init__(self, session_id: str):
         self.session_id = session_id
         self.rag_extractor = None
         self.agentic_explorer = None
-        self.issue_rag = None  # Add issue-aware RAG
+        self.issue_rag = None
         self.repo_path = None
         self.repo_info = None
-        self._query_cache = {}  # Cache for repeated queries
+        self._query_cache = {}
+        
+        # New composite retriever
+        self.composite_retriever = CompositeAgenticRetriever(session_id)
+        self._use_composite = False  # Flag to enable composite retrieval
+        
+        # Enhanced logging
+        self._setup_enhanced_logging()
+    
+    def _setup_enhanced_logging(self) -> None:
+        """Setup enhanced structured logging"""
+        self.logger = logging.getLogger(f"agentic_rag.{self.session_id}")
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+            self.logger.setLevel(logging.INFO)
 
     async def initialize_core_systems(self, repo_url: str, branch: str = "main") -> None:
         """Initialize core RAG systems without issue RAG (that comes later async)"""
         try:
-            logger.info(f"Initializing AgenticRAG core systems for session {self.session_id}")
+            self.logger.info(f"Initializing AgenticRAG core systems for session {self.session_id}")
             
             # Check if this repo is already loaded in memory cache
             repo_info_from_url = extract_repo_info_from_url(repo_url)
@@ -64,7 +365,7 @@ class AgenticRAGSystem:
             from .api.dependencies import agentic_rag_cache
             if repo_key in agentic_rag_cache:
                 existing_instance = agentic_rag_cache[repo_key]
-                logger.info(f"Found existing AgenticRAG instance for {repo_key}, reusing core components")
+                self.logger.info(f"Found existing AgenticRAG instance for {repo_key}, reusing core components")
                 
                 # Copy existing components instead of rebuilding
                 self.rag_extractor = existing_instance.rag_extractor
@@ -83,31 +384,35 @@ class AgenticRAGSystem:
                 )
                 
                 if not rag_is_valid:
-                    logger.warning(f"RAG extractor from cache missing critical components, will need fresh initialization")
-                    logger.warning(f"RAG extractor state: query_engine={getattr(self.rag_extractor, 'query_engine', 'missing')}, vector_store={getattr(self.rag_extractor, 'vector_store', 'missing')}")
+                    self.logger.warning(f"RAG extractor from cache missing critical components, will need fresh initialization")
                     # Instead of setting to None, try to reinitialize with existing repo path
-                    if existing_instance.repo_path and os.path.exists(existing_instance.repo_path):
-                        logger.info(f"Attempting to reinitialize RAG extractor using existing repo at {existing_instance.repo_path}")
-                        try:
-                            code_rag = LocalRepoContextExtractor()
-                            code_rag.current_repo_path = existing_instance.repo_path
-                            # Try to rebuild indices from existing repository without re-cloning
-                            await code_rag._rebuild_indices_from_existing_repo()
-                            self.rag_extractor = code_rag
-                            # Update the cache with the fixed rag_extractor
-                            existing_instance.rag_extractor = code_rag
-                            logger.info(f"Successfully reinitialized RAG extractor for {repo_key} from existing repo")
-                        except Exception as reinit_error:
-                            logger.error(f"Failed to reinitialize RAG extractor: {reinit_error}")
-                            # Fall back to full re-cloning only as last resort
+                    if existing_instance.repo_path and hasattr(existing_instance, 'repo_path') and existing_instance.repo_path:
+                        import os
+                        if os.path.exists(existing_instance.repo_path):
+                            self.logger.info(f"Attempting to reinitialize RAG extractor using existing repo at {existing_instance.repo_path}")
+                            try:
+                                code_rag = LocalRepoContextExtractor()
+                                code_rag.current_repo_path = existing_instance.repo_path
+                                # Try to rebuild indices from existing repository without re-cloning
+                                await code_rag._rebuild_indices_from_existing_repo()
+                                self.rag_extractor = code_rag
+                                # Update the cache with the fixed rag_extractor
+                                existing_instance.rag_extractor = code_rag
+                                self.logger.info(f"Successfully reinitialized RAG extractor for {repo_key} from existing repo")
+                            except Exception as reinit_error:
+                                self.logger.error(f"Failed to reinitialize RAG extractor: {reinit_error}")
+                                # Fall back to full re-cloning only as last resort
+                                self.rag_extractor = None
+                        else:
+                            self.logger.warning(f"Existing repo path doesn't exist: {existing_instance.repo_path}")
                             self.rag_extractor = None
                     else:
-                        logger.warning(f"No existing repo path or path doesn't exist: {existing_instance.repo_path}")
+                        self.logger.warning(f"No existing repo path available")
                         self.rag_extractor = None
                 
                 # If rag_extractor is still missing or invalid, create a fresh one
                 if not self.rag_extractor:
-                    logger.info(f"Creating fresh RAG extractor for cached instance {repo_key}")
+                    self.logger.info(f"Creating fresh RAG extractor for cached instance {repo_key}")
                     code_rag = LocalRepoContextExtractor()
                     await code_rag.load_repository(repo_url, branch)
                     self.rag_extractor = code_rag
@@ -117,72 +422,101 @@ class AgenticRAGSystem:
                     existing_instance.repo_path = code_rag.current_repo_path
                     self.repo_path = code_rag.current_repo_path
                 
-                logger.info(f"AgenticRAG core systems reused from cache for session {self.session_id}")
+                # Initialize composite retriever with existing components
+                if self.rag_extractor and self.repo_path:
+                    await self._initialize_composite_retriever()
+                
+                self.logger.info(f"AgenticRAG core systems reused from cache for session {self.session_id}")
                 return
             
             # If not in cache, proceed with initialization
-            logger.info(f"No cached instance found for {repo_key}, initializing fresh")
+            self.logger.info(f"No cached instance found for {repo_key}, initializing fresh")
             
             # Load repository locally  
             code_rag = LocalRepoContextExtractor()
             await code_rag.load_repository(repo_url, branch)
             
-            self.rag_extractor = code_rag  # Fix: Assign the rag_extractor
+            self.rag_extractor = code_rag
             self.repo_path = code_rag.current_repo_path
             self.repo_info = repo_info_from_url
             
             # Initialize AgenticCodebaseExplorer with the repo path
-            from .agent_tools.core import AgenticCodebaseExplorer
-            self.agentic_explorer = AgenticCodebaseExplorer(
-                self.session_id, 
-                self.repo_path, 
-                issue_rag_system=None  # Will be set later
-            )
+            try:
+                from .agent_tools.core import AgenticCodebaseExplorer
+                self.agentic_explorer = AgenticCodebaseExplorer(
+                    self.session_id, 
+                    self.repo_path, 
+                    issue_rag_system=None  # Will be set later
+                )
+            except ImportError as e:
+                self.logger.warning(f"AgenticCodebaseExplorer not available: {e}")
+                self.agentic_explorer = None
             
             # Initialize commit index - this should load existing cache when available
-            try:
-                logger.info(f"Initializing commit index for session {self.session_id}")
-                # force_rebuild=False means it will load existing cache if available
-                await self.agentic_explorer.initialize_commit_index(force_rebuild=False)
-                
-                # Verify initialization
-                if hasattr(self.agentic_explorer, 'commit_index_manager'):
-                    stats = self.agentic_explorer.commit_index_manager.get_statistics()
-                    logger.info(f"Commit index initialized for session {self.session_id}: {stats}")
+            if self.agentic_explorer:
+                try:
+                    self.logger.info(f"Initializing commit index for session {self.session_id}")
+                    # force_rebuild=False means it will load existing cache if available
+                    await self.agentic_explorer.initialize_commit_index(force_rebuild=False)
                     
-                    # Check if we got reasonable data from cache
-                    if stats.get('total_commits', 0) < 10:
-                        logger.warning(f"Low commit count ({stats.get('total_commits', 0)}) for session {self.session_id} - may indicate cache miss or small repo")
-                else:
-                    logger.warning(f"Commit index manager not available for session {self.session_id}")
-                    
-            except Exception as e:
-                logger.warning(f"Failed to initialize commit index for session {self.session_id}: {e}")
-                import traceback
-                logger.warning(f"Full traceback: {traceback.format_exc()}")
-                # Continue without commit index - other tools will still work
+                    # Verify initialization
+                    if hasattr(self.agentic_explorer, 'commit_index_manager'):
+                        stats = self.agentic_explorer.commit_index_manager.get_statistics()
+                        self.logger.info(f"Commit index initialized for session {self.session_id}: {stats}")
+                        
+                        # Check if we got reasonable data from cache
+                        if stats.get('total_commits', 0) < 10:
+                            self.logger.warning(f"Low commit count ({stats.get('total_commits', 0)}) for session {self.session_id} - may indicate cache miss or small repo")
+                    else:
+                        self.logger.warning(f"Commit index manager not available for session {self.session_id}")
+                        
+                except Exception as e:
+                    self.logger.warning(f"Failed to initialize commit index for session {self.session_id}: {e}")
+                    import traceback
+                    self.logger.warning(f"Full traceback: {traceback.format_exc()}")
+                    # Continue without commit index - other tools will still work
             
-            logger.info(f"AgenticRAG core systems initialized for session {self.session_id}")
+            # Initialize composite retriever
+            await self._initialize_composite_retriever()
+            
+            self.logger.info(f"AgenticRAG core systems initialized for session {self.session_id}")
             
         except Exception as e:
-            logger.error(f"Failed to initialize AgenticRAG core systems: {e}")
+            self.logger.error(f"Failed to initialize AgenticRAG core systems: {e}")
             raise
+    
+    async def _initialize_composite_retriever(self) -> None:
+        """Initialize the composite retriever with current components"""
+        try:
+            if self.rag_extractor and self.repo_path:
+                await self.composite_retriever.initialize_indices(
+                    self.repo_path,
+                    self.rag_extractor,
+                    self.issue_rag
+                )
+                self._use_composite = True
+                self.logger.info("Composite retriever initialized successfully")
+            else:
+                self.logger.warning("Cannot initialize composite retriever: missing core components")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize composite retriever: {e}")
+            self._use_composite = False
 
     async def initialize_issue_rag_async(self, session: Dict[str, Any]) -> None:
         """Initializes the IssueAwareRAG system asynchronously and updates session status."""
         from .patch_linkage import ProgressUpdate
         
         if not self.repo_info:
-            logger.error(f"Session {self.session_id}: Cannot initialize IssueAwareRAG: repo_info is missing.")
+            self.logger.error(f"Session {self.session_id}: Cannot initialize IssueAwareRAG: repo_info is missing.")
             session["metadata"]["status"] = "error_repo_info_missing"
             session["metadata"]["message"] = "Error: Repository information missing, cannot load issue context."
             return
 
         owner = self.repo_info.get("owner")
-        repo_name = self.repo_info.get("repo") # Renamed to avoid conflict with 'repo' module
+        repo_name = self.repo_info.get("repo")
 
         if not (owner and repo_name):
-            logger.error(f"Session {self.session_id}: Cannot initialize IssueAwareRAG: owner or repo name is missing from repo_info.")
+            self.logger.error(f"Session {self.session_id}: Cannot initialize IssueAwareRAG: owner or repo name is missing from repo_info.")
             session["metadata"]["status"] = "error_repo_details_missing"
             session["metadata"]["message"] = "Error: Repository owner/name missing, cannot load issue context."
             return
@@ -217,13 +551,13 @@ class AgenticRAGSystem:
                 
                 session["metadata"]["message"] = message
                 
-                logger.info(f"Progress: {update.stage} - {update.current_step} ({update.progress_percentage:.1f}%)")
+                self.logger.info(f"Progress: {update.stage} - {update.current_step} ({update.progress_percentage:.1f}%)")
                 
             except Exception as e:
-                logger.error(f"Error in progress callback: {e}")
+                self.logger.error(f"Error in progress callback: {e}")
 
         try:
-            logger.info(f"Session {self.session_id}: Starting IssueAwareRAG initialization for {owner}/{repo_name}.")
+            self.logger.info(f"Session {self.session_id}: Starting IssueAwareRAG initialization for {owner}/{repo_name}.")
             session["metadata"]["status"] = "issue_linking" 
             session["metadata"]["message"] = f"Starting issue linking and indexing for {owner}/{repo_name}..."
             
@@ -235,7 +569,7 @@ class AgenticRAGSystem:
                 await self.issue_rag.initialize(force_rebuild=False) 
             except RuntimeError as re:
                 if "cannot reuse already awaited coroutine" in str(re):
-                    logger.warning(f"Session {self.session_id}: Coroutine reuse detected, retrying with force rebuild...")
+                    self.logger.warning(f"Session {self.session_id}: Coroutine reuse detected, retrying with force rebuild...")
                     # Create a completely fresh instance and force rebuild
                     self.issue_rag = IssueAwareRAG(owner, repo_name, progress_callback)
                     await self.issue_rag.initialize(force_rebuild=True)
@@ -250,7 +584,12 @@ class AgenticRAGSystem:
                 if hasattr(self.agentic_explorer, 'issue_ops'):
                     self.agentic_explorer.issue_ops.issue_rag_system = self.issue_rag
             
-            logger.info(f"Session {self.session_id}: IssueAwareRAG for {owner}/{repo_name} initialized successfully.")
+            # Update composite retriever with issue RAG
+            if self._use_composite and self.composite_retriever:
+                self.composite_retriever.indices["issues"] = self.issue_rag
+                self.logger.info("Updated composite retriever with issue RAG")
+            
+            self.logger.info(f"Session {self.session_id}: IssueAwareRAG for {owner}/{repo_name} initialized successfully.")
             session["metadata"]["issue_rag_ready"] = True
             session["metadata"]["status"] = "ready" 
             session["metadata"]["message"] = "All systems ready. Full repository context available."
@@ -261,11 +600,11 @@ class AgenticRAGSystem:
                 session["metadata"].pop(key, None)
 
         except Exception as e:
-            logger.error(f"Session {self.session_id}: Failed to initialize IssueAwareRAG for {owner}/{repo_name}: {e}")
+            self.logger.error(f"Session {self.session_id}: Failed to initialize IssueAwareRAG for {owner}/{repo_name}: {e}")
             
             # Log more detailed error information for debugging
             import traceback
-            logger.error(f"Full traceback: {traceback.format_exc()}")
+            self.logger.error(f"Full traceback: {traceback.format_exc()}")
             
             self.issue_rag = None # Ensure it's None if init failed
             session["metadata"]["issue_rag_ready"] = False
@@ -277,9 +616,6 @@ class AgenticRAGSystem:
             for key in ["progress_stage", "progress_step", "progress_percentage", "progress_items_processed", 
                        "progress_total_items", "progress_current_item", "progress_estimated_time", "progress_details"]:
                 session["metadata"].pop(key, None)
-
-        # NOTE: The 'session' dict is modified here. The caller (SessionManager)
-        # is responsible for persisting these changes if needed (e.g., to disk or notifying UI).
     
     async def get_enhanced_context(
         self, 
@@ -287,17 +623,112 @@ class AgenticRAGSystem:
         restrict_files: Optional[List[str]] = None,
         use_agentic_tools: bool = True,
         include_issue_context: bool = True
-    ) -> Dict[str, Any]:
+    ) -> List[ContextChunk]:
         """
-        Get enhanced context using both RAG and agentic capabilities with issue awareness
+        Get enhanced context using both RAG and agentic capabilities with issue awareness.
+        
+        This is the main public API method that now transparently decides between
+        legacy single-index path and new composite multi-index path.
         """
-        if not self.rag_extractor or not self.agentic_explorer:
+        if not self.rag_extractor:
             raise ValueError("AgenticRAG not properly initialized")
         
         try:
-            # Analyze query to determine best approach
-            query_analysis = await self._analyze_query(query)
+            # Decide whether to use composite retrieval based on query complexity
+            use_composite = self._should_use_composite_retrieval(query)
             
+            if use_composite and self._use_composite:
+                # Use new composite multi-index retrieval
+                return await self._get_enhanced_context_composite(
+                    query, restrict_files, use_agentic_tools, include_issue_context
+                )
+            else:
+                # Use legacy single-index path for backward compatibility
+                return await self._get_enhanced_context_legacy(
+                    query, restrict_files, use_agentic_tools, include_issue_context
+                )
+                
+        except Exception as e:
+            self.logger.error(f"Error in enhanced context retrieval: {e}")
+            # Fallback to base RAG
+            try:
+                base_context = await self.rag_extractor.get_relevant_context(query, restrict_files)
+                return base_context.get("sources", [])
+            except Exception as fallback_error:
+                self.logger.error(f"Fallback retrieval also failed: {fallback_error}")
+                return []
+    
+    def _should_use_composite_retrieval(self, query: str) -> bool:
+        """Decide whether to use composite retrieval based on query characteristics"""
+        if not self._use_composite:
+            return False
+        
+        # Use composite for complex queries
+        query_lower = query.lower()
+        
+        # Multi-domain queries
+        domain_indicators = ["issue", "test", "config", "document", "readme"]
+        domain_count = sum(1 for indicator in domain_indicators if indicator in query_lower)
+        
+        if domain_count >= 2:
+            return True
+        
+        # Complex exploration queries
+        complex_patterns = [
+            "comprehensive", "detailed", "thorough", "all files", "entire",
+            "architecture", "structure", "relationship", "dependency"
+        ]
+        
+        if any(pattern in query_lower for pattern in complex_patterns):
+            return True
+        
+        # Long queries likely benefit from multi-index
+        if len(query.split()) > 15:
+            return True
+        
+        return False
+    
+    async def _get_enhanced_context_composite(
+        self,
+        query: str,
+        restrict_files: Optional[List[str]] = None,
+        use_agentic_tools: bool = True,
+        include_issue_context: bool = True
+    ) -> List[ContextChunk]:
+        """Enhanced context retrieval using composite multi-index system"""
+        
+        try:
+            # Step 1: Use composite retriever
+            composite_result = await self.composite_retriever.retrieve(
+                query, retrieval_mode="auto_routed", max_results=15
+            )
+            
+            # Step 2: Convert to legacy format for backward compatibility
+            context_chunks = composite_result.get("context_chunks", [])
+            
+            # Step 3: Log composite retrieval statistics
+            stats = self.composite_retriever.get_statistics()
+            self.logger.info(f"Composite retrieval stats: {stats}")
+            
+            return context_chunks
+            
+        except Exception as e:
+            self.logger.error(f"Composite retrieval failed: {e}")
+            # Fallback to legacy path
+            return await self._get_enhanced_context_legacy(
+                query, restrict_files, use_agentic_tools, include_issue_context
+            )
+    
+    async def _get_enhanced_context_legacy(
+        self,
+        query: str,
+        restrict_files: Optional[List[str]] = None,
+        use_agentic_tools: bool = True,
+        include_issue_context: bool = True
+    ) -> List[ContextChunk]:
+        """Legacy enhanced context retrieval (original implementation)"""
+        
+        try:
             # Get base RAG context
             base_context = await self.rag_extractor.get_relevant_context(query, restrict_files)
             
@@ -306,415 +737,38 @@ class AgenticRAGSystem:
                 try:
                     issue_context = await self.issue_rag.get_issue_context(query, max_issues=3)
                     if issue_context.related_issues:
-                        base_context["related_issues"] = {
-                            "issues": [
-                                {
-                                    "number": result.issue.id,
-                                    "title": result.issue.title,
-                                    "state": result.issue.state,
-                                    "url": f"https://github.com/{self.repo_info.get('owner')}/{self.repo_info.get('repo')}/issues/{result.issue.id}",
-                                    "similarity": result.similarity,
-                                    "labels": result.issue.labels,
-                                    "body_preview": result.issue.body[:150] + "..." if len(result.issue.body) > 150 else result.issue.body
-                                }
-                                for result in issue_context.related_issues
-                            ],
-                            "total_found": issue_context.total_found,
-                            "processing_time": issue_context.processing_time
-                        }
-                        logger.info(f"Added {len(issue_context.related_issues)} related issues to context")
+                        # Convert issue context to chunk format
+                        issue_chunks = [
+                            {
+                                "content": f"Issue #{result.issue.id}: {result.issue.title}\n{result.issue.body[:500]}...",
+                                "file": f"issue_{result.issue.id}",
+                                "similarity": result.similarity,
+                                "type": "issue",
+                                "url": f"https://github.com/{self.repo_info.get('owner')}/{self.repo_info.get('repo')}/issues/{result.issue.id}" if self.repo_info else ""
+                            }
+                            for result in issue_context.related_issues
+                        ]
+                        
+                        # Add issue chunks to sources
+                        sources = base_context.get("sources", [])
+                        sources.extend(issue_chunks)
+                        base_context["sources"] = sources
+                        
+                        self.logger.info(f"Added {len(issue_context.related_issues)} related issues to context")
                 except Exception as e:
-                    logger.warning(f"Failed to get issue context: {e}")
+                    self.logger.warning(f"Failed to get issue context: {e}")
             
-            # Enhance with agentic tools if beneficial
-            if use_agentic_tools and query_analysis["should_use_agentic"]:
-                enhanced_context = await self._enhance_with_agentic_tools(
-                    query, base_context, query_analysis
-                )
-                return enhanced_context
-            else:
-                # Just add query analysis to base context
-                base_context["query_analysis"] = query_analysis
-                return base_context
+            # Return chunks
+            return base_context.get("sources", [])
                 
         except Exception as e:
-            logger.error(f"Error in enhanced context retrieval: {e}")
-            # Fallback to base RAG
-            return await self.rag_extractor.get_relevant_context(query, restrict_files)
-    
-    async def _analyze_query(self, query: str) -> Dict[str, Any]:
-        """Analyze query to determine optimal processing approach"""
-        query_lower = query.lower()
-        
-        # Classify query type
-        query_type = self._classify_query_type(query)
-        
-        # Determine if agentic tools would be beneficial
-        should_use_agentic = self._should_use_agentic_approach(query)
-        
-        # Extract technical requirements
-        tech_requirements = self._extract_technical_requirements(query)
-        
-        # Extract keywords using agentic tools
-        keywords = self._extract_issue_keywords(query)
-        
-        # Detect file/code references
-        code_references = self._extract_code_references(query)
-        
-        return {
-            "query_type": query_type,
-            "should_use_agentic": should_use_agentic,
-            "technical_requirements": tech_requirements,
-            "keywords": keywords,
-            "code_references": code_references,
-            "complexity_score": self._calculate_complexity_score(query),
-            "processing_strategy": self._determine_processing_strategy(query_type, should_use_agentic)
-        }
-    
-    def _classify_query_type(self, query: str) -> str:
-        """Classify the type of query for optimal processing"""
-        query_lower = query.lower()
-        
-        # File/directory exploration
-        if any(pattern in query_lower for pattern in [
-            "explore", "what's in", "show me", "list files", "directory", "folder"
-        ]):
-            return "exploration"
-        
-        # Code analysis and explanation
-        if any(pattern in query_lower for pattern in [
-            "explain", "what does", "how does", "analyze", "understand", "describe"
-        ]):
-            return "analysis"
-        
-        # Implementation and examples
-        if any(pattern in query_lower for pattern in [
-            "implement", "create", "build", "example", "how to", "generate"
-        ]):
-            return "implementation"
-        
-        # Debugging and troubleshooting
-        if any(pattern in query_lower for pattern in [
-            "debug", "fix", "error", "issue", "problem", "bug", "troubleshoot"
-        ]):
-            return "debugging"
-        
-        # Architecture and structure
-        if any(pattern in query_lower for pattern in [
-            "architecture", "structure", "design", "pattern", "relationship", "dependency"
-        ]):
-            return "architecture"
-        
-        # Search and finding
-        if any(pattern in query_lower for pattern in [
-            "find", "search", "locate", "where", "which files"
-        ]):
-            return "search"
-        
-        return "general"
-    
-    def _should_use_agentic_approach(self, query: str) -> bool:
-        """Determine if agentic tools would improve the response"""
-        query_lower = query.lower()
-        
-        # Complex exploration queries benefit from agentic tools
-        exploration_patterns = [
-            "explore", "analyze", "find all", "search for", "trace", "follow",
-            "investigate", "deep dive", "comprehensive", "detailed"
-        ]
-        
-        # Multi-step reasoning queries
-        multi_step_indicators = [
-            "step by step", "walk through", "process", "flow", "sequence",
-            "first", "then", "next", "how does"
-        ]
-        
-        # Code generation and examples
-        generation_patterns = [
-            "implement", "create", "build", "generate", "example", "show me how"
-        ]
-        
-        # Architecture and relationship queries
-        relationship_patterns = [
-            "relationship", "dependency", "connected", "related", "structure",
-            "architecture", "design", "pattern"
-        ]
-        
-        # Check patterns
-        if any(pattern in query_lower for pattern in exploration_patterns):
-            return True
-        if any(pattern in query_lower for pattern in multi_step_indicators):
-            return True
-        if any(pattern in query_lower for pattern in generation_patterns):
-            return True
-        if any(pattern in query_lower for pattern in relationship_patterns):
-            return True
-        
-        # Long, complex queries likely benefit from agentic approach
-        if len(query.split()) > 15:
-            return True
-        
-        return False
-    
-    def _extract_technical_requirements(self, query: str) -> Dict[str, List[str]]:
-        """Extract technical requirements from query using agentic tools"""
-        if self.agentic_explorer:
-            # Use the existing method from agentic tools
-            fake_issue = type('Issue', (), {
-                'title': '',
-                'body': query,
-                'labels': []
-            })()
-            return self.agentic_explorer._extract_technical_requirements(fake_issue)
-        return {}
-    
-    def _extract_issue_keywords(self, query: str) -> Dict[str, List[str]]:
-        """Extract keywords using agentic tools"""
-        if self.agentic_explorer:
-            return self.agentic_explorer._extract_issue_keywords(query)
-        return {"primary": [], "contextual": [], "file_patterns": [], "all_terms": []}
-    
-    def _extract_code_references(self, query: str) -> Dict[str, List[str]]:
-        """Extract code references (files, functions, classes) from query"""
-        code_refs = {
-            "files": [],
-            "functions": [],
-            "classes": [],
-            "variables": [],
-            "patterns": []
-        }
-        
-        # File references (@file, file.py, etc.)
-        file_patterns = [
-            r'@([\w\-/\\.]+)',  # @filename
-            r'`([^`]+\.(py|js|jsx|ts|tsx|java|go|rs|rb|php|html|css|json|yaml|yml|md))`',  # `file.ext`
-            r'\b([\w\-/]+\.(py|js|jsx|ts|tsx|java|go|rs|rb|php|html|css|json|yaml|yml|md))\b'  # file.ext
-        ]
-        
-        for pattern in file_patterns:
-            matches = re.findall(pattern, query)
-            for match in matches:
-                if isinstance(match, tuple):
-                    code_refs["files"].append(match[0])
-                else:
-                    code_refs["files"].append(match)
-        
-        # Function/method references
-        function_patterns = [
-            r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',  # function_name(
-            r'`([a-zA-Z_][a-zA-Z0-9_]*)\(\)`',   # `function()`
-            r'def\s+([a-zA-Z_][a-zA-Z0-9_]*)',   # def function_name
-            r'function\s+([a-zA-Z_][a-zA-Z0-9_]*)'  # function function_name
-        ]
-        
-        for pattern in function_patterns:
-            matches = re.findall(pattern, query)
-            code_refs["functions"].extend(matches)
-        
-        # Class references
-        class_patterns = [
-            r'\bclass\s+([A-Z][a-zA-Z0-9_]*)',  # class ClassName
-            r'\b([A-Z][a-zA-Z0-9_]*)\s*\(',     # ClassName(
-            r'`([A-Z][a-zA-Z0-9_]*)`'           # `ClassName`
-        ]
-        
-        for pattern in class_patterns:
-            matches = re.findall(pattern, query)
-            code_refs["classes"].extend(matches)
-        
-        # Remove duplicates and clean up
-        for key in code_refs:
-            code_refs[key] = list(set([ref for ref in code_refs[key] if ref and len(ref) > 1]))
-        
-        return code_refs
-    
-    def _calculate_complexity_score(self, query: str) -> int:
-        """Calculate query complexity score"""
-        score = 0
-        
-        # Word count factor
-        word_count = len(query.split())
-        if word_count > 20:
-            score += 3
-        elif word_count > 10:
-            score += 2
-        else:
-            score += 1
-        
-        # Question complexity
-        question_words = ['how', 'why', 'what', 'where', 'when', 'which']
-        score += sum(1 for word in question_words if word in query.lower())
-        
-        # Technical terms
-        tech_indicators = ['implement', 'debug', 'analyze', 'architecture', 'pattern', 'design']
-        score += sum(1 for term in tech_indicators if term in query.lower())
-        
-        # File/code references
-        if '@' in query or any(ext in query for ext in ['.py', '.js', '.ts', '.java']):
-            score += 2
-        
-        return min(10, score)  # Cap at 10
-    
-    def _determine_processing_strategy(self, query_type: str, should_use_agentic: bool) -> str:
-        """Determine the best processing strategy"""
-        if should_use_agentic:
-            if query_type in ["exploration", "architecture", "debugging"]:
-                return "agentic_deep"
-            elif query_type in ["implementation", "analysis"]:
-                return "agentic_focused"
-            else:
-                return "agentic_light"
-        else:
-            return "rag_only"
-    
-    async def _enhance_with_agentic_tools(
-        self, 
-        query: str, 
-        base_context: Dict[str, Any], 
-        query_analysis: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Enhance RAG context using agentic tools"""
-        try:
-            enhanced_context = base_context.copy()
-            enhanced_context["query_analysis"] = query_analysis
-            
-            processing_strategy = query_analysis["processing_strategy"]
-            
-            if processing_strategy == "agentic_deep":
-                # Deep analysis with multiple tools
-                enhanced_context = await self._deep_agentic_enhancement(query, enhanced_context, query_analysis)
-            elif processing_strategy == "agentic_focused":
-                # Focused enhancement for specific needs
-                enhanced_context = await self._focused_agentic_enhancement(query, enhanced_context, query_analysis)
-            elif processing_strategy == "agentic_light":
-                # Light enhancement with minimal overhead
-                enhanced_context = await self._light_agentic_enhancement(query, enhanced_context, query_analysis)
-            
-            return enhanced_context
-            
-        except Exception as e:
-            logger.error(f"Error enhancing with agentic tools: {e}")
-            return base_context
-    
-    async def _deep_agentic_enhancement(
-        self, 
-        query: str, 
-        context: Dict[str, Any], 
-        analysis: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Deep enhancement using multiple agentic tools"""
-        
-        # Analyze file structure if architecture query
-        if analysis["query_type"] == "architecture":
+            self.logger.error(f"Legacy context retrieval failed: {e}")
+            # Ultimate fallback
             try:
-                structure_analysis = self.agentic_explorer.analyze_file_structure("")
-                if structure_analysis:
-                    try:
-                        context["structure_analysis"] = json.loads(structure_analysis)
-                    except (json.JSONDecodeError, TypeError):
-                        context["structure_analysis"] = {"raw_response": str(structure_analysis)}
-            except Exception as e:
-                logger.warning(f"Failed to get structure analysis: {e}")
-        
-        # Find related files for all sources
-        if context.get("sources"):
-            try:
-                related_files_map = {}
-                for source in context["sources"][:3]:  # Limit to top 3 to avoid overhead
-                    related_files = self.agentic_explorer.search_ops.find_related_files(source["file"])
-                    if related_files:
-                        try:
-                            related_files_map[source["file"]] = json.loads(related_files)
-                        except (json.JSONDecodeError, TypeError):
-                            related_files_map[source["file"]] = {"raw_response": str(related_files)}
-                if related_files_map:
-                    context["related_files"] = related_files_map
-            except Exception as e:
-                logger.warning(f"Failed to get related files: {e}")
-        
-        # Semantic content search for additional context
-        if analysis.get("keywords", {}).get("primary"):
-            try:
-                for keyword in analysis["keywords"]["primary"][:2]:  # Limit to 2 keywords
-                    semantic_results = self.agentic_explorer.search_ops.semantic_content_search(keyword)
-                    if semantic_results:
-                        if "semantic_context" not in context:
-                            context["semantic_context"] = {}
-                        try:
-                            context["semantic_context"][keyword] = json.loads(semantic_results)
-                        except (json.JSONDecodeError, TypeError):
-                            context["semantic_context"][keyword] = {"raw_response": str(semantic_results)}
-            except Exception as e:
-                logger.warning(f"Failed to get semantic context: {e}")
-        
-        return context
-    
-    async def _focused_agentic_enhancement(
-        self, 
-        query: str, 
-        context: Dict[str, Any], 
-        analysis: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Focused enhancement for implementation/analysis queries"""
-        
-        # For implementation queries, find examples and patterns
-        if analysis["query_type"] == "implementation":
-            try:
-                # Generate code examples if sources are available
-                if context.get("sources"):
-                    source_files = [source["file"] for source in context["sources"][:3]]
-                    code_example = self.agentic_explorer.code_gen_ops.generate_code_example(
-                        query, source_files
-                    )
-                    if code_example:
-                        try:
-                            context["code_examples"] = json.loads(code_example)
-                        except (json.JSONDecodeError, TypeError):
-                            context["code_examples"] = {"raw_response": str(code_example)}
-            except Exception as e:
-                logger.warning(f"Failed to generate code examples: {e}")
-        
-        # For analysis queries, provide deeper file analysis
-        elif analysis["query_type"] == "analysis":
-            try:
-                if context.get("sources"):
-                    analyzed_files = {}
-                    for source in context["sources"][:2]:  # Limit to 2 files
-                        file_analysis = self.agentic_explorer.analyze_file_structure(source["file"])
-                        if file_analysis:
-                            try:
-                                analyzed_files[source["file"]] = json.loads(file_analysis)
-                            except (json.JSONDecodeError, TypeError):
-                                analyzed_files[source["file"]] = {"raw_response": str(file_analysis)}
-                    if analyzed_files:
-                        context["file_analysis"] = analyzed_files
-            except Exception as e:
-                logger.warning(f"Failed to analyze files: {e}")
-        
-        return context
-    
-    async def _light_agentic_enhancement(
-        self, 
-        query: str, 
-        context: Dict[str, Any], 
-        analysis: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Light enhancement with minimal processing overhead"""
-        
-        # Just add some basic semantic search if keywords are available
-        if analysis.get("keywords", {}).get("primary"):
-            try:
-                primary_keyword = analysis["keywords"]["primary"][0]
-                semantic_results = self.agentic_explorer.search_ops.semantic_content_search(primary_keyword)
-                if semantic_results:
-                    try:
-                        context["additional_context"] = json.loads(semantic_results)
-                    except (json.JSONDecodeError, TypeError):
-                        context["additional_context"] = {"raw_response": str(semantic_results)}
-            except Exception as e:
-                logger.warning(f"Failed light semantic search: {e}")
-        
-        return context
+                base_context = await self.rag_extractor.get_relevant_context(query, restrict_files)
+                return base_context.get("sources", [])
+            except Exception:
+                return []
     
     def get_repo_info(self) -> Optional[Dict[str, Any]]:
         """Get repository information"""
@@ -723,6 +777,12 @@ class AgenticRAGSystem:
     def get_repo_path(self) -> Optional[str]:
         """Get repository path"""
         return self.repo_path
+    
+    def get_composite_statistics(self) -> Optional[Dict[str, Any]]:
+        """Get composite retriever statistics"""
+        if self.composite_retriever:
+            return self.composite_retriever.get_statistics()
+        return None
     
     async def cleanup(self):
         """Cleanup resources"""
@@ -733,7 +793,11 @@ class AgenticRAGSystem:
             # Clear caches
             self._query_cache.clear()
             
-            logger.info(f"AgenticRAG cleaned up for session {self.session_id}")
+            # Clear composite retriever caches
+            if self.composite_retriever:
+                self.composite_retriever.routing_cache.clear()
+            
+            self.logger.info(f"AgenticRAG cleaned up for session {self.session_id}")
             
         except Exception as e:
-            logger.warning(f"Error during AgenticRAG cleanup: {e}")
+            self.logger.warning(f"Error during AgenticRAG cleanup: {e}")

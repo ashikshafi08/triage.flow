@@ -508,25 +508,48 @@ class GitOperations:
             })
 
     # Commit Index Manager dependent methods
-    async def search_commits( # Made async to align with CommitIndexManager
+    def search_commits( # Made sync for tool compatibility
         self,
         query: Annotated[str, "Search query for commit messages and metadata"],
         k: Annotated[int, "Number of commits to return (default: 10)"] = 10,
         author_filter: Annotated[Optional[str], "Filter by author name (optional)"] = None,
-        file_filter: Annotated[Optional[str], "Filter by file path (optional)"] = None
+        file_filter: Annotated[Optional[str], "Filter by file path (optional)"] = None,
+        path: Annotated[Optional[str], "Alternative parameter name for file_filter (for backward compatibility)"] = None
     ) -> str:
         try:
-            if not self.commit_index_manager.is_initialized():
-                return self._search_commits_fallback(query, k, author_filter, file_filter)
+            # Handle backward compatibility: use path if provided, otherwise use file_filter
+            effective_file_filter = path if path else file_filter
             
-            file_filter_list = [file_filter] if file_filter else None
-            results = await self.commit_index_manager.search_commits(
-                query, k=k, author_filter=author_filter, file_filter=file_filter_list
-            )
+            if not self.commit_index_manager.is_initialized():
+                return self._search_commits_fallback(query, k, author_filter, effective_file_filter)
+            
+            file_filter_list = [effective_file_filter] if effective_file_filter else None
+            
+            # Handle async call from sync context
+            try:
+                loop = asyncio.get_running_loop()
+                # We're in an async context, use concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        self.commit_index_manager.search_commits(
+                            query, k=k, author_filter=author_filter, file_filter=file_filter_list
+                        )
+                    )
+                    results = future.result(timeout=30)
+            except RuntimeError:
+                # No event loop running
+                results = asyncio.run(
+                    self.commit_index_manager.search_commits(
+                        query, k=k, author_filter=author_filter, file_filter=file_filter_list
+                    )
+                )
+            
             return json.dumps([r.to_dict() for r in results], indent=2) # Assuming SearchResult has to_dict
         except Exception as e:
             logger.error(f"Error in search_commits: {e}")
-            return self._search_commits_fallback(query, k, author_filter, file_filter)
+            effective_file_filter = path if path else file_filter
+            return self._search_commits_fallback(query, k, author_filter, effective_file_filter)
 
     def _search_commits_fallback(self, query: str, k: int, author_filter: Optional[str], file_filter: Optional[str]) -> str:
         """Fallback git log search when commit index is not available"""

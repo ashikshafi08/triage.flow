@@ -126,9 +126,22 @@ async def handle_chat_message(
             sources_count = len(enhanced_context["sources"])
             query_analysis = enhanced_context.get("query_analysis", {})
             processing_strategy = query_analysis.get("processing_strategy", "unknown")
-            print(f"AgenticRAG retrieved {sources_count} sources using strategy: {processing_strategy}")
+            
+            # Check if composite retrieval was used
+            composite_used = agentic_rag._use_composite
+            retrieval_type = "composite multi-index" if composite_used else "legacy single-index"
+            
+            print(f"AgenticRAG retrieved {sources_count} sources using {retrieval_type} retrieval, strategy: {processing_strategy}")
             if folder_mentions:
                 print(f"Folder-restricted query for folders: {folder_mentions}")
+            
+            # Log composite retrieval stats if available
+            if composite_used and hasattr(agentic_rag, 'composite_retriever'):
+                stats = agentic_rag.get_composite_statistics()
+                if stats:
+                    indices_used = stats.get("available_indices", [])
+                    total_queries = stats.get("total_queries", 0)
+                    print(f"Composite retrieval used indices: {indices_used}, total queries: {total_queries}")
         else:
             print("No enhanced context sources retrieved")
         

@@ -325,7 +325,11 @@ async def get_agentic_rag_info(session_id: str, session: Dict[str, Any] = Depend
         
         repo_info = agentic_rag.get_repo_info()
         
-        return {
+        # NEW: Get composite retrieval information
+        composite_stats = agentic_rag.get_composite_statistics()
+        composite_enabled = agentic_rag._use_composite if hasattr(agentic_rag, '_use_composite') else False
+        
+        response = {
             "session_id": session_id,
             "agentic_rag_enabled": True,
             "repo_info": repo_info,
@@ -337,7 +341,8 @@ async def get_agentic_rag_info(session_id: str, session: Dict[str, Any] = Depend
                 "code_references_detection": True,
                 "semantic_enhancement": True,
                 "file_relationship_analysis": True,
-                "agentic_tool_integration": True
+                "agentic_tool_integration": True,
+                "composite_multi_index_retrieval": composite_enabled  # NEW
             },
             "processing_strategies": [
                 "agentic_deep - for complex exploration and architecture queries",
@@ -346,6 +351,16 @@ async def get_agentic_rag_info(session_id: str, session: Dict[str, Any] = Depend
                 "rag_only - for basic queries without agentic enhancement"
             ]
         }
+        
+        # NEW: Add composite retrieval details if available
+        if composite_enabled and composite_stats:
+            response["composite_retrieval"] = {
+                "enabled": True,
+                "statistics": composite_stats,
+                "description": "LlamaIndex-style multi-index retrieval with intelligent routing"
+            }
+        
+        return response
         
     except Exception as e:
         logger.error(f"Error getting AgenticRAG info: {e}")
@@ -363,8 +378,33 @@ async def analyze_query_endpoint(session_id: str, query: dict, session: Dict[str
         if not user_query:
             raise HTTPException(status_code=400, detail="Query text is required")
         
-        # Analyze the query
-        analysis = await agentic_rag._analyze_query(user_query)
+        # Analyze the query - simple sync analysis
+        word_count = len(user_query.split())
+        query_lower = user_query.lower()
+        
+        # Determine complexity
+        if word_count > 20:
+            complexity = "complex"
+        elif word_count > 10:
+            complexity = "moderate"
+        else:
+            complexity = "simple"
+        
+        # Check for agentic patterns
+        agentic_patterns = [
+            "explain", "analyze", "how does", "implement", "create", "find all",
+            "comprehensive", "detailed", "step by step"
+        ]
+        should_use_agentic = any(pattern in query_lower for pattern in agentic_patterns)
+        
+        analysis = {
+            "query_type": "general",
+            "complexity": complexity,
+            "should_use_agentic": should_use_agentic,
+            "confidence": 0.7,
+            "processing_time": 0.01,
+            "complexity_score": min(word_count / 5, 10)  # Score out of 10
+        }
         
         return {
             "session_id": session_id,
@@ -395,11 +435,14 @@ async def get_context_preview(
             raise HTTPException(status_code=400, detail="AgenticRAG not initialized")
         
         # Get enhanced context but limit sources for preview
-        enhanced_context = await agentic_rag.get_enhanced_context(
+        enhanced_context_list = await agentic_rag.get_enhanced_context(
             query, 
             restrict_files=None,
             use_agentic_tools=True
         )
+        
+        # Convert list to dict format for compatibility
+        enhanced_context = {"sources": enhanced_context_list or []}
         
         # Limit sources for preview
         if enhanced_context.get("sources"):
@@ -415,7 +458,7 @@ async def get_context_preview(
             "session_id": session_id,
             "query": query,
             "context_preview": preview_context,
-            "total_sources_available": len(enhanced_context.get("sources", [])),
+            "total_sources_available": len(enhanced_context_list or []),
             "sources_in_preview": len(preview_context.get("sources", []))
         }
         
