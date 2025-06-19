@@ -52,6 +52,30 @@ class CommitMeta:
     parent_shas: List[str]
     branch_info: Optional[str] = None
     pr_number: Optional[int] = None  # Extracted from commit message if available
+    
+    def to_dict(self) -> dict:
+        """Convert CommitMeta to dictionary for JSON serialization"""
+        return {
+            "sha": self.sha,
+            "author_name": self.author_name,
+            "author_email": self.author_email,
+            "committer_name": self.committer_name,
+            "committer_email": self.committer_email,
+            "commit_date": self.commit_date,
+            "author_date": self.author_date,
+            "subject": self.subject,
+            "body": self.body,
+            "files_changed": self.files_changed,
+            "files_added": self.files_added,
+            "files_modified": self.files_modified,
+            "files_deleted": self.files_deleted,
+            "insertions": self.insertions,
+            "deletions": self.deletions,
+            "is_merge": self.is_merge,
+            "parent_shas": self.parent_shas,
+            "branch_info": self.branch_info,
+            "pr_number": self.pr_number
+        }
 
 @dataclass
 class CommitSearchResult:
@@ -60,6 +84,15 @@ class CommitSearchResult:
     similarity: float
     match_reasons: List[str]
     file_relevance: float = 0.0  # For file-specific searches
+    
+    def to_dict(self) -> dict:
+        """Convert CommitSearchResult to dictionary for JSON serialization"""
+        return {
+            "commit": self.commit.to_dict(),
+            "similarity": self.similarity,
+            "match_reasons": self.match_reasons,
+            "file_relevance": self.file_relevance
+        }
 
 class CommitIndexer:
     """Handles indexing and storage of Git commit metadata"""

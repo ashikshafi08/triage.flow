@@ -186,8 +186,63 @@ class AgenticCodebaseExplorer:
         except Exception as e:
             logger.warning(f"Failed to initialize commit index: {e}")
         
-    def create_enhanced_agent(self, max_iterations: int = 30) -> ReActAgent:
-        """Create a specialized agent with higher iteration limit for complex analysis"""
+    def _calculate_dynamic_iterations(self, query: str) -> int:
+        """Calculate dynamic iteration limit based on query complexity like professional tools"""
+        base_iterations = settings.AGENTIC_MAX_ITERATIONS
+        
+        if not settings.AGENTIC_DYNAMIC_ITERATIONS:
+            return base_iterations
+        
+        # Analyze query complexity
+        query_lower = query.lower()
+        word_count = len(query.split())
+        
+        complexity_score = 0
+        
+        # Word count factor
+        if word_count > 20:
+            complexity_score += 2
+        elif word_count > 10:
+            complexity_score += 1
+        
+        # File mentions (like @folder/examples)
+        file_mentions = query.count('@')
+        complexity_score += file_mentions * 0.5
+        
+        # Complex operation indicators
+        complex_patterns = [
+            'integrate', 'trace', 'show', 'analyze', 'compare', 'find all',
+            'commits that', 'file contents', 'relationship', 'dependency',
+            'evolution', 'history', 'timeline', 'comprehensive'
+        ]
+        pattern_matches = sum(1 for pattern in complex_patterns if pattern in query_lower)
+        complexity_score += pattern_matches * 0.8
+        
+        # Multiple questions/requirements
+        question_indicators = query.count('?') + query.count(' and ') + query.count(' show ')
+        complexity_score += question_indicators * 0.7
+        
+        # Calculate final iterations
+        if complexity_score >= 3:
+            # High complexity - use multiplier
+            iterations = int(base_iterations * settings.AGENTIC_COMPLEXITY_MULTIPLIER)
+        elif complexity_score >= 2:
+            # Medium complexity
+            iterations = int(base_iterations * 1.5)
+        else:
+            # Simple query
+            iterations = base_iterations
+        
+        # Cap at reasonable limits
+        return min(max(iterations, settings.AGENTIC_MIN_ITERATIONS), 100)
+    
+    def create_enhanced_agent(self, query: str = "", max_iterations: int = None) -> ReActAgent:
+        """Create a specialized agent with dynamic iteration limit for complex analysis"""
+        if max_iterations is None:
+            max_iterations = self._calculate_dynamic_iterations(query) if query else settings.AGENTIC_MAX_ITERATIONS
+        
+        logger.info(f"Creating enhanced agent with {max_iterations} iterations for query complexity")
+        
         return ReActAgent.from_tools(
             tools=self.tools,
             llm=self.base_llm,
@@ -204,11 +259,30 @@ class AgenticCodebaseExplorer:
             # Start execution context for this query
             execution_context = self.context_manager.start_execution(user_message)
             
+            # Always use dynamic iteration management for better performance like professional tools
+            dynamic_iterations = self._calculate_dynamic_iterations(user_message)
+            logger.info(f"Calculated {dynamic_iterations} iterations for query complexity")
+            
             with capture_output() as (stdout_buffer, stderr_buffer):
-                if use_enhanced_agent:
-                    response = await self.create_enhanced_agent().achat(user_message)
+                if use_enhanced_agent or dynamic_iterations > settings.AGENTIC_MAX_ITERATIONS:
+                    # Use enhanced agent with dynamic iterations for complex queries
+                    enhanced_agent = self.create_enhanced_agent(user_message)
+                    response = await enhanced_agent.achat(user_message)
                 else:
-                    response = await self.agent.achat(user_message)
+                    # For simple queries, still use dynamic iterations but with regular agent
+                    if dynamic_iterations != settings.AGENTIC_MAX_ITERATIONS:
+                        # Create a temporary agent with adjusted iterations
+                        temp_agent = ReActAgent.from_tools(
+                            tools=self.tools,
+                            llm=self.base_llm,
+                            memory=self.memory,
+                            verbose=True,
+                            max_iterations=dynamic_iterations,
+                            system_prompt=DEFAULT_SYSTEM_PROMPT
+                        )
+                        response = await temp_agent.achat(user_message)
+                    else:
+                        response = await self.agent.achat(user_message)
             
             logger.info(f"Agentic analysis completed successfully")
             
@@ -236,7 +310,14 @@ class AgenticCodebaseExplorer:
             # Enhance final answer with context information if available
             enhanced_final_answer = self._enhance_final_answer_with_context(final_answer, execution_context)
             
-            return format_agentic_response(steps, enhanced_final_answer, partial=False, suggestions=suggestions)
+            return format_agentic_response(
+                steps, 
+                enhanced_final_answer, 
+                partial=False, 
+                suggestions=suggestions,
+                repo_path=str(self.repo_path) if hasattr(self, 'repo_path') else None,
+                user_query=user_message
+            )
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Error in agentic query: {error_msg}")
@@ -249,9 +330,37 @@ class AgenticCodebaseExplorer:
             # Start execution context for this query
             execution_context = self.context_manager.start_execution(user_message)
             
-            yield json.dumps({"type": "status", "content": "Starting analysis...", "step": 0})
+            # Calculate dynamic iterations for professional-grade handling
+            dynamic_iterations = self._calculate_dynamic_iterations(user_message)
+            logger.info(f"[stream] Using {dynamic_iterations} iterations for query complexity")
+            
+            yield json.dumps({
+                "type": "status", 
+                "content": f"Starting analysis with {dynamic_iterations} max iterations...", 
+                "step": 0
+            })
+            
             with capture_output() as (stdout_buffer, stderr_buffer):
-                response = await self.agent.achat(user_message)
+                # Use appropriate agent based on complexity
+                if dynamic_iterations > settings.AGENTIC_MAX_ITERATIONS:
+                    # Complex query - use enhanced agent
+                    enhanced_agent = self.create_enhanced_agent(user_message)
+                    response = await enhanced_agent.achat(user_message)
+                else:
+                    # Simple to medium complexity - use optimized agent
+                    if dynamic_iterations != settings.AGENTIC_MAX_ITERATIONS:
+                        # Create agent with adjusted iterations
+                        temp_agent = ReActAgent.from_tools(
+                            tools=self.tools,
+                            llm=self.base_llm,
+                            memory=self.memory,
+                            verbose=True,
+                            max_iterations=dynamic_iterations,
+                            system_prompt=DEFAULT_SYSTEM_PROMPT
+                        )
+                        response = await temp_agent.achat(user_message)
+                    else:
+                        response = await self.agent.achat(user_message)
             
             # Get execution summary
             summary = self.context_manager.get_execution_summary()
@@ -280,9 +389,22 @@ class AgenticCodebaseExplorer:
             # Enhance final answer with context information
             enhanced_final_answer = self._enhance_final_answer_with_context(final_answer, execution_context)
             
+            # Apply professional formatting for streaming response
+            formatted_response = format_agentic_response(
+                steps, 
+                enhanced_final_answer, 
+                partial=False, 
+                suggestions=suggestions or [],
+                repo_path=str(self.repo_path) if hasattr(self, 'repo_path') else None,
+                user_query=user_message
+            )
+            
+            # Parse the formatted response and add stream-specific fields
+            formatted_data = json.loads(formatted_response)
             final_payload = {
-                "type": "final", "final": True, "steps": steps, "final_answer": enhanced_final_answer,
-                "partial": False, "suggestions": suggestions or [], "total_steps": len(steps),
+                **formatted_data,
+                "final": True,
+                "total_steps": len(steps),
                 "execution_summary": summary  # Include execution summary in stream
             }
             yield json.dumps(final_payload)

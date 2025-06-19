@@ -3,8 +3,18 @@
 import json
 import logging
 import re
+from pathlib import Path
+from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
+
+# Import the professional response formatter
+try:
+    from ..response_formatter import ResponseFormatter, ResponseType
+except ImportError:
+    # Fallback if formatter not available
+    ResponseFormatter = None
+    ResponseType = None
 
 def parse_react_steps(raw_response: str):
     """Parse ReAct steps from raw agent response into a structured format."""
@@ -157,15 +167,53 @@ def parse_react_steps(raw_response: str):
     logger.info(f"[DEBUG] Parsed {len(steps)} steps. Final answer derived: {bool(final_answer_content)}")
     return steps, final_answer_content
 
-def format_agentic_response(steps, final_answer=None, partial=False, suggestions=None):
-    """Format agentic output as structured JSON for the frontend UI."""
-    return json.dumps({
+def format_agentic_response(steps, final_answer=None, partial=False, suggestions=None, repo_path=None, user_query=None):
+    """Format agentic output as structured JSON for the frontend UI with professional formatting."""
+    
+    # Basic response structure for backward compatibility
+    basic_response = {
         "type": "final",
         "steps": steps,
         "final_answer": final_answer,
         "partial": partial,
         "suggestions": suggestions or []
-    })
+    }
+    
+    # Try to apply professional formatting if formatter is available
+    if ResponseFormatter and not partial and final_answer:
+        try:
+            # Initialize formatter with repo path if available
+            if repo_path:
+                formatter = ResponseFormatter(Path(repo_path))
+                
+                # Extract tool information from steps for better formatting
+                tool_name = None
+                tool_output = None
+                
+                # Find the last observation step which usually contains the main result
+                for step in reversed(steps):
+                    if step.get("type") == "observation" and step.get("observed_tool_name"):
+                        tool_name = step.get("observed_tool_name")
+                        tool_output = step.get("content")
+                        break
+                
+                # Format the response professionally
+                structured_response = formatter.format_response(
+                    raw_content=tool_output if tool_output else final_answer,
+                    tool_name=tool_name,
+                    query=user_query
+                )
+                
+                # Add structured response to the basic response
+                basic_response["structured_response"] = structured_response.to_dict()
+                
+                logger.info(f"Applied professional formatting for {structured_response.response_type.value} response")
+                
+        except Exception as e:
+            logger.warning(f"Failed to apply professional formatting: {e}")
+            # Continue with basic response if formatting fails
+    
+    return json.dumps(basic_response)
 
 def clean_captured_output(captured_output: str) -> str:
     """Clean captured output to remove logging noise but preserve ReAct trace."""

@@ -107,9 +107,13 @@ class Settings(BaseSettings):
     # Prompt Caching Configuration
     PROMPT_CACHE_MIN_TOKENS: int = int(os.getenv("PROMPT_CACHE_MIN_TOKENS", "1000"))  # Minimum tokens to enable caching
     
-    # Agentic System Configuration
-    # Increased limit for complex analysis like PR reviews
-    AGENTIC_MAX_ITERATIONS: int = int(os.getenv("AGENTIC_MAX_ITERATIONS", "12"))
+    # Agentic System Configuration - Professional-grade iteration management
+    AGENTIC_MAX_ITERATIONS: int = int(os.getenv("AGENTIC_MAX_ITERATIONS", "50"))  # Increased for complex queries
+    AGENTIC_MIN_ITERATIONS: int = int(os.getenv("AGENTIC_MIN_ITERATIONS", "5"))   # Minimum before early termination
+    AGENTIC_DYNAMIC_ITERATIONS: bool = os.getenv("AGENTIC_DYNAMIC_ITERATIONS", "true").lower() == "true"  # Enable dynamic adjustment
+    AGENTIC_COMPLEXITY_MULTIPLIER: float = float(os.getenv("AGENTIC_COMPLEXITY_MULTIPLIER", "2.0"))  # Multiply iterations for complex queries
+    AGENTIC_EARLY_SUCCESS_THRESHOLD: int = int(os.getenv("AGENTIC_EARLY_SUCCESS_THRESHOLD", "3"))  # Stop if no new info for N iterations
+    
     AGENTIC_DEBUG_MODE: bool = os.getenv("AGENTIC_DEBUG_MODE", "true").lower() == "true"  # Enable detailed agentic logging by default
     FORCE_AGENTIC_APPROACH: bool = os.getenv("FORCE_AGENTIC_APPROACH", "false").lower() == "true"  # Force all queries to use agentic
     

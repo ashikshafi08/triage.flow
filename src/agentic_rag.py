@@ -328,6 +328,7 @@ class AgenticRAGSystem:
         self.session_id = session_id
         self.rag_extractor = None
         self.agentic_explorer = None
+        self.founding_member_agent = None  # New: Advanced analysis agent
         self.issue_rag = None
         self.repo_path = None
         self.repo_info = None
@@ -479,6 +480,9 @@ class AgenticRAGSystem:
             # Initialize composite retriever
             await self._initialize_composite_retriever()
             
+            # Initialize FoundingMemberAgent for advanced analysis (but only after basic systems are ready)
+            await self._initialize_founding_member_agent()
+            
             self.logger.info(f"AgenticRAG core systems initialized for session {self.session_id}")
             
         except Exception as e:
@@ -501,6 +505,27 @@ class AgenticRAGSystem:
         except Exception as e:
             self.logger.warning(f"Failed to initialize composite retriever: {e}")
             self._use_composite = False
+    
+    async def _initialize_founding_member_agent(self) -> None:
+        """Initialize the FoundingMemberAgent for advanced repository analysis"""
+        try:
+            if self.rag_extractor and self.repo_path:
+                # Import FoundingMemberAgent
+                from .founding_member_agent import FoundingMemberAgent
+                
+                # Initialize with code RAG and issue RAG (if available)
+                self.founding_member_agent = FoundingMemberAgent(
+                    session_id=self.session_id,
+                    code_rag=self.rag_extractor,
+                    issue_rag=self.issue_rag  # May be None initially, updated later
+                )
+                
+                self.logger.info("FoundingMemberAgent initialized successfully")
+            else:
+                self.logger.warning("Cannot initialize FoundingMemberAgent: missing core components")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize FoundingMemberAgent: {e}")
+            self.founding_member_agent = None
 
     async def initialize_issue_rag_async(self, session: Dict[str, Any]) -> None:
         """Initializes the IssueAwareRAG system asynchronously and updates session status."""
@@ -588,6 +613,18 @@ class AgenticRAGSystem:
             if self._use_composite and self.composite_retriever:
                 self.composite_retriever.indices["issues"] = self.issue_rag
                 self.logger.info("Updated composite retriever with issue RAG")
+            
+            # Update FoundingMemberAgent with issue RAG
+            if self.founding_member_agent:
+                self.founding_member_agent.issue_rag = self.issue_rag
+                # Reinitialize the explorer in FoundingMemberAgent to use the new issue_rag
+                from .agent_tools.core import AgenticCodebaseExplorer
+                self.founding_member_agent.explorer = AgenticCodebaseExplorer(
+                    self.session_id, 
+                    self.repo_path, 
+                    issue_rag_system=self.issue_rag
+                )
+                self.logger.info("Updated FoundingMemberAgent with issue RAG")
             
             self.logger.info(f"Session {self.session_id}: IssueAwareRAG for {owner}/{repo_name} initialized successfully.")
             session["metadata"]["issue_rag_ready"] = True
@@ -783,6 +820,49 @@ class AgenticRAGSystem:
         if self.composite_retriever:
             return self.composite_retriever.get_statistics()
         return None
+    
+    # FoundingMemberAgent integration methods
+    async def get_file_history(self, file_path: str) -> str:
+        """Get the timeline of all PRs and issues that touched a given file"""
+        if self.founding_member_agent:
+            return self.founding_member_agent.get_file_history(file_path)
+        import json
+        return json.dumps({"error": "FoundingMemberAgent not available"})
+    
+    async def summarize_feature_evolution(self, feature_query: str) -> str:
+        """Summarize how a feature evolved over time by searching issues, PRs, and diffs"""
+        if self.founding_member_agent:
+            return self.founding_member_agent.summarize_feature_evolution(feature_query)
+        import json
+        return json.dumps({"error": "FoundingMemberAgent not available"})
+    
+    async def who_fixed_this(self, file_path: str, line_number: int = None) -> str:
+        """Find who/what last changed a file (and optionally a line)"""
+        if self.founding_member_agent:
+            return self.founding_member_agent.who_fixed_this(file_path, line_number)
+        import json
+        return json.dumps({"error": "FoundingMemberAgent not available"})
+    
+    async def who_implemented_this(self, feature_name: str, file_path: Optional[str] = None) -> str:
+        """Find who initially implemented a feature/class/function"""
+        if self.founding_member_agent:
+            return self.founding_member_agent.who_implemented_this(feature_name, file_path)
+        import json
+        return json.dumps({"error": "FoundingMemberAgent not available"})
+    
+    async def regression_detector(self, issue_query: str) -> str:
+        """Detect if a new issue is a regression of a past one"""
+        if self.founding_member_agent:
+            return await self.founding_member_agent.regression_detector(issue_query)
+        import json
+        return json.dumps({"error": "FoundingMemberAgent not available"})
+    
+    async def agentic_analysis(self, user_query: str) -> str:
+        """Perform advanced agentic analysis using FoundingMemberAgent"""
+        if self.founding_member_agent:
+            return await self.founding_member_agent.agentic_answer(user_query)
+        import json
+        return json.dumps({"error": "FoundingMemberAgent not available"})
     
     async def cleanup(self):
         """Cleanup resources"""

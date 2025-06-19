@@ -24,7 +24,8 @@ class SearchOperations:
     def search_codebase(
         self, 
         query: Annotated[str, "Search query - can be code patterns, function names, or concepts"],
-        file_types: Annotated[Optional[List[str]], "File extensions to search (e.g., ['.py', '.js']). None for all files"] = None
+        file_types: Annotated[Optional[List[str]], "File extensions to search (e.g., ['.py', '.js']). None for all files"] = None,
+        directory_path: Annotated[Optional[str], "Optional directory path to limit search scope (e.g., 'src', 'examples'). None for entire repo"] = None
     ) -> str:
         """Search through codebase files"""
         try:
@@ -36,7 +37,19 @@ class SearchOperations:
             if file_types is None:
                 file_types = ['.py', '.js', '.jsx', '.ts', '.tsx', '.json', '.yaml', '.yml', '.md', '.txt']
             
-            for file_path_obj in self.repo_path.rglob("*"):
+            # Determine search root based on directory_path
+            if directory_path:
+                search_root = self.repo_path / directory_path
+                if not search_root.exists() or not search_root.is_dir():
+                    return json.dumps({
+                        "error": f"Directory '{directory_path}' not found",
+                        "query": query,
+                        "directory_path": directory_path
+                    })
+            else:
+                search_root = self.repo_path
+            
+            for file_path_obj in search_root.rglob("*"):
                 if not file_path_obj.is_file():
                     continue
                 
@@ -80,12 +93,19 @@ class SearchOperations:
                 except Exception: # Skip files that can't be read or processed
                     continue
             
-            return json.dumps({
+            result = {
                 "query": query,
                 "files_with_matches": search_count,
                 "total_files_processed": processed_file_count,
                 "results": results
-            }, indent=2)
+            }
+            
+            # Add directory path info if specified
+            if directory_path:
+                result["search_directory"] = directory_path
+                result["search_root"] = str(search_root)
+            
+            return json.dumps(result, indent=2)
         except Exception as e:
             logger.error(f"Error searching codebase: {e}")
             return f"Error searching codebase: {str(e)}"

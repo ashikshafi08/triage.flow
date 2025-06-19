@@ -89,8 +89,40 @@ class ContextAwareTool:
                 context_used={}
             )
             
-            # Return original function result as fallback
-            return self.original_function(*args, **kwargs)
+            # Check if error is due to invalid parameters
+            if "unexpected keyword argument" in str(e):
+                # Filter out invalid parameters and retry
+                cleaned_kwargs = self._filter_invalid_parameters(kwargs)
+                logger.info(f"Retrying {self.tool_name} with cleaned parameters: {cleaned_kwargs}")
+                try:
+                    return self.original_function(*args, **cleaned_kwargs)
+                except Exception as retry_error:
+                    logger.error(f"Retry also failed for {self.tool_name}: {retry_error}")
+                    return f"Error: Tool execution failed - {str(e)}"
+            
+            # For other errors, return error message instead of retrying with same params
+            return f"Error: {str(e)}"
+    
+    def _filter_invalid_parameters(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Filter out invalid parameters based on function signature"""
+        import inspect
+        
+        try:
+            # Get the function signature
+            sig = inspect.signature(self.original_function)
+            valid_params = set(sig.parameters.keys())
+            
+            # Filter kwargs to only include valid parameters
+            cleaned_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
+            
+            invalid_params = set(kwargs.keys()) - valid_params
+            if invalid_params:
+                logger.warning(f"Filtered invalid parameters for {self.tool_name}: {invalid_params}")
+            
+            return cleaned_kwargs
+        except Exception as e:
+            logger.error(f"Error filtering parameters for {self.tool_name}: {e}")
+            return {}
     
     def _enhance_parameters_with_context(self, parameters: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -226,7 +258,7 @@ class ContextAwareToolFactory:
             self._wrap_tool(
                 explorer.search_ops.search_codebase,
                 "search_codebase",
-                "Search codebase with context from previous searches and discovered files. Use query parameter for search term and file_types parameter for extensions list (e.g., ['.py', '.js'])."
+                "Search codebase with context from previous searches and discovered files. Use query parameter for search term, file_types parameter for extensions list (e.g., ['.py', '.js']), and optional directory_path parameter to limit search scope (e.g., 'src', 'examples')."
             ),
             self._wrap_tool(
                 explorer.search_ops.find_related_files,
@@ -252,7 +284,7 @@ class ContextAwareToolFactory:
             ("get_issue_closing_info", "Get issue closing info with PR and commit context"),
             ("get_open_issues_related_to_commit", "Find related issues with commit analysis context"),
             ("find_when_feature_was_added", "Find feature addition with comprehensive git context"),
-            ("search_commits", "Search commits with context from previous git analyses"),
+            ("search_commits", "Search commits with context from previous git analyses. Use parameters: query (required), k (optional), author_filter (optional), file_filter (optional), path (optional). DO NOT use 'search_by' parameter."),
             ("get_file_timeline", "Get file timeline with comprehensive history context"),
             ("get_file_commit_statistics", "Get file stats with analysis context"),
             ("get_commit_details", "Get commit details with related commit context"),
