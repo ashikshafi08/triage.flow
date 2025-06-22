@@ -167,34 +167,10 @@ class AgentManager:
     def _get_system_prompt(self, prompt_type: str) -> str:
         """Get optimized system prompt based on query type"""
         
-        base_prompt = "You are an expert code analysis assistant with access to various tools. "
+        from .prompts import DEFAULT_SYSTEM_PROMPT
         
-        prompt_additions = {
-            "focused_search": (
-                "Focus on finding specific code elements quickly. "
-                "Use targeted searches and return relevant results immediately."
-            ),
-            "systematic_debugging": (
-                "Approach debugging systematically: understand the error, "
-                "locate relevant code, identify causes, and suggest fixes."
-            ),
-            "comprehensive_exploration": (
-                "Explore the codebase thoroughly. Start with architecture overview, "
-                "then examine key components and their relationships."
-            ),
-            "detailed_analysis": (
-                "Provide in-depth code analysis. Understand purpose and design, "
-                "examine implementation details, and identify patterns."
-            ),
-            "general_assistant": (
-                "Help with code-related tasks efficiently. Use appropriate tools "
-                "and provide clear, actionable information."
-            )
-        }
-        
-        addition = prompt_additions.get(prompt_type, prompt_additions["general_assistant"])
-        
-        return f"{base_prompt}{addition}\n\nAlways be concise and focus on answering the user's specific question."
+        # Use the main triage.flow system prompt for all agent operations
+        return DEFAULT_SYSTEM_PROMPT
     
     async def _execute_with_native_features(
         self,
