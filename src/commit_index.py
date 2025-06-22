@@ -740,9 +740,16 @@ class CommitIndexer:
                     logger.info(f"Loading VectorStoreIndex from {self.index_dir}")
                     # Ensure embed_model is set in Settings for from_persist_dir
                     Settings.embed_model = self.embed_model
-                    storage_context = StorageContext.from_defaults(persist_dir=str(self.index_dir))
-                    self.vector_index = VectorStoreIndex.from_storage(storage_context)
-                    logger.info(f"Successfully loaded VectorStoreIndex with {len(self.commit_metas)} commits")
+                    
+                    # Pre-validate vector store files for common corruption issues
+                    if not self._validate_vector_store_files():
+                        logger.warning("Vector store files failed validation, will rebuild")
+                        self._cleanup_corrupted_vector_store()
+                        self.vector_index = None
+                    else:
+                        storage_context = StorageContext.from_defaults(persist_dir=str(self.index_dir))
+                        self.vector_index = VectorStoreIndex.from_storage(storage_context)
+                        logger.info(f"Successfully loaded VectorStoreIndex with {len(self.commit_metas)} commits")
                     
                 except UnicodeDecodeError as e:
                     logger.warning(f"Vector store corrupted (UTF-8 decode error): {e}. Cleaning up and will rebuild vector store only.")
@@ -776,6 +783,27 @@ class CommitIndexer:
             logger.error(f"Failed to load existing commit index: {e}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+    
+    def _validate_vector_store_files(self) -> bool:
+        """Validate vector store files for common corruption issues"""
+        try:
+            vector_store_files = [
+                "default__vector_store.json",
+                "docstore.json", 
+                "index_store.json"
+            ]
+            
+            for file_name in vector_store_files:
+                file_path = self.index_dir / file_name
+                if file_path.exists():
+                    # Try to read and parse the JSON to check for corruption
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        json.load(f)  # This will fail if the JSON is corrupted
+            
+            return True
+        except Exception as e:
+            logger.warning(f"Vector store validation failed: {e}")
             return False
     
     def _cleanup_corrupted_vector_store(self):
@@ -823,21 +851,27 @@ class CommitIndexer:
 
     async def _save_commits(self, commits: List[CommitMeta]) -> None:
         """Save commits to storage"""
-        with open(self.commits_file, 'w', encoding='utf-8') as f:
+        with open(self.commits_file, 'w', encoding='utf-8', errors='replace') as f:
             for commit in commits:
-                f.write(json.dumps(commit.__dict__, ensure_ascii=False) + '\n')
+                # Sanitize commit data to prevent encoding issues
+                commit_dict = commit.__dict__.copy()
+                for key, value in commit_dict.items():
+                    if isinstance(value, str):
+                        # Replace problematic characters that might cause encoding issues
+                        commit_dict[key] = value.encode('utf-8', 'replace').decode('utf-8')
+                f.write(json.dumps(commit_dict, ensure_ascii=True) + '\n')
     
     async def _save_file_statistics(self) -> None:
         """Save file statistics to storage"""
-        with open(self.file_stats_file, 'w', encoding='utf-8') as f:
-            json.dump(self.file_touch_stats, f, indent=2, ensure_ascii=False)
+        with open(self.file_stats_file, 'w', encoding='utf-8', errors='replace') as f:
+            json.dump(self.file_touch_stats, f, indent=2, ensure_ascii=True)
     
     async def _save_metadata(self, total_commits: int) -> None:
         """Save index metadata"""
         metadata = {
             "total_commits": total_commits,
             "created_at": datetime.now().isoformat(),
-            "repo_path": str(self.repo_path),
+            "repo_path": str(self.repo_path.resolve()),
             "repo_key": self.repo_key,
             "embedding_model": "text-embedding-3-small"
         }

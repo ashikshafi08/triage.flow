@@ -115,11 +115,16 @@ async def list_commits(
             if not repo_path:
                 raise HTTPException(status_code=400, detail="Repository not available for this session")
             
-            # Import commit indexer
+            # Import commit indexer and utilities
             from ...commit_index import CommitIndexManager
+            from ...agent_tools.utilities import extract_repo_info
+            from pathlib import Path
             
-            # Initialize commit index manager
-            commit_manager = CommitIndexManager(repo_path)
+            # Extract repo info to ensure consistent cache keys
+            repo_owner, repo_name = extract_repo_info(Path(repo_path))
+            
+            # Initialize commit index manager with proper repo info
+            commit_manager = CommitIndexManager(repo_path, repo_owner=repo_owner, repo_name=repo_name)
             await commit_manager.initialize(max_commits=min(limit * 2, 1000))
             
             if not commit_manager.is_initialized():

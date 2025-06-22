@@ -1,6 +1,6 @@
 # src/agent_tools/tool_registry.py
 
-from typing import List, TYPE_CHECKING
+from typing import List, TYPE_CHECKING, Dict, Set
 from llama_index.core.tools import FunctionTool
 import asyncio
 import logging
@@ -49,6 +49,44 @@ def create_async_tool_wrapper(async_func, func_name: str):
     sync_wrapper.__doc__ = getattr(async_func, '__doc__', '')
     
     return sync_wrapper
+
+# Tool subset definitions for performance optimization
+TOOL_SUBSETS = {
+    "search": {
+        "tools": ["search_codebase", "find_related_files", "semantic_content_search", "read_file"],
+        "description": "Tools for searching and finding content in the codebase"
+    },
+    "file": {
+        "tools": ["read_file", "explore_directory", "analyze_file_structure", "search_codebase"],
+        "description": "Tools for file exploration and analysis"
+    },
+    "git": {
+        "tools": ["git_blame_function", "get_file_history", "get_commit_details", "search_commits", 
+                  "find_commits_touching_function", "get_function_evolution", "who_implemented_this", "read_file"],
+        "description": "Tools for git history and blame analysis"
+    },
+    "issue": {
+        "tools": ["analyze_github_issue", "find_issue_related_files", "related_issues", 
+                  "get_issue_closing_info", "find_issues_related_to_file", "check_issue_status_and_linked_pr", "read_file"],
+        "description": "Tools for GitHub issue analysis and tracking"
+    },
+    "pr": {
+        "tools": ["get_pr_for_issue", "get_pr_diff", "get_files_changed_in_pr", "get_pr_summary", 
+                  "get_pr_analysis", "find_open_prs_for_issue", "get_open_pr_status", "read_file"],
+        "description": "Tools for pull request analysis and tracking"
+    },
+    "code_gen": {
+        "tools": ["generate_code_example", "write_complete_code", "read_file", "search_codebase", "analyze_file_structure"],
+        "description": "Tools for code generation and examples"
+    },
+    "comprehensive": {
+        "tools": [],  # Will include all tools
+        "description": "All available tools for complex queries"
+    }
+}
+
+# Essential tools that should be included in most subsets
+ESSENTIAL_TOOLS = ["read_file", "search_codebase"]
 
 def create_all_tools(explorer: 'AgenticCodebaseExplorer') -> List[FunctionTool]:
     """
@@ -305,3 +343,79 @@ def create_all_tools(explorer: 'AgenticCodebaseExplorer') -> List[FunctionTool]:
     ]
     
     return tools
+
+def create_tools_for_subset(explorer: 'AgenticCodebaseExplorer', subset_name: str) -> List[FunctionTool]:
+    """
+    Creates a subset of tools based on the query type for performance optimization.
+    
+    Args:
+        explorer: AgenticCodebaseExplorer instance
+        subset_name: Name of the tool subset (search, file, git, issue, pr, code_gen, comprehensive)
+        
+    Returns:
+        List of FunctionTool instances for the specified subset
+    """
+    if subset_name not in TOOL_SUBSETS:
+        logger.warning(f"Unknown tool subset '{subset_name}', falling back to comprehensive")
+        return create_all_tools(explorer)
+    
+    if subset_name == "comprehensive":
+        return create_all_tools(explorer)
+    
+    # Get all tools first
+    all_tools = create_all_tools(explorer)
+    
+    # Create a mapping of tool names to tool objects
+    tool_map = {tool.metadata.name: tool for tool in all_tools}
+    
+    # Get the subset tool names
+    subset_tool_names = set(TOOL_SUBSETS[subset_name]["tools"])
+    
+    # Always include essential tools
+    subset_tool_names.update(ESSENTIAL_TOOLS)
+    
+    # Filter tools based on subset
+    subset_tools = [tool_map[name] for name in subset_tool_names if name in tool_map]
+    
+    logger.info(f"Created tool subset '{subset_name}' with {len(subset_tools)} tools: {[t.metadata.name for t in subset_tools]}")
+    
+    return subset_tools
+
+def get_subset_for_query_type(query_type: str) -> str:
+    """
+    Determine the appropriate tool subset based on query analysis.
+    
+    Args:
+        query_type: The type of query (from query analysis)
+        
+    Returns:
+        Tool subset name to use
+    """
+    # Mapping from query types to tool subsets
+    query_to_subset = {
+        "search": "search",
+        "find": "search", 
+        "locate": "search",
+        "file_content": "file",
+        "file_structure": "file",
+        "directory": "file",
+        "git_history": "git",
+        "git_blame": "git",
+        "commit": "git",
+        "who_changed": "git",
+        "when_added": "git",
+        "issue_analysis": "issue",
+        "bug_report": "issue",
+        "feature_request": "issue",
+        "pr_analysis": "pr",
+        "pull_request": "pr",
+        "code_review": "pr",
+        "code_generation": "code_gen",
+        "write_code": "code_gen",
+        "example": "code_gen",
+        "complex": "comprehensive",
+        "multi_step": "comprehensive",
+        "unknown": "comprehensive"
+    }
+    
+    return query_to_subset.get(query_type, "comprehensive")

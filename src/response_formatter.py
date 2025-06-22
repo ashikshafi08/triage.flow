@@ -511,6 +511,9 @@ class ResponseFormatter:
     
     def detect_response_type(self, content: str, tool_name: str = None) -> ResponseType:
         """Detect the most appropriate response type based on content and context"""
+        # Ensure content is a string
+        if not isinstance(content, str):
+            content = str(content)
         content_lower = content.lower()
         
         # Check tool name first
@@ -541,6 +544,13 @@ class ResponseFormatter:
     def format_response(self, raw_content: str, tool_name: str = None, query: str = None) -> StructuredResponse:
         """Main method to format any response content"""
         try:
+            # Ensure raw_content is a string
+            if not isinstance(raw_content, str):
+                if isinstance(raw_content, dict):
+                    raw_content = json.dumps(raw_content, indent=2)
+                else:
+                    raw_content = str(raw_content)
+            
             # Detect response type
             response_type = self.detect_response_type(raw_content, tool_name)
             

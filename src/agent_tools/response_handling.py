@@ -4,9 +4,26 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
+
+# Compile regex patterns once for better performance
+REACT_PATTERNS = {
+    'main_sections': re.compile(r'^(Thought:|Action:|Action Input:|Observation:|Answer:|Final Answer:)', re.MULTILINE),
+    'section_headers': re.compile(r'^(Thought:|Action:|Action Input:|Observation:|Answer:|Final Answer:)'),
+    'log_patterns': re.compile(r'^\s*(DEBUG|INFO|WARNING|ERROR):'),
+    'http_request': re.compile(r'HTTP Request:'),
+    'running_step': re.compile(r'> Running step'),
+    'ansi_escape': re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])'),
+    'ansi_codes': re.compile(r'\033\[[0-9;]*m|\[0m|\[1;3;[0-9]+m')
+}
+
+# Maximum sizes for response optimization
+MAX_RESPONSE_SIZE = 50000  # 50KB max response size
+MAX_STEP_CONTENT_SIZE = 5000  # 5KB max per step
+MAX_OBSERVATION_PREVIEW = 500  # 500 chars for observation preview
 
 # Import the professional response formatter
 try:
@@ -16,167 +33,214 @@ except ImportError:
     ResponseFormatter = None
     ResponseType = None
 
+@lru_cache(maxsize=128)
+def _get_section_boundaries(text_hash: str, text: str) -> List[Tuple[int, str, str]]:
+    """Cache section boundary detection for repeated parsing."""
+    boundaries = []
+    for match in REACT_PATTERNS['main_sections'].finditer(text):
+        boundaries.append((match.start(), match.group(1), match.group(0)))
+    return boundaries
+
 def parse_react_steps(raw_response: str):
-    """Parse ReAct steps from raw agent response into a structured format."""
-    logger.info(f"[DEBUG] Parsing ReAct trace (length: {len(raw_response)}): {raw_response[:500]}")
+    """Optimized ReAct steps parser with caching and size limits."""
+    if not raw_response or len(raw_response.strip()) == 0:
+        return [], None
+    
+    # Truncate overly large responses
+    if len(raw_response) > MAX_RESPONSE_SIZE:
+        logger.warning(f"Truncating large response from {len(raw_response)} to {MAX_RESPONSE_SIZE} chars")
+        raw_response = raw_response[:MAX_RESPONSE_SIZE] + "\n[Response truncated for performance]"
+    
+    logger.debug(f"Parsing ReAct trace (length: {len(raw_response)})")
+    
+    # Use optimized section-based parsing instead of line-by-line
+    text_hash = str(hash(raw_response))
+    sections = _get_section_boundaries(text_hash, raw_response)
+    
+    if not sections:
+        # No ReAct structure found, return raw response as answer
+        return [{"type": "answer", "content": _truncate_content(raw_response.strip()), "step": 0}], raw_response.strip()
     
     steps = []
-    lines = raw_response.split('\n')
-    i = 0
     step_counter = 0
-
-    while i < len(lines):
-        line_content_stripped = lines[i].strip() # For prefix checking
-        original_line = lines[i] # Keep original for content extraction
-        
-        if not line_content_stripped: # Skip empty lines
-            i += 1
-            continue
-
-        current_step_data = {"step": step_counter}
-
-        if line_content_stripped.startswith("Thought:"):
-            current_step_data["type"] = "thought"
-            content_lines = [original_line.split("Thought:", 1)[1].strip()]
-            i += 1
-            while i < len(lines) and not re.match(r"^(Thought:|Action:|Action Input:|Observation:|Answer:|Final Answer:)", lines[i].strip()):
-                content_lines.append(lines[i])
-                i += 1
-            current_step_data["content"] = "\n".join(content_lines).strip()
-            steps.append(current_step_data)
-            step_counter += 1
-        
-        elif line_content_stripped.startswith("Action:"):
-            current_step_data["type"] = "action"
-            current_step_data["tool_name"] = original_line.split("Action:", 1)[1].strip()
-            current_step_data["content"] = f"Calling tool: {current_step_data['tool_name']}"
-            i += 1
-            if i < len(lines) and lines[i].strip().startswith("Action Input:"):
-                input_json_lines = [lines[i].split("Action Input:", 1)[1].strip()]
-                i += 1
-                first_input_line_stripped = input_json_lines[0]
-                is_likely_json = first_input_line_stripped.startswith('{') or first_input_line_stripped.startswith('[')
-                if is_likely_json:
-                    open_braces = first_input_line_stripped.count('{') + first_input_line_stripped.count('[')
-                    close_braces = first_input_line_stripped.count('}') + first_input_line_stripped.count(']')
-                    while i < len(lines) and not re.match(r"^(Thought:|Action:|Observation:|Answer:|Final Answer:)", lines[i].strip()):
-                        current_input_line = lines[i]
-                        input_json_lines.append(current_input_line)
-                        open_braces += current_input_line.count('{') + current_input_line.count('[')
-                        close_braces += current_input_line.count('}') + current_input_line.count(']')
-                        i += 1
-                        if open_braces > 0 and open_braces == close_braces:
-                            break
-                else:
-                     while i < len(lines) and not re.match(r"^(Thought:|Action:|Observation:|Answer:|Final Answer:)", lines[i].strip()):
-                        input_json_lines.append(lines[i])
-                        i += 1
-                action_input_str = "\n".join(input_json_lines).strip()
-                try:
-                    current_step_data["tool_input"] = json.loads(action_input_str)
-                except json.JSONDecodeError:
-                    logger.debug(f"Action Input for {current_step_data['tool_name']} not JSON: {action_input_str[:100]}")
-                    current_step_data["tool_input"] = action_input_str 
-            else:
-                current_step_data["tool_input"] = None 
-            steps.append(current_step_data)
-            step_counter += 1
-
-        elif line_content_stripped.startswith("Observation:"):
-            current_step_data["type"] = "observation"
-            if steps and steps[-1]["type"] == "action":
-                current_step_data["observed_tool_name"] = steps[-1].get("tool_name", "unknown_tool")
-            obs_content_lines = [original_line.split("Observation:", 1)[1].strip()]
-            i += 1
-            first_obs_line_stripped = obs_content_lines[0]
-            is_likely_json_obs = first_obs_line_stripped.startswith('{') or first_obs_line_stripped.startswith('[')
-            if is_likely_json_obs:
-                open_braces_obs = first_obs_line_stripped.count('{') + first_obs_line_stripped.count('[')
-                close_braces_obs = first_obs_line_stripped.count('}') + first_obs_line_stripped.count(']')
-                while i < len(lines) and not re.match(r"^(Thought:|Action:|Answer:|Final Answer:|Observation:)", lines[i].strip()):
-                    current_obs_line = lines[i]
-                    obs_content_lines.append(current_obs_line)
-                    open_braces_obs += current_obs_line.count('{') + current_obs_line.count('[')
-                    close_braces_obs += current_obs_line.count('}') + current_obs_line.count(']')
-                    i += 1
-                    if open_braces_obs > 0 and open_braces_obs == close_braces_obs:
-                        break
-            else: 
-                while i < len(lines) and not re.match(r"^(Thought:|Action:|Answer:|Final Answer:|Observation:)", lines[i].strip()):
-                    obs_content_lines.append(lines[i])
-                    i += 1
-            observation_str = "\n".join(obs_content_lines).strip()
-            try:
-                parsed_observation = json.loads(observation_str)
-                current_step_data["content"] = parsed_observation
-                if isinstance(parsed_observation, dict):
-                    current_step_data["tool_output_preview"] = f"JSON data (Keys: {list(parsed_observation.keys())[:3]}...)"
-                elif isinstance(parsed_observation, list):
-                    current_step_data["tool_output_preview"] = f"JSON array (Length: {len(parsed_observation)}, First item: {str(parsed_observation[0])[:50]}...)" if parsed_observation else "Empty JSON array"
-                else:
-                    current_step_data["tool_output_preview"] = observation_str[:200] + "..." if len(observation_str) > 200 else observation_str
-            except json.JSONDecodeError:
-                current_step_data["content"] = observation_str
-                current_step_data["tool_output_preview"] = observation_str[:200] + "..." if len(observation_str) > 200 else observation_str
-            steps.append(current_step_data)
-            step_counter += 1
-
-        elif line_content_stripped.startswith("Answer:") or line_content_stripped.startswith("Final Answer:"):
-            current_step_data["type"] = "answer"
-            if line_content_stripped.startswith("Final Answer:"):
-                content_lines = [original_line.split("Final Answer:", 1)[1].strip()]
-            else:
-                content_lines = [original_line.split("Answer:", 1)[1].strip()]
-            i += 1
-            while i < len(lines) and not re.match(r"^(Thought:|Action:|Observation:)", lines[i].strip()):
-                content_lines.append(lines[i])
-                i += 1
-            current_step_data["content"] = "\n".join(content_lines).strip()
-            steps.append(current_step_data)
-            step_counter += 1
-        else:
-            if steps and steps[-1]["type"] in ["thought", "answer"] and isinstance(steps[-1]["content"], str):
-                logger.debug(f"Appending to previous {steps[-1]['type']}: {original_line.strip()}")
-                steps[-1]["content"] += "\n" + original_line
-                steps[-1]["content"] = steps[-1]["content"].strip()
-            else:
-                logger.debug(f"Skipping unexpected line: {original_line.strip()}")
-            i += 1
-
-    final_answer_obj = next((step for step in reversed(steps) if step["type"] == "answer"), None)
-    final_answer_content = final_answer_obj["content"] if final_answer_obj else None
-
-    if not final_answer_content and not steps and raw_response.strip():
-        if not any(pattern.search(raw_response) for pattern in [
-            re.compile(r'^\s*(DEBUG|INFO|WARNING|ERROR)'), 
-            re.compile(r'HTTP Request:'),
-            re.compile(r'> Running step')
-        ]):
-            logger.info(f"[DEBUG] No ReAct steps, using raw_response as final answer.")
-            final_answer_content = raw_response.strip()
-            steps.append({"type": "answer", "content": final_answer_content, "step": 0})
-
-    for step in steps:
-        if 'content' not in step:
-            step['content'] = f"Step {step.get('step', 0)}: {step.get('type', 'unknown')} executed"
-        if 'type' not in step:
-            step['type'] = 'unknown'
-        if 'step' not in step:
-            step['step'] = 0
     
-    logger.info(f"[DEBUG] Parsed {len(steps)} steps. Final answer derived: {bool(final_answer_content)}")
-    return steps, final_answer_content
+    for i, (start_pos, section_type, full_match) in enumerate(sections):
+        end_pos = sections[i + 1][0] if i + 1 < len(sections) else len(raw_response)
+        section_content = raw_response[start_pos:end_pos]
+        
+        current_step_data = {"step": step_counter}
+        content_lines = section_content.split('\n')
+        
+        # Extract content after the section header
+        header_line = content_lines[0]
+        content_text = '\n'.join(content_lines[1:]).strip() if len(content_lines) > 1 else ""
+        
+        # Remove section prefix from first line if present
+        if ':' in header_line:
+            remaining_text = header_line.split(':', 1)[1].strip()
+            if remaining_text:
+                content_text = remaining_text + ('\n' + content_text if content_text else '')
+        
+        # Truncate large content for performance
+        content_text = _truncate_content(content_text)
+        
+        current_step_data = _parse_section_optimized(section_type, content_text, step_counter)
+        if current_step_data:
+            steps.append(current_step_data)
+            step_counter += 1
+    
+    # Extract final answer from steps if present
+    final_answer = None
+    for step in reversed(steps):
+        if step.get("type") == "answer":
+            final_answer = step.get("content")
+            break
+    
+    # If no final answer found but we have steps, use the last observation
+    if not final_answer and steps:
+        for step in reversed(steps):
+            if step.get("type") == "observation":
+                final_answer = step.get("content")
+                break
+    
+    # If still no final answer, use raw response if it looks clean
+    if not final_answer and raw_response.strip():
+        if not any(pattern.search(raw_response) for pattern in [
+            REACT_PATTERNS['log_patterns'],
+            REACT_PATTERNS['http_request'], 
+            REACT_PATTERNS['running_step']
+        ]):
+            final_answer = raw_response.strip()
+    
+    logger.debug(f"Parsed {len(steps)} steps. Final answer: {bool(final_answer)}")
+    return steps, final_answer
+
+def _parse_section_optimized(section_type: str, content: str, step_num: int) -> Optional[Dict[str, Any]]:
+    """Optimized section parsing with reduced complexity."""
+    if not content.strip():
+        return None
+    
+    section_type_clean = section_type.rstrip(':')
+    
+    if section_type_clean == "Thought":
+        return {
+            "type": "thought",
+            "content": content,
+            "step": step_num
+        }
+    
+    elif section_type_clean == "Action":
+        return {
+            "type": "action", 
+            "tool_name": content.strip(),
+            "content": f"Calling tool: {content.strip()}",
+            "step": step_num
+        }
+    
+    elif section_type_clean == "Action Input":
+        # Try to parse as JSON, fallback to string
+        tool_input = _safe_json_parse(content)
+        return {
+            "type": "action_input",
+            "tool_input": tool_input,
+            "content": str(tool_input),
+            "step": step_num
+        }
+    
+    elif section_type_clean == "Observation":
+        parsed_content = _safe_json_parse(content) 
+        preview = _create_observation_preview(parsed_content)
+        return {
+            "type": "observation",
+            "content": parsed_content,
+            "tool_output_preview": preview,
+            "step": step_num
+        }
+    
+    elif section_type_clean in ["Answer", "Final Answer"]:
+        return {
+            "type": "answer",
+            "content": content,
+            "step": step_num
+        }
+    
+    return None
+
+def _safe_json_parse(text: str) -> Any:
+    """Safely parse JSON with fallback to original text."""
+    text_stripped = text.strip()
+    if not text_stripped or not (text_stripped.startswith(('{', '[')) and text_stripped.endswith(('}', ']'))):
+        return text_stripped
+    
+    try:
+        return json.loads(text_stripped)
+    except (json.JSONDecodeError, ValueError):
+        return text_stripped
+
+def _create_observation_preview(content: Any) -> str:
+    """Create a concise preview of observation content."""
+    if isinstance(content, dict):
+        keys = list(content.keys())[:3]
+        return f"JSON data (Keys: {keys}{'...' if len(content) > 3 else ''})"
+    elif isinstance(content, list):
+        length = len(content)
+        first_item = str(content[0])[:50] + "..." if content and len(str(content[0])) > 50 else str(content[0]) if content else ""
+        return f"JSON array (Length: {length}, First: {first_item})"
+    elif isinstance(content, str):
+        return content[:MAX_OBSERVATION_PREVIEW] + "..." if len(content) > MAX_OBSERVATION_PREVIEW else content
+    else:
+        return str(content)[:MAX_OBSERVATION_PREVIEW] + "..." if len(str(content)) > MAX_OBSERVATION_PREVIEW else str(content)
+
+def _truncate_content(content: str) -> str:
+    """Truncate content to prevent memory issues."""
+    if len(content) <= MAX_STEP_CONTENT_SIZE:
+        return content
+    return content[:MAX_STEP_CONTENT_SIZE] + "\n[Content truncated for performance]"
 
 def format_agentic_response(steps, final_answer=None, partial=False, suggestions=None, repo_path=None, user_query=None):
-    """Format agentic output as structured JSON for the frontend UI with professional formatting."""
+    """Optimized response formatting with size limits and performance improvements."""
+    
+    # Optimize steps for frontend consumption
+    optimized_steps = []
+    for step in steps[:50]:  # Limit to 50 steps max for performance
+        optimized_step = {
+            "type": step.get("type", "unknown"),
+            "step": step.get("step", 0)
+        }
+        
+        # Truncate content for performance
+        content = step.get("content", "")
+        if isinstance(content, str):
+            optimized_step["content"] = _truncate_content(content)
+        elif isinstance(content, dict):
+            # Summarize large dictionaries
+            if len(str(content)) > MAX_STEP_CONTENT_SIZE:
+                optimized_step["content"] = f"Large JSON object with {len(content)} keys"
+                optimized_step["content_preview"] = str(content)[:200] + "..."
+            else:
+                optimized_step["content"] = content
+        else:
+            optimized_step["content"] = str(content)[:MAX_STEP_CONTENT_SIZE]
+        
+        # Include other important fields
+        for field in ["tool_name", "tool_input", "tool_output_preview", "observed_tool_name"]:
+            if field in step:
+                optimized_step[field] = step[field]
+        
+        optimized_steps.append(optimized_step)
     
     # Basic response structure for backward compatibility
     basic_response = {
         "type": "final",
-        "steps": steps,
-        "final_answer": final_answer,
+        "steps": optimized_steps,
+        "final_answer": _truncate_content(final_answer) if isinstance(final_answer, str) else final_answer,
         "partial": partial,
-        "suggestions": suggestions or []
+        "suggestions": suggestions or [],
+        "performance_info": {
+            "total_steps": len(steps),
+            "displayed_steps": len(optimized_steps),
+            "truncated": len(steps) > 50
+        }
     }
     
     # Try to apply professional formatting if formatter is available
@@ -198,8 +262,16 @@ def format_agentic_response(steps, final_answer=None, partial=False, suggestions
                         break
                 
                 # Format the response professionally
+                # Ensure we pass a string to the formatter
+                content_to_format = tool_output if tool_output else final_answer
+                if not isinstance(content_to_format, str):
+                    if isinstance(content_to_format, dict):
+                        content_to_format = json.dumps(content_to_format, indent=2)
+                    else:
+                        content_to_format = str(content_to_format)
+                
                 structured_response = formatter.format_response(
-                    raw_content=tool_output if tool_output else final_answer,
+                    raw_content=content_to_format,
                     tool_name=tool_name,
                     query=user_query
                 )
@@ -216,69 +288,79 @@ def format_agentic_response(steps, final_answer=None, partial=False, suggestions
     return json.dumps(basic_response)
 
 def clean_captured_output(captured_output: str) -> str:
-    """Clean captured output to remove logging noise but preserve ReAct trace."""
+    """Optimized output cleaning using precompiled patterns."""
     if not captured_output:
         return ""
     
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    cleaned_output = ansi_escape.sub('', captured_output)
+    # Quick size check and truncation
+    if len(captured_output) > MAX_RESPONSE_SIZE:
+        captured_output = captured_output[:MAX_RESPONSE_SIZE]
     
-    cleaned_output = re.sub(r'\033\[[0-9;]*m', '', cleaned_output)
-    cleaned_output = re.sub(r'\[0m', '', cleaned_output) 
-    cleaned_output = re.sub(r'\[1;3;[0-9]+m', '', cleaned_output)
+    # Remove ANSI escape sequences using precompiled pattern
+    cleaned_output = REACT_PATTERNS['ansi_escape'].sub('', captured_output)
+    cleaned_output = REACT_PATTERNS['ansi_codes'].sub('', cleaned_output)
 
+    # Split and filter lines efficiently
     lines = cleaned_output.split('\n')
     preserved_lines = []
     
-    skip_log_patterns = [
-        re.compile(r'^\s*DEBUG:'),
-        re.compile(r'^\s*INFO:'),
-        re.compile(r'^\s*WARNING:'),
-        re.compile(r'^\s*ERROR:'),
-        re.compile(r'^\s*INFO:httpx:HTTP Request:'),
-        re.compile(r'^\s*⚡'), 
-        re.compile(r'^\s*> Running step'), 
-        re.compile(r'^\s*Step \w+ produced event'), 
+    # Additional skip patterns for better filtering
+    skip_patterns = [
+        REACT_PATTERNS['log_patterns'],
+        REACT_PATTERNS['http_request'],
+        REACT_PATTERNS['running_step'],
+        re.compile(r'^\s*⚡'),
+        re.compile(r'^\s*Step \w+ produced event'),
+        re.compile(r'^[\[\]0-9;m\s]*$')  # ANSI remnants
     ]
 
     for line in lines:
-        if any(pattern.search(line) for pattern in skip_log_patterns):
-            continue
-        if re.match(r'^[\[\]0-9;m\s]*$', line.strip()): 
+        # Skip empty lines and lines matching skip patterns
+        if not line.strip() or any(pattern.search(line) for pattern in skip_patterns):
             continue
         preserved_lines.append(line)
     
     return '\n'.join(preserved_lines)
 
 def extract_clean_answer(raw_response: str) -> str:
-    """Extract clean final answer from ReAct agent response"""
+    """Optimized clean answer extraction."""
+    if not raw_response:
+        return ""
+    
     try:
-        if "Answer:" in raw_response:
-            answer_parts = raw_response.split("Answer:")
+        # Quick answer extraction for performance
+        if "Final Answer:" in raw_response:
+            answer_parts = raw_response.split("Final Answer:", 1)
             if len(answer_parts) > 1:
-                clean_answer = answer_parts[-1].strip()
-                if clean_answer:
-                    return clean_answer
+                clean_answer = answer_parts[1].strip()
+                return _truncate_content(clean_answer) if clean_answer else ""
         
+        if "Answer:" in raw_response:
+            answer_parts = raw_response.split("Answer:", 1)
+            if len(answer_parts) > 1:
+                clean_answer = answer_parts[1].strip()
+                return _truncate_content(clean_answer) if clean_answer else ""
+        
+        # Fallback: filter out ReAct noise using compiled patterns
         lines = raw_response.split('\n')
         clean_lines = []
-        skip_patterns = [
-            'Thought:', 'Action:', 'Action Input:', 'Observation:', '> Running step',
-            'INFO:', 'HTTP Request:', 'Step input:', '{', '}', 
-            'Pandas Instructions:', 'Pandas Output:'
-        ]
+        
+        # Optimized skip patterns
+        skip_pattern = re.compile(r'(Thought:|Action:|Action Input:|Observation:|> Running step|INFO:|HTTP Request:|Step input:|Pandas [IO])')
+        
         for line in lines:
             line = line.strip()
-            if not line: continue
-            if not any(pattern in line for pattern in skip_patterns):
-                clean_lines.append(line)
+            if not line or skip_pattern.search(line) or line in ['{', '}']:
+                continue
+            clean_lines.append(line)
         
         if clean_lines:
             cleaned = '\n'.join(clean_lines)
+            # Remove markdown code blocks efficiently
             cleaned = cleaned.replace('```', '')
-            cleaned = '\n'.join([line for line in cleaned.split('\n') if line.strip()])
-            if cleaned.strip():
-                return cleaned.strip()
+            # Remove empty lines
+            cleaned = '\n'.join(line for line in cleaned.split('\n') if line.strip())
+            return _truncate_content(cleaned) if cleaned.strip() else ""
         
         return basic_cleanup(raw_response)
     except Exception as e:

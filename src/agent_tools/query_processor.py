@@ -42,7 +42,14 @@ class QueryProcessor:
     def set_llm(self, llm: LLM):
         """Set LLM for dynamic analysis"""
         self._llm = llm
-        self._tool_selector = PydanticSingleSelector.from_defaults(llm=llm)
+        try:
+            self._tool_selector = PydanticSingleSelector.from_defaults(llm=llm)
+        except ValueError as e:
+            if "does not support function calling" in str(e):
+                logger.warning(f"LLM does not support function calling for PydanticSingleSelector, disabling advanced tool selection: {e}")
+                self._tool_selector = None
+            else:
+                raise
         
     def process_query(self, query: str) -> Dict[str, Any]:
         """
@@ -50,11 +57,11 @@ class QueryProcessor:
         Returns enhanced query and processing metadata
         """
         try:
-            # Step 1: Analyze query using LLM if available, otherwise use heuristics
-            if self._llm:
-                analysis = self._analyze_query_with_llm(query)
-            else:
-                analysis = self._analyze_query_heuristic(query)
+            # Step 1: Always start with heuristic analysis for speed
+            heuristic_analysis = self._analyze_query_heuristic(query)
+            
+            # Step 2: Use LLM only for low-confidence cases if available
+            analysis = self._smart_query_analysis(query, heuristic_analysis)
             
             # Step 2: Enhance vague queries with context
             enhanced_query = self._enhance_query_with_context(query, analysis)
@@ -77,6 +84,36 @@ class QueryProcessor:
         except Exception as e:
             logger.error(f"Error in query processing: {e}")
             return self._get_fallback_result(query)
+            
+    def _smart_query_analysis(self, query: str, heuristic_analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Smart query analysis that uses heuristics first and LLM only when needed.
+        This significantly reduces LLM calls for simple queries.
+        """
+        confidence = heuristic_analysis.get("confidence", 0.0)
+        complexity = heuristic_analysis.get("complexity", "moderate")
+        
+        # Use heuristic result if confidence is high enough
+        if confidence >= 0.7 or not self._llm:
+            logger.debug(f"Using heuristic analysis (confidence: {confidence:.2f})")
+            return heuristic_analysis
+        
+        # Use LLM for borderline cases (moderate confidence) and complex queries
+        if confidence >= 0.4 and complexity in ["simple", "moderate"]:
+            logger.debug(f"Borderline case, using heuristic analysis (confidence: {confidence:.2f})")
+            return heuristic_analysis
+        
+        # Use LLM for low confidence or complex queries
+        logger.debug(f"Low confidence ({confidence:.2f}) or complex query, using LLM analysis")
+        try:
+            llm_analysis = self._analyze_query_with_llm(query)
+            llm_analysis["analysis_method"] = "llm"
+            llm_analysis["fallback_confidence"] = confidence
+            return llm_analysis
+        except Exception as e:
+            logger.warning(f"LLM analysis failed: {e}, falling back to heuristics")
+            heuristic_analysis["analysis_method"] = "heuristic_fallback"
+            return heuristic_analysis
     
     def _analyze_query_with_llm(self, query: str) -> Dict[str, Any]:
         """Analyze query using LLM for better understanding"""
@@ -111,37 +148,57 @@ class QueryProcessor:
             return self._analyze_query_heuristic(query)
     
     def _analyze_query_heuristic(self, query: str) -> Dict[str, Any]:
-        """Fallback heuristic analysis when LLM is not available"""
+        """Enhanced heuristic analysis with confidence scoring"""
         words = query.split()
         word_count = len(words)
         query_lower = query.lower()
         
-        # Simple vague detection
-        vague_indicators = ["this", "that", "it", "here", "there", "issue", "problem", "error"]
+        # Enhanced vague detection
+        vague_indicators = ["this", "that", "it", "here", "there", "issue", "problem", "error", "thing", "stuff"]
         vague_count = sum(1 for word in words if word.lower() in vague_indicators)
         
-        # Check for specific references
+        # Enhanced specific reference detection
         has_specific_refs = bool(
-            re.search(r'@[\w/.-]+', query) or
-            re.search(r'\.(py|js|ts|java|cpp|c|go|rs)\b', query) or
-            re.search(r'(def|class|function|import|package)\s+\w+', query) or
-            re.search(r'#\d+', query)
+            re.search(r'@[\w/.-]+', query) or  # File references
+            re.search(r'\.(py|js|ts|java|cpp|c|go|rs|jsx|tsx|vue|php|rb|swift|kt)\b', query) or  # File extensions
+            re.search(r'(def|class|function|import|package|const|let|var|interface|type)\s+\w+', query) or  # Code constructs
+            re.search(r'#\d+', query) or  # Issue numbers
+            re.search(r'(src/|lib/|components/|utils/|tests?/)', query) or  # Common paths
+            re.search(r'\b[A-Z][a-zA-Z]*[A-Z][a-zA-Z]*\b', query) or  # CamelCase (likely class/component names)
+            re.search(r'\b\w*[._]\w+\b', query)  # Snake_case or dot.notation
         )
         
-        # Simplified complexity scoring
-        complexity_score = min(word_count // 5 + (2 if vague_count > 2 else 0), 10)
+        # Calculate confidence based on multiple factors
+        confidence_factors = {
+            "has_specific_refs": 0.4 if has_specific_refs else 0.0,
+            "low_vague_count": 0.3 if vague_count <= 1 else 0.0,
+            "moderate_length": 0.2 if 3 <= word_count <= 15 else 0.0,
+            "clear_intent": 0.1 if any(keyword in query_lower for keyword in 
+                                     ["find", "search", "show", "list", "explain", "how", "what", "where", "who", "when"]) else 0.0
+        }
+        confidence = min(sum(confidence_factors.values()), 1.0)
         
-        # Map to complexity level
-        if complexity_score <= 2:
+        # Enhanced complexity scoring
+        complexity_base = word_count // 4
+        complexity_adjustments = {
+            "vague_penalty": 2 if vague_count > 2 else 0,
+            "specific_bonus": -1 if has_specific_refs else 0,
+            "question_bonus": -1 if query.strip().endswith('?') else 0,
+            "multi_part_penalty": 1 if query.count('and') + query.count('or') > 1 else 0
+        }
+        complexity_score = max(0, complexity_base + sum(complexity_adjustments.values()))
+        
+        # Map to complexity level with better thresholds
+        if complexity_score <= 1 and has_specific_refs:
             complexity = "simple"
-        elif complexity_score <= 5:
+        elif complexity_score <= 3:
             complexity = "moderate"
-        elif complexity_score <= 7:
+        elif complexity_score <= 6:
             complexity = "complex"
         else:
             complexity = "research"
         
-        # Determine query type
+        # Determine query type with enhanced patterns
         query_type = self._classify_query_type(query)
         
         return {
@@ -153,27 +210,42 @@ class QueryProcessor:
             "complexity": complexity,
             "query_type": query_type,
             "is_vague": vague_count > 0 and not has_specific_refs,
-            "estimated_difficulty": complexity
+            "estimated_difficulty": complexity,
+            "confidence": confidence,
+            "confidence_factors": confidence_factors,
+            "analysis_method": "heuristic"
         }
     
     def _classify_query_type(self, query: str) -> str:
-        """Classify the type of query for optimal processing"""
+        """Enhanced query type classification for optimal processing"""
         query_lower = query.lower()
         
-        # Order matters - check more specific patterns first
+        # Enhanced patterns with more comprehensive keywords and scoring
         patterns = [
-            ("issue", ["#", "issue"]),
-            ("exploration", ["explore", "what's in", "show me", "list files", "directory", "folder"]),
-            ("debugging", ["debug", "fix", "error", "bug", "troubleshoot", "not working", "failing"]),
-            ("implementation", ["implement", "create", "build", "example", "how to", "generate"]),
-            ("architecture", ["architecture", "structure", "design", "pattern", "relationship", "dependency"]),
-            ("analysis", ["explain", "what does", "how does", "analyze", "understand", "describe"]),
-            ("search", ["find", "search", "locate", "where", "which files", "spot"]),
+            ("git_history", ["when", "who changed", "git blame", "commit", "history", "author", "last edited", "evolution"]),
+            ("git_blame", ["blame", "who wrote", "who added", "author of", "last modified by"]),
+            ("issue_analysis", ["issue #", "bug #", "problem with", "error in", "issue", "github issue"]),
+            ("pr_analysis", ["pull request", "pr #", "merge", "diff", "changes in pr"]),
+            ("file_content", ["read", "show content", "what's in", "contents of", "file content"]),
+            ("file_structure", ["structure", "organize", "hierarchy", "files in", "directory structure"]),
+            ("search", ["find", "search", "locate", "where is", "which file", "spot", "grep"]),
+            ("code_generation", ["generate", "create", "write", "implement", "example", "template"]),
+            ("debugging", ["debug", "fix", "error", "bug", "troubleshoot", "not working", "failing", "broken"]),
+            ("architecture", ["architecture", "design", "pattern", "relationship", "dependency", "overview"]),
+            ("analysis", ["explain", "what does", "how does", "analyze", "understand", "describe", "why"]),
+            ("exploration", ["explore", "list", "show me", "directory", "folder", "browse"]),
         ]
         
+        # Score each pattern
+        scores = {}
         for query_type, keywords in patterns:
-            if any(keyword in query_lower for keyword in keywords):
-                return query_type
+            score = sum(1 for keyword in keywords if keyword in query_lower)
+            if score > 0:
+                scores[query_type] = score
+        
+        # Return the highest scoring type, or "general" if no matches
+        if scores:
+            return max(scores.items(), key=lambda x: x[1])[0]
         
         return "general"
     

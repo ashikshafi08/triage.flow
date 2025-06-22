@@ -107,7 +107,10 @@ class CompositeAgenticRetriever:
             "total_queries": 0,
             "cache_hits": 0,
             "routing_decisions": defaultdict(int),
-            "index_usage": defaultdict(int)
+            "index_usage": defaultdict(int),
+            "fusion_applied": 0,
+            "parallel_retrievals": 0,
+            "avg_processing_time": 0.0
         }
         
         # Redis cache for routing decisions
@@ -176,54 +179,24 @@ class CompositeAgenticRetriever:
             # Step 2: Route to appropriate indices (simplified)
             target_indices = self._select_target_indices_simple(query)
             
-            # Step 3: Retrieve from indices
-            all_chunks = []
+            # Step 3: Parallel retrieval from indices for better performance
+            all_chunks = await self._retrieve_from_indices_parallel(query, target_indices, max_results)
             
-            # Code index (always query)
-            if "code" in self.indices:
-                try:
-                    code_context = await self.indices["code"].get_relevant_context(query, None)
-                    code_chunks = code_context.get("sources", [])
-                    for chunk in code_chunks:
-                        chunk["source_index"] = "code"
-                    all_chunks.extend(code_chunks[:max_results//2])
-                except Exception as e:
-                    logger.warning(f"Error querying code index: {e}")
-            
-            # Issue index (if available and relevant)
-            if "issues" in self.indices and "issues" in target_indices:
-                try:
-                    issue_context = await self.indices["issues"].get_issue_context(query, max_issues=max_results//3)
-                    if issue_context.related_issues:
-                        for result in issue_context.related_issues:
-                            issue_chunk = {
-                                "content": f"Issue #{result.issue.id}: {result.issue.title}\n{result.issue.body[:500]}",
-                                "file": f"issue_{result.issue.id}",
-                                "similarity": result.similarity,
-                                "type": "issue",
-                                "source_index": "issues"
-                            }
-                            all_chunks.append(issue_chunk)
-                except Exception as e:
-                    logger.warning(f"Error querying issue index: {e}")
-            
-            # Step 4: Simple fusion (sort by similarity/score)
-            for chunk in all_chunks:
-                score = chunk.get("similarity", chunk.get("score", 0.5))
-                chunk["fusion_score"] = score
-            
-            all_chunks.sort(key=lambda x: x.get("fusion_score", 0), reverse=True)
+            # Step 4: Intelligent fusion with weighted scoring
+            fused_chunks = await self._apply_intelligent_fusion(all_chunks, query, query_analysis)
             
             # Step 5: Create response
             total_time = time.time() - start_time
             
             result = {
-                "context_chunks": all_chunks[:max_results],
+                "context_chunks": fused_chunks[:max_results],
                 "query_analysis": query_analysis,
                 "total_processing_time": total_time,
-                "cache_hits": 0,
+                "cache_hits": self._stats["cache_hits"],
                 "fusion_applied": len(target_indices) > 1,
-                "reranking_applied": True
+                "reranking_applied": True,
+                "indices_queried": target_indices,
+                "fusion_strategy": "intelligent_weighted"
             }
             
             logger.debug(f"Composite retrieval completed in {total_time:.2f}s")
@@ -273,6 +246,283 @@ class CompositeAgenticRetriever:
             target_indices.append("issues")
         
         return target_indices
+    
+    async def _retrieve_from_indices_parallel(self, query: str, target_indices: List[str], max_results: int) -> List[Dict[str, Any]]:
+        """Retrieve from multiple indices in parallel for better performance"""
+        import asyncio
+        
+        tasks = []
+        
+        # Code index task
+        if "code" in self.indices:
+            async def get_code_chunks():
+                try:
+                    code_context = await self.indices["code"].get_relevant_context(query, None)
+                    code_chunks = code_context.get("sources", [])
+                    for chunk in code_chunks:
+                        chunk["source_index"] = "code"
+                        chunk["index_type"] = "code"
+                        chunk["relevance_score"] = chunk.get("similarity", chunk.get("score", 0.5))
+                    return code_chunks[:max_results//2]
+                except Exception as e:
+                    logger.warning(f"Error querying code index: {e}")
+                    return []
+            
+            tasks.append(get_code_chunks())
+        
+        # Issue index task
+        if "issues" in self.indices and "issues" in target_indices:
+            async def get_issue_chunks():
+                try:
+                    issue_context = await self.indices["issues"].get_issue_context(query, max_issues=max_results//3)
+                    issue_chunks = []
+                    if issue_context.related_issues:
+                        for result in issue_context.related_issues:
+                            issue_chunk = {
+                                "content": f"Issue #{result.issue.id}: {result.issue.title}\n{result.issue.body[:500]}",
+                                "file": f"issue_{result.issue.id}",
+                                "similarity": result.similarity,
+                                "relevance_score": result.similarity,
+                                "type": "issue",
+                                "source_index": "issues",
+                                "index_type": "issue",
+                                "issue_id": result.issue.id,
+                                "issue_state": getattr(result.issue, 'state', 'unknown')
+                            }
+                            issue_chunks.append(issue_chunk)
+                    return issue_chunks
+                except Exception as e:
+                    logger.warning(f"Error querying issue index: {e}")
+                    return []
+            
+            tasks.append(get_issue_chunks())
+        
+        # Execute all tasks in parallel
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            all_chunks = []
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"Index query failed: {result}")
+                    continue
+                if isinstance(result, list):
+                    all_chunks.extend(result)
+            
+            return all_chunks
+        
+        return []
+    
+    async def _apply_intelligent_fusion(self, chunks: List[Dict[str, Any]], query: str, query_analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Apply intelligent fusion algorithm with weighted scoring"""
+        if not chunks:
+            return []
+        
+        # Define weights based on query type and content type
+        fusion_weights = self._get_fusion_weights(query, query_analysis)
+        
+        # Apply fusion scoring
+        for chunk in chunks:
+            base_score = chunk.get("relevance_score", 0.5)
+            index_type = chunk.get("index_type", "unknown")
+            
+            # Apply content type weight
+            content_weight = fusion_weights.get(index_type, 1.0)
+            
+            # Apply recency boost for issues
+            recency_boost = 1.0
+            if index_type == "issue":
+                issue_state = chunk.get("issue_state", "unknown")
+                if issue_state == "open":
+                    recency_boost = 1.2  # Boost open issues
+                elif issue_state == "closed":
+                    recency_boost = 0.9  # Slightly lower closed issues
+            
+            # Apply query-content alignment boost
+            alignment_boost = self._calculate_content_alignment(chunk, query)
+            
+            # Calculate final fusion score
+            fusion_score = base_score * content_weight * recency_boost * alignment_boost
+            chunk["fusion_score"] = fusion_score
+            chunk["fusion_details"] = {
+                "base_score": base_score,
+                "content_weight": content_weight,
+                "recency_boost": recency_boost,
+                "alignment_boost": alignment_boost
+            }
+        
+        # Sort by fusion score
+        chunks.sort(key=lambda x: x.get("fusion_score", 0), reverse=True)
+        
+        # Apply diversity filtering to avoid redundant results
+        diverse_chunks = self._apply_diversity_filtering(chunks)
+        
+        return diverse_chunks
+    
+    def _get_fusion_weights(self, query: str, query_analysis: Dict[str, Any]) -> Dict[str, float]:
+        """Get fusion weights based on query characteristics"""
+        query_lower = query.lower()
+        
+        # Default weights
+        weights = {
+            "code": 1.0,
+            "issue": 0.8,
+            "pr": 0.9,
+            "docs": 0.7
+        }
+        
+        # Adjust weights based on query content
+        if any(word in query_lower for word in ["bug", "error", "problem", "issue", "broken"]):
+            weights["issue"] = 1.3  # Boost issues for bug-related queries
+            weights["code"] = 0.9
+        
+        elif any(word in query_lower for word in ["implement", "function", "class", "method"]):
+            weights["code"] = 1.2  # Boost code for implementation queries
+            weights["issue"] = 0.7
+        
+        elif any(word in query_lower for word in ["review", "change", "diff", "pull request"]):
+            weights["pr"] = 1.3  # Boost PRs for review-related queries
+            weights["code"] = 0.8
+        
+        return weights
+    
+    def _calculate_content_alignment(self, chunk: Dict[str, Any], query: str) -> float:
+        """Calculate how well the chunk content aligns with the query"""
+        content = chunk.get("content", "")
+        if not content:
+            return 1.0
+        
+        query_words = set(query.lower().split())
+        content_words = set(content.lower().split())
+        
+        # Calculate word overlap
+        overlap = len(query_words.intersection(content_words))
+        total_query_words = len(query_words)
+        
+        if total_query_words == 0:
+            return 1.0
+        
+        # Base alignment score
+        alignment = overlap / total_query_words
+        
+        # Boost for exact phrase matches
+        if query.lower() in content.lower():
+            alignment *= 1.5
+        
+        # Normalize to reasonable range
+        return min(max(alignment, 0.5), 2.0)
+    
+    def _apply_diversity_filtering(self, chunks: List[Dict[str, Any]], max_similar: int = 3) -> List[Dict[str, Any]]:
+        """Apply diversity filtering to avoid too many similar results"""
+        if len(chunks) <= max_similar:
+            return chunks
+        
+        diverse_chunks = []
+        seen_files = set()
+        file_count = {}
+        
+        for chunk in chunks:
+            file_path = chunk.get("file", "unknown")
+            
+            # Limit results per file
+            if file_path not in file_count:
+                file_count[file_path] = 0
+            
+            if file_count[file_path] < 2:  # Max 2 chunks per file
+                diverse_chunks.append(chunk)
+                file_count[file_path] += 1
+                seen_files.add(file_path)
+            
+            # Stop if we have enough diverse results
+            if len(diverse_chunks) >= len(chunks):
+                break
+        
+        return diverse_chunks
+    
+    def _generate_cache_key(self, query: str, retrieval_mode: str, max_results: int) -> str:
+        """Generate cache key for query results"""
+        import hashlib
+        
+        # Create a hash of the query parameters
+        key_data = f"{query}_{retrieval_mode}_{max_results}_{self.session_id}"
+        cache_key = f"composite_rag_{hashlib.md5(key_data.encode()).hexdigest()}"
+        return cache_key
+    
+    async def _get_cached_result(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        """Get cached result if available"""
+        try:
+            # Check memory cache first
+            if cache_key in self.routing_cache:
+                cached_data = self.routing_cache[cache_key]
+                # Check if cache is still valid (5 minutes)
+                if time.time() - cached_data.get("timestamp", 0) < 300:
+                    return cached_data.get("result")
+                else:
+                    # Remove expired cache
+                    del self.routing_cache[cache_key]
+            
+            # Check Redis cache if available
+            if self._redis_cache:
+                cached_result = await self._redis_cache.get(cache_key)
+                if cached_result:
+                    # Store in memory cache for faster access
+                    self.routing_cache[cache_key] = {
+                        "result": cached_result,
+                        "timestamp": time.time()
+                    }
+                    return cached_result
+            
+        except Exception as e:
+            logger.warning(f"Error retrieving cached result: {e}")
+        
+        return None
+    
+    async def _cache_result(self, cache_key: str, result: Dict[str, Any]) -> None:
+        """Cache the result for future use"""
+        try:
+            # Store in memory cache
+            self.routing_cache[cache_key] = {
+                "result": result,
+                "timestamp": time.time()
+            }
+            
+            # Limit memory cache size
+            if len(self.routing_cache) > 100:
+                # Remove oldest entries
+                sorted_cache = sorted(
+                    self.routing_cache.items(),
+                    key=lambda x: x[1].get("timestamp", 0)
+                )
+                for old_key, _ in sorted_cache[:20]:  # Remove 20 oldest
+                    del self.routing_cache[old_key]
+            
+            # Store in Redis cache if available
+            if self._redis_cache:
+                await self._redis_cache.set(cache_key, result, ttl=300)  # 5 minute TTL
+            
+        except Exception as e:
+            logger.warning(f"Error caching result: {e}")
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get performance statistics for optimization insights"""
+        total_queries = self._stats["total_queries"]
+        cache_hit_rate = (self._stats["cache_hits"] / total_queries * 100) if total_queries > 0 else 0
+        
+        return {
+            "total_queries": total_queries,
+            "cache_hits": self._stats["cache_hits"],
+            "cache_hit_rate": f"{cache_hit_rate:.1f}%",
+            "fusion_applied": self._stats["fusion_applied"],
+            "parallel_retrievals": self._stats["parallel_retrievals"],
+            "avg_processing_time": f"{self._stats['avg_processing_time']:.3f}s",
+            "routing_decisions": dict(self._stats["routing_decisions"]),
+            "index_usage": dict(self._stats["index_usage"])
+        }
+    
+    def clear_cache(self) -> None:
+        """Clear all cached data"""
+        self.routing_cache.clear()
+        logger.info("Composite RAG cache cleared")
     
     async def _fallback_retrieve(self, query: str, max_results: int) -> Dict[str, Any]:
         """Fallback to simple code index retrieval"""

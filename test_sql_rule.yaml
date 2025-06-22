@@ -1,0 +1,22 @@
+rules:
+  - id: command-injection-os-system
+    pattern: os.system($X)
+    message: "Potential command injection vulnerability using os.system"
+    languages: 
+      - python
+    severity: ERROR
+  - id: sql-injection-string-format
+    pattern-either:
+      - pattern: $CURSOR.execute(f"$...{$VAR}$...")
+      - pattern: $CURSOR.execute("$..." + $VAR + "$...")
+      - pattern: $CURSOR.execute("$..." % $VAR)
+    message: "Potential SQL injection vulnerability using string formatting"
+    languages:
+      - python
+    severity: ERROR
+  - id: path-traversal-file-open
+    pattern: open($PATH, $MODE)
+    message: "File open operation - check for path traversal"
+    languages:
+      - python
+    severity: WARNING

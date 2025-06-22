@@ -31,37 +31,56 @@ class Settings(BaseSettings):
         "gpt-4": {
             "max_tokens": 4096,
             "temperature": 0.7,
-            "context_window": 8192
+            "context_window": 8192,
+            "supports_function_calling": True
         },
         "gpt-3.5-turbo": {
             "max_tokens": 4096,
             "temperature": 0.7,
-            "context_window": 4096
+            "context_window": 4096,
+            "supports_function_calling": True
+        },
+        "openai/gpt-4o-mini": {
+            "max_tokens": 4096,
+            "temperature": 0.7,
+            "context_window": 128000,
+            "supports_function_calling": True
+        },
+        "gpt-4o-mini": {
+            "max_tokens": 4096,
+            "temperature": 0.7,
+            "context_window": 128000,
+            "supports_function_calling": True
         },
         "anthropic/claude-3.5-sonnet": {
             "max_tokens": 4096,
             "temperature": 0.7,
-            "context_window": 200000
+            "context_window": 200000,
+            "supports_function_calling": True
         },
         "anthropic/claude-3-opus": {
             "max_tokens": 4096,
             "temperature": 0.7,
-            "context_window": 200000
+            "context_window": 200000,
+            "supports_function_calling": True
         },
         "google/gemini-2.5-flash-preview-05-20": {
             "max_tokens": 8192,
             "temperature": 0.7,
-            "context_window": 1000000  # Gemini 2.5 Flash has 1M context window
+            "context_window": 1000000,  # Gemini 2.5 Flash has 1M context window
+            "supports_function_calling": True  # Gemini supports function calling through OpenRouter
         },
         "meta-llama/llama-3.1-70b-instruct": {
             "max_tokens": 4096,
             "temperature": 0.7,
-            "context_window": 131072
+            "context_window": 131072,
+            "supports_function_calling": True
         },
         "deepseek/deepseek-r1-0528-qwen3-8b": {
             "max_tokens": 4096,
             "temperature": 0.5,
-            "context_window": 32768  # DeepSeek R1 context window
+            "context_window": 32768,  # DeepSeek R1 context window
+            "supports_function_calling": True
         }
     }
     
