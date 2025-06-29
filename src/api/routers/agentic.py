@@ -18,29 +18,118 @@ router = APIRouter(prefix="/assistant/sessions", tags=["agentic"])
 async def enable_agentic_mode(session_id: str, session: Dict[str, Any] = Depends(get_session)):
     """Check agentic capabilities for a session (now integrated by default)"""
     try:
+        # First check if we have a functioning agentic_rag system
         agentic_rag = session.get("agentic_rag")
+        
+        # If no agentic_rag in session, try to get/create one through the dependency
         if not agentic_rag:
-            raise HTTPException(status_code=400, detail="Session not properly initialized with AgenticRAG")
+            try:
+                # Use the dependency to get or create an AgenticRAG instance
+                from ..dependencies import get_agentic_rag
+                agentic_rag = await get_agentic_rag(session_id, session)
+                # Store it in the session for future use
+                session["agentic_rag"] = agentic_rag
+                logger.info(f"Successfully created/retrieved AgenticRAG for session {session_id}")
+            except HTTPException as he:
+                logger.error(f"Failed to get AgenticRAG for session {session_id}: {he.detail}")
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"AgenticRAG system not available: {he.detail}"
+                )
+            except Exception as e:
+                logger.error(f"Unexpected error getting AgenticRAG for session {session_id}: {e}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Failed to initialize AgenticRAG system: {str(e)}"
+                )
+        
+        # Check if it's a valid AgenticRAG instance
+        if not isinstance(agentic_rag, AgenticRAGSystem):
+            logger.error(f"Invalid AgenticRAG instance type for session {session_id}: {type(agentic_rag)}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Invalid AgenticRAG system type: {type(agentic_rag)}"
+            )
+        
+        # Check core components
+        core_tools = []
+        has_rag_extractor = bool(agentic_rag.rag_extractor)
+        has_agentic_explorer = bool(agentic_rag.agentic_explorer)
+        has_issue_rag = bool(agentic_rag.issue_rag and agentic_rag.issue_rag.is_initialized())
+        has_composite_retriever = bool(getattr(agentic_rag, '_use_composite', False))
+        
+        if has_rag_extractor:
+            core_tools.extend([
+                "enhanced_context_retrieval",
+                "semantic_search",
+                "file_structure_analysis",
+                "related_files_discovery"
+            ])
+        
+        if has_agentic_explorer:
+            core_tools.extend([
+                "query_analysis", 
+                "technical_requirements_extraction",
+                "code_references_detection",
+                "code_example_generation"
+            ])
+        
+        if has_issue_rag:
+            core_tools.extend([
+                "issue_context_retrieval",
+                "related_issues_search",
+                "issue_history_analysis"
+            ])
+        
+        if has_composite_retriever:
+            core_tools.append("multi_index_retrieval")
+        
+        # Get session metadata for additional context
+        session_metadata = session.get("metadata", {})
+        repo_status = session_metadata.get("status", "unknown")
+        issue_rag_ready = session_metadata.get("issue_rag_ready", False)
+        
+        # Determine overall system status
+        if has_rag_extractor and has_agentic_explorer:
+            if has_issue_rag:
+                system_status = "fully_operational"
+                status_message = "All agentic capabilities available including issue context"
+            else:
+                system_status = "core_operational"
+                if repo_status == "warning_issue_rag_failed":
+                    status_message = "Core agentic capabilities available. Issue context unavailable due to GitHub API issues."
+                else:
+                    status_message = "Core agentic capabilities available. Issue context still loading or unavailable."
+        else:
+            system_status = "limited"
+            status_message = "Limited agentic capabilities available"
         
         return {
             "session_id": session_id,
             "agentic_enabled": True,
             "integrated_system": "AgenticRAG",
-            "tools_available": [
-                "enhanced_context_retrieval",
-                "query_analysis",
-                "technical_requirements_extraction",
-                "code_references_detection",
-                "semantic_search",
-                "file_structure_analysis",
-                "related_files_discovery",
-                "code_example_generation"
-            ]
+            "system_status": system_status,
+            "status_message": status_message,
+            "components": {
+                "rag_extractor": has_rag_extractor,
+                "agentic_explorer": has_agentic_explorer, 
+                "issue_rag": has_issue_rag,
+                "composite_retriever": has_composite_retriever
+            },
+            "tools_available": core_tools,
+            "repository": {
+                "status": repo_status,
+                "issue_rag_ready": issue_rag_ready,
+                "repo_info": agentic_rag.get_repo_info() if agentic_rag else None
+            }
         }
         
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
     except Exception as e:
-        logger.error(f"Error checking agentic mode: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error checking agentic mode for session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @router.get("/{session_id}/agentic-status")
 async def get_agentic_status(session_id: str, session: Dict[str, Any] = Depends(get_session)):

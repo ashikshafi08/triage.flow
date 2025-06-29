@@ -255,14 +255,16 @@ class SessionManager:
             # If not cached, proceed with fresh initialization
             session["metadata"]["status"] = "cloning"
             session["metadata"]["message"] = "Cloning repository..."
+            # Store the status update immediately
+            await self._store_session(session_id, session)
 
             agentic_rag = AgenticRAGSystem(repo_key)  # Use repo_key instead of session_id
-            session["agentic_rag"] = agentic_rag
 
             # Initialize core systems (blocking part of this background task)
             await agentic_rag.initialize_core_systems(session["repo_url"])
             
             # Update session with info from core systems
+            session["agentic_rag"] = agentic_rag
             session["repo_path"] = agentic_rag.get_repo_path()
             session["repo_context"] = {"repo_info": agentic_rag.get_repo_info()}
             session["agentic_enabled"] = True
@@ -273,23 +275,40 @@ class SessionManager:
             # Cache the instance for reuse across sessions
             agentic_rag_cache[repo_key] = agentic_rag
 
-            # Kick off asynchronous initialization of IssueAwareRAG
-            asyncio.create_task(agentic_rag.initialize_issue_rag_async(session))
-            logger.info(f"Session {session_id}: Kicked off background task for IssueAwareRAG initialization.")
-            
-            # Save the session with repo_path and other updates back to storage
+            # IMPORTANT: Save the session with the working AgenticRAG instance BEFORE attempting issue RAG
             await self._store_session(session_id, session)
+            logger.info(f"Session {session_id}: Core AgenticRAG systems initialized and stored successfully")
+
+            # Kick off asynchronous initialization of IssueAwareRAG
+            # This can fail without affecting the core functionality
+            try:
+                asyncio.create_task(agentic_rag.initialize_issue_rag_async(session))
+                logger.info(f"Session {session_id}: Started background task for IssueAwareRAG initialization.")
+            except Exception as issue_rag_error:
+                logger.warning(f"Session {session_id}: Failed to start issue RAG initialization: {issue_rag_error}")
+                # Update session to indicate issue RAG failed but core is ready
+                session["metadata"]["status"] = "warning_issue_rag_failed"
+                session["metadata"]["message"] = "Core chat ready. Issue context failed to initialize."
+                session["metadata"]["issue_rag_ready"] = False
+                await self._store_session(session_id, session)
             
             # Save metadata to disk for persistence
-            metadata_path = os.path.join(session["metadata"]["storage_path"], "metadata.json")
-            with open(metadata_path, 'w') as f:
-                json.dump(session["metadata"], f, indent=2)
+            try:
+                metadata_path = os.path.join(session["metadata"]["storage_path"], "metadata.json")
+                with open(metadata_path, 'w') as f:
+                    json.dump(session["metadata"], f, indent=2)
+            except Exception as metadata_error:
+                logger.warning(f"Failed to save metadata to disk for session {session_id}: {metadata_error}")
                 
         except Exception as e:
             logger.error(f"Error during repository session initialization for {session_id}: {e}")
+            # Make sure to store the error state
             session["metadata"]["status"] = "error"
             session["metadata"]["error"] = str(e)
             session["metadata"]["message"] = f"Failed to initialize session systems: {str(e)}"
+            # Remove any partial agentic_rag that might have been set
+            session.pop("agentic_rag", None)
+            session["agentic_enabled"] = False
             # Save the error status back to storage
             await self._store_session(session_id, session)
     

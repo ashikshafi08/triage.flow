@@ -5,6 +5,10 @@ from datetime import datetime, timedelta
 import aiohttp
 from .config import settings
 from .models import Issue, IssueResponse, IssueComment, PullRequestInfo, PullRequestUser, EnhancedPullRequestInfo, PullRequestReview, PullRequestReviewer, PullRequestStatusCheck
+import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 class GitHubIssueClient:
     def __init__(self):
@@ -199,36 +203,112 @@ class GitHubIssueClient:
         issues = []
         page = 1
         fetched = 0
-        while page <= max_pages:
-            url = f"https://api.github.com/repos/{owner}/{repo}/issues?state={state}&per_page={per_page}&page={page}"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self.headers) as response:
-                    if response.status != 200:
-                        break
-                    data = await response.json()
-                    if not data:
-                        break
-                    for issue_data in data:
-                        # Exclude pull requests (GitHub returns PRs in issues API)
-                        if 'pull_request' in issue_data:
+        
+        # Configure timeout settings
+        timeout = aiohttp.ClientTimeout(
+            total=30,  # Total timeout per request
+            connect=10,  # Connection timeout
+            sock_read=20  # Socket read timeout
+        )
+        
+        # Use a single session with proper timeout and retry logic
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while page <= max_pages:
+                url = f"https://api.github.com/repos/{owner}/{repo}/issues?state={state}&per_page={per_page}&page={page}"
+                
+                # Retry logic for each page
+                for attempt in range(self.max_retries):
+                    try:
+                        async with session.get(url, headers=self.headers) as response:
+                            if response.status == 404:
+                                logger.warning(f"Repository {owner}/{repo} not found or not accessible")
+                                return issues
+                            elif response.status == 403:
+                                # Check for rate limiting
+                                remaining = response.headers.get("X-RateLimit-Remaining", "1")
+                                if remaining == "0":
+                                    reset_time = int(response.headers.get("X-RateLimit-Reset", time.time() + 60))
+                                    sleep_duration = max(0, reset_time - time.time()) + 1
+                                    logger.warning(f"Rate limit hit on page {page}, sleeping for {sleep_duration} seconds")
+                                    await asyncio.sleep(sleep_duration)
+                                    continue
+                                else:
+                                    logger.error(f"Access forbidden for {owner}/{repo}: {response.status}")
+                                    return issues
+                            elif response.status != 200:
+                                error_text = await response.text()
+                                logger.warning(f"Error fetching issues page {page}: {response.status} - {error_text}")
+                                if attempt < self.max_retries - 1:
+                                    await asyncio.sleep(self.backoff_factor ** attempt)
+                                    continue
+                                else:
+                                    logger.error(f"Failed to fetch page {page} after {self.max_retries} attempts")
+                                    break
+                            
+                            data = await response.json()
+                            if not data:
+                                logger.info(f"No more issues found at page {page}")
+                                return issues
+                                
+                            page_issues_count = 0
+                            for issue_data in data:
+                                # Exclude pull requests (GitHub returns PRs in issues API)
+                                if 'pull_request' in issue_data:
+                                    continue
+                                    
+                                try:
+                                    issue = Issue(
+                                        number=issue_data['number'],
+                                        title=issue_data['title'],
+                                        body=issue_data.get('body') or "",  # Ensure body is an empty string if None
+                                        state=issue_data['state'],
+                                        created_at=datetime.fromisoformat(issue_data['created_at'].replace('Z', '+00:00')),
+                                        closed_at=datetime.fromisoformat(issue_data['closed_at'].replace('Z', '+00:00')) if issue_data.get('closed_at') else None,
+                                        url=issue_data['html_url'],
+                                        labels=[label['name'] for label in issue_data.get('labels', [])],
+                                        assignees=[assignee['login'] for assignee in issue_data.get('assignees', [])],
+                                        comments=[]  # Comments can be fetched separately if needed
+                                    )
+                                    issues.append(issue)
+                                    fetched += 1
+                                    page_issues_count += 1
+                                except Exception as e:
+                                    logger.warning(f"Error parsing issue {issue_data.get('number', 'unknown')}: {e}")
+                                    continue
+                            
+                            logger.info(f"Successfully fetched page {page} with {page_issues_count} issues (total: {fetched})")
+                            
+                            if len(data) < per_page:
+                                logger.info(f"Reached last page at page {page}")
+                                return issues
+                            
+                            # Break out of retry loop on success
+                            break
+                            
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        if attempt < self.max_retries - 1:
+                            backoff_time = self.backoff_factor ** attempt
+                            logger.warning(f"Network error on page {page}, attempt {attempt + 1}/{self.max_retries}: {e}. Retrying in {backoff_time}s...")
+                            await asyncio.sleep(backoff_time)
                             continue
-                        issue = Issue(
-                            number=issue_data['number'],
-                            title=issue_data['title'],
-                            body=issue_data.get('body') or "",  # Ensure body is an empty string if None
-                            state=issue_data['state'],
-                            created_at=datetime.fromisoformat(issue_data['created_at'].replace('Z', '+00:00')),
-                            closed_at=datetime.fromisoformat(issue_data['closed_at'].replace('Z', '+00:00')) if issue_data.get('closed_at') else None,
-                            url=issue_data['html_url'],
-                            labels=[label['name'] for label in issue_data.get('labels', [])],
-                            assignees=[assignee['login'] for assignee in issue_data.get('assignees', [])],
-                            comments=[]  # Comments can be fetched separately if needed
-                        )
-                        issues.append(issue)
-                        fetched += 1
-                    if len(data) < per_page:
-                        break  # No more pages
-            page += 1
+                        else:
+                            logger.error(f"Final network error on page {page}: {e}. Returning {fetched} issues fetched so far.")
+                            return issues  # Return partial results instead of failing completely
+                    except Exception as e:
+                        logger.error(f"Unexpected error on page {page}: {e}")
+                        if attempt < self.max_retries - 1:
+                            await asyncio.sleep(self.backoff_factor ** attempt)
+                            continue
+                        else:
+                            logger.error(f"Failed to fetch page {page} after {self.max_retries} attempts. Returning {fetched} issues fetched so far.")
+                            return issues  # Return partial results
+                else:
+                    # If we've exhausted retries for this page, continue to next page
+                    logger.warning(f"Skipping page {page} after {self.max_retries} failed attempts")
+                
+                page += 1
+                
+        logger.info(f"Completed fetching issues: {fetched} total issues from {page-1} pages")
         return issues
 
     async def create_issue(self, owner: str, repo: str, title: str, body: str, labels: list = None) -> Dict[str, Any]:

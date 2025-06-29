@@ -120,13 +120,56 @@ class IssueIndexer:
         else:
             logger.info(f"Using existing patch docs from {diff_file}")
 
-        # 1. Fetch all closed issues
+        # 1. Fetch all closed issues with more conservative pagination
         repo_url = f"https://github.com/{self.repo_owner}/{self.repo_name}"
-        issues = await self.github_client.list_issues(repo_url, state="all", max_pages=100)
+        
+        # Calculate reasonable max_pages based on max_issues
+        per_page = 30  # GitHub's default
+        max_pages = min(100, (max_issues + per_page - 1) // per_page)  # Round up division, but cap at 100
+        logger.info(f"Fetching issues with max_pages={max_pages}, per_page={per_page} to get up to {max_issues} issues")
+        
+        try:
+            issues = await self.github_client.list_issues(
+                repo_url, 
+                state="all", 
+                per_page=per_page,
+                max_pages=max_pages
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch issues from GitHub API: {e}")
+            # Check if we have any cached issues to work with
+            if self.issues_file.exists():
+                logger.warning(f"GitHub API failed, trying to load existing cached issues from {self.issues_file}")
+                try:
+                    await self._load_issues()
+                    if self.issue_docs:
+                        logger.info(f"Loaded {len(self.issue_docs)} cached issues, proceeding with existing data")
+                        # Skip to building index with cached data
+                        return
+                except Exception as load_error:
+                    logger.error(f"Failed to load cached issues: {load_error}")
+            
+            # If we can't get issues from API or cache, raise the original error
+            raise e
         
         # Limit issue count (pull requests are already filtered out by github_client.list_issues)
         issues = issues[:max_issues]
         logger.info(f"Fetched {len(issues)} issues to process")
+        
+        # If we didn't get any issues, but we have cached data, use that
+        if not issues and self.issues_file.exists():
+            logger.warning("No issues fetched from API, but cached issues exist. Loading cached data.")
+            try:
+                await self._load_issues()
+                if self.issue_docs:
+                    logger.info(f"Using {len(self.issue_docs)} cached issues")
+                    return
+            except Exception as e:
+                logger.error(f"Failed to load cached issues: {e}")
+        
+        if not issues:
+            logger.warning("No issues available for indexing (neither from API nor cache)")
+            return
         
         # 2. Convert issues to llama_index Documents
         issue_documents = []
