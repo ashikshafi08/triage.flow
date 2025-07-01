@@ -149,7 +149,14 @@ def _parse_section_optimized(section_type: str, content: str, step_num: int) -> 
     
     elif section_type_clean == "Observation":
         parsed_content = _safe_json_parse(content) 
-        preview = _create_observation_preview(parsed_content)
+        # Create preview based on whether content was kept as string or parsed as JSON
+        if isinstance(parsed_content, str) and parsed_content == content.strip():
+            # Content was kept as string, so it's likely readable text
+            preview = parsed_content[:MAX_OBSERVATION_PREVIEW] + "..." if len(parsed_content) > MAX_OBSERVATION_PREVIEW else parsed_content
+        else:
+            # Content was parsed as JSON, create structured preview
+            preview = _create_observation_preview(parsed_content)
+        
         return {
             "type": "observation",
             "content": parsed_content,
@@ -167,13 +174,32 @@ def _parse_section_optimized(section_type: str, content: str, step_num: int) -> 
     return None
 
 def _safe_json_parse(text: str) -> Any:
-    """Safely parse JSON with fallback to original text."""
+    """Safely parse JSON with fallback to original text, preferring readable text over JSON objects."""
     text_stripped = text.strip()
     if not text_stripped or not (text_stripped.startswith(('{', '[')) and text_stripped.endswith(('}', ']'))):
         return text_stripped
     
     try:
-        return json.loads(text_stripped)
+        parsed = json.loads(text_stripped)
+        
+        # Only return parsed JSON if it's complex structured data
+        # For simple objects or readable text-like content, keep as string
+        if isinstance(parsed, dict):
+            # If it has many keys or looks like API response data, keep as JSON
+            if len(parsed) > 3 or any(key in parsed for key in ['data', 'results', 'items', 'response', 'content', 'files', 'error', 'status']):
+                return parsed
+            # If it looks like readable content with just a few keys, keep as string
+            elif len(parsed) <= 3 and all(isinstance(v, (str, int, float, bool, type(None))) for v in parsed.values()):
+                return text_stripped
+        elif isinstance(parsed, list):
+            # If it's a list of complex objects, keep as JSON
+            if len(parsed) > 0 and isinstance(parsed[0], dict):
+                return parsed
+            # If it's a simple list, keep as string for readability
+            elif len(parsed) <= 5 and all(isinstance(item, (str, int, float, bool, type(None))) for item in parsed):
+                return text_stripped
+        
+        return parsed
     except (json.JSONDecodeError, ValueError):
         return text_stripped
 
