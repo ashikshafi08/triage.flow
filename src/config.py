@@ -129,6 +129,7 @@ class Settings(BaseSettings):
     # Agentic System Configuration - Professional-grade iteration management
     AGENTIC_MAX_ITERATIONS: int = int(os.getenv("AGENTIC_MAX_ITERATIONS", "50"))  # Increased for complex queries
     AGENTIC_MIN_ITERATIONS: int = int(os.getenv("AGENTIC_MIN_ITERATIONS", "5"))   # Minimum before early termination
+    AGENTIC_BASE_ITERATIONS: int = int(os.getenv("AGENTIC_BASE_ITERATIONS", "10"))  # Base number of iterations for standard queries
     AGENTIC_DYNAMIC_ITERATIONS: bool = os.getenv("AGENTIC_DYNAMIC_ITERATIONS", "true").lower() == "true"  # Enable dynamic adjustment
     AGENTIC_COMPLEXITY_MULTIPLIER: float = float(os.getenv("AGENTIC_COMPLEXITY_MULTIPLIER", "2.0"))  # Multiply iterations for complex queries
     AGENTIC_EARLY_SUCCESS_THRESHOLD: int = int(os.getenv("AGENTIC_EARLY_SUCCESS_THRESHOLD", "3"))  # Stop if no new info for N iterations

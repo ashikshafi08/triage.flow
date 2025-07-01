@@ -1,4 +1,4 @@
-from typing import Optional, Dict, Any, AsyncGenerator
+from typing import Optional, Dict, Any, AsyncGenerator, List, Union
 import httpx
 from llama_index.llms.openai import OpenAI
 from llama_index.llms.openrouter import OpenRouter
@@ -28,10 +28,22 @@ def estimate_tokens(text: str) -> int:
     # Fallback: rough estimation (words * 1.3)
     return int(len(text.split()) * 1.3)
 
-def format_rag_context_for_llm(rag_data: Optional[Dict[str, Any]]) -> str:
-    """Formats the RAG context dictionary into a string for the LLM prompt."""
+def format_rag_context_for_llm(rag_data: Optional[Union[Dict[str, Any], List]]) -> str:
+    """Formats the RAG context dictionary or list into a string for the LLM prompt."""
     if not rag_data:
         return "No specific RAG context available for this query."
+
+    # Handle case where rag_data is a list (from get_enhanced_context)
+    if isinstance(rag_data, list):
+        # Convert list of context chunks to dictionary format
+        rag_data = {
+            "sources": rag_data,
+            "response": None,
+            "repo_info": None,
+            "related_issues": None,
+            "patches": None,
+            "user_selected_files": None
+        }
 
     context_parts = []
     repo_info = rag_data.get("repo_info")
