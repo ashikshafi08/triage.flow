@@ -209,5 +209,6 @@ index_*
 
 .CLAUDE.md
 .claude
+*.md
 
 .node_modules/
