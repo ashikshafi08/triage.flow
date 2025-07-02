@@ -18,8 +18,9 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 class SearchOperations:
-    def __init__(self, repo_path: Path):
-        self.repo_path = repo_path
+    def __init__(self, repo_path):
+        # Ensure repo_path is a Path object
+        self.repo_path = Path(repo_path) if not isinstance(repo_path, Path) else repo_path
 
     def search_codebase(
         self, 
@@ -39,6 +40,12 @@ class SearchOperations:
             
             # Determine search root based on directory_path
             if directory_path:
+                # Ensure directory_path is a string
+                if hasattr(directory_path, '__iter__') and not isinstance(directory_path, (str, bytes)):
+                    directory_path = str(directory_path[0]) if len(directory_path) > 0 else ""
+                else:
+                    directory_path = str(directory_path) if directory_path is not None else ""
+                    
                 search_root = self.repo_path / directory_path
                 if not search_root.exists() or not search_root.is_dir():
                     return json.dumps({
@@ -108,7 +115,13 @@ class SearchOperations:
             return json.dumps(result, indent=2)
         except Exception as e:
             logger.error(f"Error searching codebase: {e}")
-            return f"Error searching codebase: {str(e)}"
+            return json.dumps({
+                "error": f"Error searching codebase: {str(e)}",
+                "query": query,
+                "files_with_matches": 0,
+                "total_files_processed": 0,
+                "results": []
+            })
 
     def find_related_files(
         self, 
@@ -116,6 +129,12 @@ class SearchOperations:
     ) -> str:
         """Find files related to a given file"""
         try:
+            # Ensure file_path_str is a string
+            if hasattr(file_path_str, '__iter__') and not isinstance(file_path_str, (str, bytes)):
+                file_path_str = str(file_path_str[0]) if len(file_path_str) > 0 else ""
+            else:
+                file_path_str = str(file_path_str) if file_path_str is not None else ""
+                
             target_full_path = self.repo_path / file_path_str
             if not target_full_path.exists() or not target_full_path.is_file():
                 return f"Target file does not exist: {file_path_str}"

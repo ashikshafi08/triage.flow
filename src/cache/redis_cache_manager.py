@@ -438,4 +438,10 @@ async def cleanup_caches_periodically():
 # Initialize Redis on import
 async def initialize_redis_cache():
     """Initialize Redis connection"""
-    await redis_manager.initialize() 
+    await redis_manager.initialize()
+
+def get_redis_client():
+    """Get Redis client instance for backward compatibility"""
+    if redis_manager.initialized and redis_manager.redis_client:
+        return redis_manager.redis_client
+    return None 

@@ -298,6 +298,12 @@ class {class_name} extends {base_class} {{
     def _analyze_repository_context(self, context_files: List[str]) -> Dict[str, Any]: # Added self
         analysis = {"classes": [], "base_classes": [], "imports": [], "capabilities": [], "functions": []}
         for file_path_str in context_files:
+            # Ensure file_path_str is a string
+            if hasattr(file_path_str, '__iter__') and not isinstance(file_path_str, (str, bytes)):
+                file_path_str = str(file_path_str[0]) if len(file_path_str) > 0 else ""
+            else:
+                file_path_str = str(file_path_str) if file_path_str is not None else ""
+                
             full_path = self.repo_path / file_path_str # Added self
             if not full_path.exists(): continue
             try:
@@ -370,6 +376,12 @@ class {class_name} extends {base_class} {{
             if context_files:
                 for file_path_str in context_files:
                     try:
+                        # Ensure file_path_str is a string
+                        if hasattr(file_path_str, '__iter__') and not isinstance(file_path_str, (str, bytes)):
+                            file_path_str = str(file_path_str[0]) if len(file_path_str) > 0 else ""
+                        else:
+                            file_path_str = str(file_path_str) if file_path_str is not None else ""
+                            
                         full_path = self.repo_path / file_path_str
                         if full_path.exists():
                             with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:

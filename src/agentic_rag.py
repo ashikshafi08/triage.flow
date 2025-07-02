@@ -677,6 +677,14 @@ class AgenticRAGSystem:
                 if self.rag_extractor and self.repo_path:
                     await self._initialize_composite_retriever()
                 
+                # Ensure learning is started for cached instances too
+                if self.agentic_explorer and hasattr(self.agentic_explorer, '_learning_enabled'):
+                    try:
+                        await self.agentic_explorer.start_learning()
+                        self.logger.info(f"Learning system auto-started for cached session {self.session_id}")
+                    except Exception as learning_error:
+                        self.logger.warning(f"Failed to auto-start learning for cached session {self.session_id}: {learning_error}")
+                
                 self.logger.info(f"AgenticRAG core systems reused from cache for session {self.session_id}")
                 return
             
@@ -699,6 +707,14 @@ class AgenticRAGSystem:
                     self.repo_path, 
                     issue_rag_system=None  # Will be set later
                 )
+                
+                # Auto-start learning for all agentic explorers
+                try:
+                    await self.agentic_explorer.start_learning()
+                    self.logger.info(f"Learning system auto-started for session {self.session_id}")
+                except Exception as learning_error:
+                    self.logger.warning(f"Failed to auto-start learning for session {self.session_id}: {learning_error}")
+                    
             except ImportError as e:
                 self.logger.warning(f"AgenticCodebaseExplorer not available: {e}")
                 self.agentic_explorer = None

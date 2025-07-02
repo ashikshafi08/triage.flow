@@ -26,8 +26,9 @@ from .utilities import extract_functions, extract_classes # Moved from agentic_t
 logger = logging.getLogger(__name__)
 
 class FileOperations:
-    def __init__(self, repo_path: Path, chunk_store_instance: Optional[Any]):
-        self.repo_path = repo_path
+    def __init__(self, repo_path, chunk_store_instance: Optional[Any]):
+        # Ensure repo_path is a Path object
+        self.repo_path = Path(repo_path) if not isinstance(repo_path, Path) else repo_path
         self.chunk_store = chunk_store_instance # For _chunk_large_output, if used by these methods
 
     def explore_directory(
@@ -36,6 +37,18 @@ class FileOperations:
     ) -> str:
         """Explore directory contents with metadata"""
         try:
+            # Ensure directory_path is a string and handle special cases
+            if hasattr(directory_path, '__iter__') and not isinstance(directory_path, (str, bytes)):
+                # If it's a list/tuple, take the first element
+                if len(directory_path) > 0:
+                    directory_path = str(directory_path[0])
+                else:
+                    directory_path = ""
+            elif directory_path is not None:
+                directory_path = str(directory_path)
+            else:
+                directory_path = ""
+                
             full_path = self.repo_path / directory_path if directory_path else self.repo_path
             
             if not full_path.exists() or not full_path.is_dir():
@@ -79,7 +92,11 @@ class FileOperations:
             return json.dumps(result, indent=2)
         except Exception as e:
             logger.error(f"Error exploring directory {directory_path}: {e}")
-            return f"Error exploring directory: {str(e)}"
+            return json.dumps({
+                "error": f"Error exploring directory: {str(e)}",
+                "directory": directory_path or "root",
+                "items": []
+            })
 
     def read_file(
         self, 
@@ -87,6 +104,18 @@ class FileOperations:
     ) -> str:
         """Read complete file contents with dynamic chunking"""
         try:
+            # Ensure file_path is a string and handle special cases
+            if hasattr(file_path, '__iter__') and not isinstance(file_path, (str, bytes)):
+                # If it's a list/tuple, take the first element
+                if len(file_path) > 0:
+                    file_path = str(file_path[0])
+                else:
+                    return "Error: No file path provided"
+            elif file_path is not None:
+                file_path = str(file_path)
+            else:
+                return "Error: No file path provided"
+                
             full_path = self.repo_path / file_path
             if not full_path.exists() or not full_path.is_file():
                 return f"File {file_path} does not exist or is not a file"
@@ -102,10 +131,18 @@ class FileOperations:
                 "lines": len(content.split('\n')), "content": content
             }, indent=2)
         except UnicodeDecodeError:
-            return f"File {file_path} appears to be binary and cannot be read as text"
+            return json.dumps({
+                "error": f"File {file_path} appears to be binary and cannot be read as text",
+                "file": file_path,
+                "content": ""
+            })
         except Exception as e:
             logger.error(f"Error reading file {file_path}: {e}")
-            return f"Error reading file: {str(e)}"
+            return json.dumps({
+                "error": f"Error reading file: {str(e)}",
+                "file": file_path or "unknown",
+                "content": ""
+            })
 
     def _read_large_file(self, file_path_obj: Path, relative_path: str) -> str:
         """Read large files in chunks with smart content handling (helper method)"""
@@ -152,6 +189,12 @@ class FileOperations:
     async def stream_large_file(self, file_path: str) -> AsyncGenerator[str, None]:
         """Stream large file content in chunks"""
         try:
+            # Ensure file_path is a string
+            if hasattr(file_path, '__iter__') and not isinstance(file_path, (str, bytes)):
+                file_path = str(file_path[0]) if len(file_path) > 0 else ""
+            else:
+                file_path = str(file_path) if file_path is not None else ""
+                
             full_path = self.repo_path / file_path
             if not full_path.exists() or not full_path.is_file():
                 yield json.dumps({"error": f"File {file_path} does not exist or is not a file"})
@@ -188,6 +231,12 @@ class FileOperations:
     ) -> str:
         """Analyze file structure and relationships"""
         try:
+            # Ensure target_path is a string
+            if hasattr(target_path, '__iter__') and not isinstance(target_path, (str, bytes)):
+                target_path = str(target_path[0]) if len(target_path) > 0 else ""
+            else:
+                target_path = str(target_path) if target_path is not None else ""
+                
             full_path = self.repo_path / target_path if target_path else self.repo_path
             if not full_path.exists():
                 return f"Path {target_path} does not exist"
@@ -223,4 +272,10 @@ class FileOperations:
             return json.dumps(analysis, indent=2)
         except Exception as e:
             logger.error(f"Error analyzing file structure for {target_path}: {e}")
-            return f"Error analyzing structure: {str(e)}"
+            return json.dumps({
+                "error": f"Error analyzing structure: {str(e)}",
+                "path": target_path or "root",
+                "type": "unknown",
+                "files_by_type": {},
+                "structure_summary": "Analysis failed"
+            })

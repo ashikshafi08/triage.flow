@@ -2,8 +2,8 @@
 
 import logging
 from llama_index.core.llms import LLM
-from llama_index.llms.openrouter import OpenRouter
 from llama_index.llms.openai import OpenAI
+from llama_index.llms.openai_like import OpenAILike
 
 # Assuming 'settings' will be available in the context where this is called,
 # or passed in. For now, let's import it directly if it's a global config.
@@ -23,11 +23,16 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
 def get_llm_instance(llm_provider: str = settings.llm_provider,
                      openrouter_api_key: str = settings.openrouter_api_key,
                      openai_api_key: str = settings.openai_api_key,
                      default_model: str = settings.default_model) -> LLM:
     """Get LLM instance based on settings."""
+    
+    # All models through OpenRouter support function calling capability
+    # as per https://openrouter.ai/docs/features/tool-calling
+    # No need to override models for function calling
     
     # Skip validation - let LlamaIndex handle model compatibility internally
     logger.debug(f"Creating LLM instance for model: {default_model}")
@@ -38,25 +43,27 @@ def get_llm_instance(llm_provider: str = settings.llm_provider,
             logger.error("OpenRouter API key is required but not found.")
             raise ValueError("OpenRouter API key is required")
         
-        # OpenRouter supports tool calling for most models, especially OpenAI ones
-        logger.info(f"Using OpenRouter with model {default_model} for function calling")
+        # Use OpenAILike for OpenRouter which properly supports function calling
+        # This bypasses LlamaIndex's model validation and uses OpenRouter's OpenAI-compatible API
+        logger.info(f"Using OpenAILike with OpenRouter for {default_model} (function calling enabled)")
         
-        try:
-            return OpenRouter(
-                api_key=openrouter_api_key,
-                model=default_model,
-                max_tokens=4096,
-                temperature=0.7
-            )
-        except Exception as e:
-            logger.error(f"Failed to create OpenRouter LLM instance: {e}")
-            # If the model is an OpenAI model via OpenRouter, provide specific guidance
-            if default_model.startswith("openai/"):
-                logger.info(f"OpenRouter model {default_model} failed to initialize. This might be a temporary API issue.")
-                # Don't raise here, let the calling code handle it
-                raise ValueError(f"Failed to initialize OpenRouter with model {default_model}: {e}")
-            else:
-                raise
+        return OpenAILike(
+            api_base="https://openrouter.ai/api/v1",
+            api_key=openrouter_api_key,
+            model=default_model,
+            is_chat_model=True,
+            is_function_calling_model=True,  # Critical flag for function calling
+            context_window=32000,
+            max_tokens=4096,
+            temperature=0.7,
+            timeout=120,
+            # OpenRouter-specific headers
+            default_headers={
+                "HTTP-Referer": "https://github.com/triage-flow",
+                "X-Title": "Triage Flow Repository Analysis"
+            }
+        )
+        
     
     # Default to OpenAI if not openrouter or if provider is explicitly openai
     elif llm_provider == "openai":

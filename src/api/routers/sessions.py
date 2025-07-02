@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query, Depends, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Query, Depends, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from ...models import (
     PromptRequest, PromptResponse, SessionResponse, 
@@ -9,11 +9,94 @@ from ..dependencies import (
     llm_client, get_session, get_agentic_rag, logger, settings
 )
 import asyncio
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 from pydantic import BaseModel, Field
 
 router = APIRouter(tags=["sessions"])
+
+# WebSocket connection management
+active_connections: Dict[str, List[WebSocket]] = {}
+
+@router.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    """WebSocket endpoint for real-time session updates"""
+    await websocket.accept()
+    
+    # Add connection to active connections
+    if session_id not in active_connections:
+        active_connections[session_id] = []
+    active_connections[session_id].append(websocket)
+    
+    logger.info(f"WebSocket connected for session {session_id}")
+    
+    try:
+        # Send initial connection confirmation
+        await websocket.send_json({
+            "type": "connection_established",
+            "session_id": session_id,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # Keep connection alive with ping/pong
+        while True:
+            try:
+                # Wait for messages with timeout
+                message = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+                
+                # Handle ping messages
+                if message == "ping":
+                    await websocket.send_text("pong")
+                else:
+                    # Echo other messages back
+                    await websocket.send_json({
+                        "type": "message_received",
+                        "message": message,
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    
+            except asyncio.TimeoutError:
+                # Send heartbeat
+                await websocket.send_json({
+                    "type": "heartbeat",
+                    "timestamp": datetime.now().isoformat()
+                })
+                
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for session {session_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error for session {session_id}: {e}")
+    finally:
+        # Remove connection from active connections
+        if session_id in active_connections:
+            try:
+                active_connections[session_id].remove(websocket)
+                if not active_connections[session_id]:
+                    del active_connections[session_id]
+            except ValueError:
+                pass  # Connection already removed
+
+async def broadcast_to_session(session_id: str, message: dict):
+    """Send message to all WebSocket connections for a session"""
+    if session_id in active_connections:
+        disconnected = []
+        for websocket in active_connections[session_id]:
+            try:
+                await websocket.send_json(message)
+            except Exception as e:
+                logger.error(f"Failed to send message to WebSocket: {e}")
+                disconnected.append(websocket)
+        
+        # Remove disconnected connections
+        for ws in disconnected:
+            try:
+                active_connections[session_id].remove(ws)
+            except ValueError:
+                pass
+        
+        # Clean up empty session
+        if not active_connections[session_id]:
+            del active_connections[session_id]
 
 @router.post("/sessions", response_model=SessionResponse)
 async def create_session(request: PromptRequest):
@@ -368,3 +451,43 @@ async def sync_repository_data(
         "max_new_issues": max_new_issues if not force_full_sync else None,
         "max_new_prs": max_new_prs if not force_full_sync else None
     }
+
+@router.get("/sessions/{session_id}/available-tools")
+async def get_available_tools(session_id: str, session: Dict[str, Any] = Depends(get_session)):
+    """Get available tools for a session"""
+    try:
+        # Get tools from session metadata
+        tools_ready = session.get("metadata", {}).get("tools_ready", [])
+        
+        # Convert tool names to tool objects with descriptions
+        tool_descriptions = {
+            "code_rag": "Code repository analysis and retrieval",
+            "issue_rag": "GitHub issues and PR analysis", 
+            "patch_linkage": "Patch analysis and code changes",
+            "founding_member_agent": "Advanced founding member analysis",
+            "enhanced_context_retrieval": "Enhanced context retrieval",
+            "semantic_search": "Semantic search capabilities",
+            "file_structure_analysis": "File structure analysis",
+            "related_files_discovery": "Related files discovery",
+            "query_analysis": "Query analysis", 
+            "technical_requirements_extraction": "Technical requirements extraction",
+            "code_references_detection": "Code references detection",
+            "code_example_generation": "Code example generation",
+            "issue_context_retrieval": "Issue context retrieval",
+            "related_issues_search": "Related issues search",
+            "issue_history_analysis": "Issue history analysis",
+            "multi_index_retrieval": "Multi-index retrieval"
+        }
+        
+        tools = []
+        for tool_name in tools_ready:
+            tools.append({
+                "name": tool_name,
+                "description": tool_descriptions.get(tool_name, f"{tool_name} capability")
+            })
+        
+        return {"tools": tools}
+        
+    except Exception as e:
+        logger.error(f"Error getting available tools for session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

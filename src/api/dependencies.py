@@ -97,10 +97,17 @@ async def get_agentic_rag(session_id: str, session: Dict[str, Any] = Depends(get
         # Initialize code explorer with existing indexes if available
         from ..agent_tools import AgenticCodebaseExplorer
         recreated_agentic_rag.agentic_explorer = AgenticCodebaseExplorer(
-            repo_key,
+            session_id,  # Use actual session_id for learning system
             session["repo_path"], 
             issue_rag_system=None 
         )
+        
+        # Auto-start learning for recreated instances
+        try:
+            await recreated_agentic_rag.agentic_explorer.start_learning()
+            logger.info(f"Learning system auto-started for recreated session {session_id}")
+        except Exception as learning_error:
+            logger.warning(f"Failed to auto-start learning for recreated session {session_id}: {learning_error}")
         
         # Initialize composite retriever after core systems are ready
         logger.info(f"Initializing composite retriever for {repo_key}")

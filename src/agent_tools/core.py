@@ -30,6 +30,9 @@ from ..commit_index import CommitIndexManager
 # Relative imports for components within the agent_tools package
 from .prompts import DEFAULT_SYSTEM_PROMPT, COMMIT_INDEX_SYSTEM_PROMPT
 from .llm_config import get_llm_instance
+
+# Import learning system components
+from ..learning import PerformanceTracker, MemorySystem, LearningLoop, Episode
 from .utilities import (
     get_current_head_sha,
     extract_repo_info,
@@ -215,6 +218,17 @@ class AgenticCodebaseExplorer:
         self.issue_rag_system = issue_rag_system
         self.chunk_store = ChunkStoreFactory.get_instance()
         
+        # Initialize learning system components
+        redis_client = getattr(self.chunk_store, 'redis', None)
+        self.performance_tracker = PerformanceTracker(session_id, redis_client)
+        self.memory_system = MemorySystem(session_id, redis_client)
+        self.learning_loop = LearningLoop(
+            session_id, self.performance_tracker, self.memory_system, redis_client
+        )
+        
+        # Auto-start learning for all new agent instances
+        self._learning_enabled = True
+        
         # Initialize context manager for enhanced tool coordination
         self.context_manager = ContextManager(session_id, self.repo_path)
         
@@ -397,8 +411,13 @@ class AgenticCodebaseExplorer:
             system_prompt=DEFAULT_SYSTEM_PROMPT
         )
         
-    async def query(self, user_message: str, use_enhanced_agent: bool = False) -> str:
+    async def query(self, user_message: str, use_enhanced_agent: bool = False, enable_learning: bool = True) -> str:
         try:
+            # Use learning-enabled query by default for unified experience
+            if enable_learning and hasattr(self, 'performance_tracker'):
+                return await self.query_with_learning(user_message)
+            
+            # Fallback to non-learning query (for backwards compatibility)
             logger.info(f"Starting optimized agentic analysis: {user_message[:100]}...")
             
             # Start execution context for this query
@@ -636,3 +655,309 @@ class AgenticCodebaseExplorer:
     def _extract_issue_keywords(self, text: str):
         """Extract keywords from issue text for targeted search."""
         pass
+    
+    # ============================================================================
+    # Learning System Integration Methods
+    # ============================================================================
+    
+    async def start_learning(self):
+        """Start the continuous learning system for this agent"""
+        try:
+            await self.learning_loop.start_learning()
+            logger.info(f"Learning system started for session {self.session_id}")
+        except Exception as e:
+            logger.error(f"Failed to start learning system: {e}")
+    
+    async def stop_learning(self):
+        """Stop the continuous learning system"""
+        try:
+            await self.learning_loop.stop_learning()
+            logger.info(f"Learning system stopped for session {self.session_id}")
+        except Exception as e:
+            logger.error(f"Failed to stop learning system: {e}")
+    
+    async def query_with_learning(self, query: str, stream: bool = False) -> str:
+        """
+        Execute a query with learning capabilities
+        This wraps the standard query method with performance tracking and learning
+        """
+        # Start tracking this interaction
+        interaction_id = self.performance_tracker.start_interaction(query)
+        start_time = time.time()
+        success = False
+        response = ""
+        actions_taken = []
+        
+        try:
+            # Get relevant memories for this query
+            memories = await self.memory_system.get_relevant_memories(
+                query=query,
+                context={
+                    "repo_path": str(self.repo_path),
+                    "session_id": self.session_id
+                }
+            )
+            
+            # Apply learned patterns if available
+            if memories.get("similar_patterns"):
+                logger.info(f"Found {len(memories['similar_patterns'])} similar patterns for query")
+                # Could adjust strategy based on learned patterns here
+            
+            # Execute the query using existing methods
+            if stream:
+                response = await self.stream_query(query)
+            else:
+                response = await self.query(query)
+            
+            success = bool(response and len(response.strip()) > 10)
+            
+            # Extract actions taken (tool calls) from the response
+            # This would need to be integrated with the actual tool calling mechanism
+            actions_taken = self._extract_actions_from_response(response)
+            
+        except Exception as e:
+            logger.error(f"Error in query_with_learning: {e}")
+            response = f"Error processing query: {e}"
+            self.performance_tracker.record_error(str(e))
+        
+        finally:
+            
+            for action in actions_taken:
+                self.performance_tracker.record_tool_call(
+                    tool_name=action.get("tool", "unknown"),
+                    success=action.get("success", success),
+                    duration=action.get("duration", 1.0)
+                )
+            
+            # End performance tracking
+            performance_metrics = await self.performance_tracker.end_interaction(
+                success=success,
+                response=response
+            )
+            
+            # Create and record episode for learning
+            if performance_metrics:
+                episode = Episode(
+                    episode_id=interaction_id,
+                    session_id=self.session_id,
+                    timestamp=datetime.now(),
+                    query=query,
+                    context={
+                        "repo_path": str(self.repo_path),
+                        "session_id": self.session_id
+                    },
+                    actions_taken=actions_taken,
+                    response=response,
+                    performance_metrics=performance_metrics,
+                    outcome_quality=self._calculate_outcome_quality(response, success),
+                    learned_insights=self._extract_insights_from_interaction(query, response, success)
+                )
+                
+                await self.memory_system.record_episode(episode)
+        
+        return response
+    
+    def _extract_actions_from_response(self, response: str) -> List[Dict[str, Any]]:
+        """Extract real actions/tool calls from the agent's execution trace"""
+        actions = []
+        
+        try:
+            # Get execution summary from context manager if available
+            if hasattr(self, 'context_manager'):
+                summary = self.context_manager.get_execution_summary()
+                tool_executions = summary.get('tool_executions', [])
+                
+                # Convert context manager data to action format
+                for execution in tool_executions:
+                    action = {
+                        "tool": execution.get('tool_name', 'unknown'),
+                        "success": execution.get('success', False),
+                        "duration": execution.get('duration', 0.0),
+                        "input": execution.get('input_summary', ''),
+                        "output": execution.get('output_summary', ''),
+                        "timestamp": execution.get('timestamp')
+                    }
+                    actions.append(action)
+            
+            # If no context manager data, parse from ReAct trace
+            if not actions and response:
+                steps, _ = parse_react_steps(response)
+                
+                for step in steps:
+                    if step.get('type') == 'action':
+                        # Extract tool name from action
+                        action_content = step.get('content', '')
+                        tool_name = self._extract_tool_name_from_action(action_content)
+                        
+                        # Look for corresponding observation to determine success
+                        success = True  # Default to success if observation exists
+                        duration = 1.0  # Default duration
+                        output = ''
+                        
+                        # Find the next observation step to get results
+                        step_index = steps.index(step)
+                        if step_index + 1 < len(steps):
+                            next_step = steps[step_index + 1]
+                            if next_step.get('type') == 'observation':
+                                output = next_step.get('content', '')[:200]  # Limit output size
+                                # Check if observation indicates failure
+                                if any(error_word in output.lower() for error_word in ['error', 'failed', 'exception']):
+                                    success = False
+                        
+                        action = {
+                            "tool": tool_name,
+                            "success": success,
+                            "duration": duration,
+                            "input": action_content[:100] if action_content else '',
+                            "output": output
+                        }
+                        actions.append(action)
+            
+            # If still no actions, create a minimal action from tool usage patterns
+            if not actions and hasattr(self, 'tools'):
+                # This means the query was processed but we couldn't extract specific tool calls
+                # Still valuable for learning about query patterns
+                actions.append({
+                    "tool": "general_processing",
+                    "success": bool(response and len(response.strip()) > 10),
+                    "duration": 2.0,  # Estimated
+                    "input": "processed_query",
+                    "output": "response_generated"
+                })
+                
+        except Exception as e:
+            logger.error(f"Error extracting actions from response: {e}")
+            # Fallback to basic action if extraction fails
+            actions = [{
+                "tool": "error_recovery",
+                "success": False,
+                "duration": 0.0,
+                "input": "extraction_failed",
+                "output": str(e)
+            }]
+        
+        return actions
+    
+    def _calculate_outcome_quality(self, response: str, success: bool) -> float:
+        """Calculate the quality of the interaction outcome"""
+        if not success:
+            return 0.3
+        
+        # Simple quality heuristics
+        quality = 0.7  # Base quality for successful response
+        
+        if len(response) > 100:
+            quality += 0.1  # Bonus for substantial response
+        
+        if "error" not in response.lower():
+            quality += 0.1  # Bonus for error-free response
+            
+        if any(keyword in response.lower() for keyword in ["found", "identified", "analysis", "solution"]):
+            quality += 0.1  # Bonus for productive language
+        
+        return min(quality, 1.0)
+    
+    def _extract_tool_name_from_action(self, action_content: str) -> str:
+        """Extract tool name from ReAct action content"""
+        # Common patterns in action content
+        action_lower = action_content.lower()
+        
+        # Direct tool name patterns
+        if 'search_files' in action_lower or 'search' in action_lower:
+            return 'search_files'
+        elif 'read_file' in action_lower or 'read' in action_lower:
+            return 'read_file'
+        elif 'analyze' in action_lower:
+            return 'analyze_code'
+        elif 'git' in action_lower:
+            return 'git_operations'
+        elif 'issue' in action_lower:
+            return 'issue_operations'
+        elif 'generate' in action_lower or 'create' in action_lower:
+            return 'code_generation'
+        else:
+            return 'unknown_tool'
+    
+    def _extract_insights_from_interaction(self, query: str, response: str, success: bool) -> List[str]:
+        """Extract insights from the interaction for learning"""
+        insights = []
+        
+        if success:
+            insights.append("successful_interaction")
+            
+            if "file" in query.lower() and "found" in response.lower():
+                insights.append("successful_file_search")
+            
+            if "analyze" in query.lower() and len(response) > 200:
+                insights.append("successful_analysis")
+        else:
+            insights.append("failed_interaction")
+            
+            if "error" in response.lower():
+                insights.append("error_encountered")
+        
+        return insights
+    
+    async def get_learning_status(self) -> Dict[str, Any]:
+        """Get current learning status and insights"""
+        try:
+            learning_status = await self.learning_loop.get_learning_status()
+            performance_summary = await self.performance_tracker.get_performance_summary()
+            learning_insights = await self.memory_system.get_learning_insights()
+            
+            return {
+                "session_id": self.session_id,
+                "learning_active": learning_status.get("learning_active", False),
+                "performance_summary": performance_summary,
+                "learning_insights": learning_insights,
+                "patterns_learned": learning_status.get("total_patterns_learned", 0),
+                "last_learning": learning_status.get("last_learning"),
+                "next_learning": learning_status.get("next_learning_scheduled")
+            }
+        except Exception as e:
+            logger.error(f"Error getting learning status: {e}")
+            return {"error": str(e)}
+    
+    async def apply_learned_optimizations(self, query: str) -> Dict[str, Any]:
+        """Apply learned optimizations to improve query handling"""
+        try:
+            # Get relevant patterns
+            memories = await self.memory_system.get_relevant_memories(query)
+            
+            optimizations = {
+                "strategy_adjustments": [],
+                "tool_preferences": {},
+                "expected_performance": {}
+            }
+            
+            # Apply similar patterns
+            if memories.get("similar_patterns"):
+                for pattern in memories["similar_patterns"][:3]:  # Top 3 patterns
+                    if pattern.get("success_rate", 0) > 0.8:
+                        optimizations["strategy_adjustments"].append({
+                            "pattern_id": pattern.get("pattern_id"),
+                            "description": pattern.get("description"),
+                            "success_rate": pattern.get("success_rate")
+                        })
+            
+            # Apply successful strategies
+            if memories.get("successful_strategies"):
+                for strategy in memories["successful_strategies"]:
+                    tools = strategy.get("tools", [])
+                    if tools:
+                        for tool in tools:
+                            optimizations["tool_preferences"][tool] = "preferred"
+            
+            # Avoid error patterns
+            if memories.get("error_patterns"):
+                for error_pattern in memories["error_patterns"]:
+                    error_tools = [action.get("tool") for action in error_pattern.get("actions", [])]
+                    for tool in error_tools:
+                        if tool:
+                            optimizations["tool_preferences"][tool] = "use_with_caution"
+            
+            return optimizations
+            
+        except Exception as e:
+            logger.error(f"Error applying learned optimizations: {e}")
+            return {"error": str(e)}
