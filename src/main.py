@@ -9,7 +9,7 @@ from .cache import cleanup_caches_periodically, initialize_redis_cache
 from .chunk_store import ChunkStoreFactory
 
 # Import routers
-from .api.routers import chat, sessions, repository, issues, timeline, agentic, learning, workflows
+from .api.routers import chat, sessions, repository, issues, timeline, agentic, workflows
 
 # Enable nested event loops for Jupyter notebooks
 nest_asyncio.apply()
@@ -34,7 +34,6 @@ app.include_router(repository.router)
 app.include_router(issues.router)
 app.include_router(timeline.router)
 app.include_router(agentic.router)
-app.include_router(learning.router)
 app.include_router(workflows.router)
 
 # Background task to clean up old sessions

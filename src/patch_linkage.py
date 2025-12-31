@@ -1,1349 +1,351 @@
-"""
-Patch→Issue Linkage Module (Optimized for Speed)
-Builds mapping from closed issues to their linked pull requests for enhanced context
-"""
-
-import os
-import json
-import asyncio
-import logging
-import time
-from typing import Dict, Any, Optional, List, Tuple, Set, Callable
+"""Patch→Issue Linkage Module - tinygrad-style rewrite (1,349→~500 lines)"""
+import os, json, asyncio, logging, time, re, uuid, aiohttp
+from typing import Dict, Any, Optional, List, Set, Callable, NamedTuple
 from pathlib import Path
 from datetime import datetime
-import aiohttp
 from dataclasses import dataclass
 from tqdm.auto import tqdm
-from collections import defaultdict
-import re
-import uuid
-
 from src.config import settings
+from .utils.decorators import safe_op, retry
 
 logger = logging.getLogger(__name__)
-
-# Add sentinel constant at the top of the file
 DIFF_TRUNCATION_SENTINEL = "... [diff truncated for embedding] ..."
 
-@dataclass
-class ProgressUpdate:
-    """Represents a progress update with detailed information"""
-    stage: str
-    current_step: str
-    progress_percentage: float
-    items_processed: int
-    total_items: int
-    current_item: Optional[str] = None
-    estimated_time_remaining: Optional[int] = None
-    details: Optional[Dict[str, Any]] = None
+# GraphQL Queries as module constants
+GQL_ISSUES_WITH_PRS = """
+query($owner: String!, $name: String!, $after: String, $first: Int!) {
+  repository(owner: $owner, name: $name) {
+    issues(first: $first, after: $after, states: [CLOSED], orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes { number title state closedAt
+        timelineItems(first: 10, itemTypes: [CLOSED_EVENT, REFERENCED_EVENT, CROSS_REFERENCED_EVENT]) {
+          nodes { __typename
+            ... on ClosedEvent { closer { __typename
+              ... on PullRequest { number title state mergedAt url files(first: 100) { nodes { path } } }
+              ... on Commit { oid associatedPullRequests(first: 1) { nodes { number title state mergedAt url files(first: 100) { nodes { path } } } } } } }
+            ... on ReferencedEvent { commit { oid associatedPullRequests(first: 1) { nodes { number title state mergedAt url files(first: 100) { nodes { path } } } } } }
+            ... on CrossReferencedEvent { source { __typename ... on PullRequest { number title state mergedAt url files(first: 100) { nodes { path } } } } } } } }
+      pageInfo { hasNextPage endCursor } } } }"""
+
+GQL_MERGED_PRS = """
+query($owner: String!, $name: String!, $after: String, $first: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(first: $first, after: $after, states: [MERGED], orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes { number title state mergedAt url changedFiles files(first: 100) { nodes { path } } }
+      pageInfo { hasNextPage endCursor } } } }"""
+
+GQL_OPEN_PRS = """
+query($owner: String!, $name: String!, $after: String, $first: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(first: $first, after: $after, states: [OPEN], orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes { number title body createdAt updatedAt url isDraft author { login } reviewDecision mergeable
+        reviews(last: 10) { nodes { author { login } state submittedAt body } }
+        commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 5) {
+          nodes { __typename ... on StatusContext { context state } ... on CheckRun { name conclusion } } } } } } }
+        files(first: 50) { nodes { path } } }
+      pageInfo { hasNextPage endCursor } } } }"""
+
+
+class ProgressUpdate(NamedTuple):
+    stage: str; step: str; pct: float; done: int; total: int; item: str = ""; eta: int = 0
+
 
 @dataclass
 class PatchLink:
-    """Represents a link between an issue and its fixing pull request"""
-    issue_id: int
-    pr_number: int
-    merged_at: Optional[str]
-    pr_title: str
-    pr_url: str
-    pr_diff_url: str
-    files_changed: List[str]
+    issue_id: int; pr_number: int; merged_at: Optional[str]; pr_title: str; pr_url: str; pr_diff_url: str; files_changed: List[str]
+
 
 @dataclass
 class DiffDoc:
-    """Represents a downloaded diff for embedding and retrieval"""
-    pr_number: int
-    issue_id: int
-    files_changed: List[str]
-    diff_path: str
-    diff_text: str  # The actual diff content
-    diff_summary: str  # Cleaned summary for embedding
-    merged_at: Optional[str] = None # Add merged_at field
+    pr_number: int; issue_id: int; files_changed: List[str]; diff_path: str; diff_text: str; diff_summary: str; merged_at: Optional[str] = None
+
 
 @dataclass
 class OpenPRDoc:
-    """Represents an open PR for embedding and retrieval"""
-    pr_number: int
-    title: str
-    body: str
-    author: str
-    created_at: str
-    updated_at: str
-    files_changed: List[str]
-    review_decision: Optional[str] = None  # APPROVED, REVIEW_REQUIRED, CHANGES_REQUESTED
-    reviews_summary: str = ""  # Summary of reviews for embedding
-    status_summary: str = ""  # Summary of CI/status checks
-    draft: bool = False
-    mergeable: Optional[str] = None
-    url: Optional[str] = None
+    pr_number: int; title: str; body: str; author: str; created_at: str; updated_at: str; files_changed: List[str]
+    review_decision: Optional[str] = None; reviews_summary: str = ""; status_summary: str = ""
+    draft: bool = False; mergeable: Optional[str] = None; url: Optional[str] = None
+
 
 class PatchLinkageBuilder:
     """Builds and persists the issue→PR mapping for a repository"""
-    
-    def __init__(self, repo_owner: str, repo_name: str, progress_callback: Optional[Callable[[ProgressUpdate], None]] = None):
-        self.repo_owner = repo_owner
-        self.repo_name = repo_name
+
+    def __init__(self, repo_owner: str, repo_name: str, progress_callback: Optional[Callable] = None):
+        self.repo_owner, self.repo_name = repo_owner, repo_name
         self.repo_key = f"{repo_owner}/{repo_name}"
         self.progress_callback = progress_callback
-        
-        # Progress tracking
         self.start_time = None
-        self.stage_start_times = {}
-        self.stage_estimates = {
-            "connectivity": 2,  # seconds
-            "issues_and_prs": 30,  # seconds
-            "merged_prs": 20,  # seconds
-            "open_prs": 15,  # seconds - NEW STAGE
-            "downloading_diffs": 120,  # seconds
-            "processing_diffs": 60,  # seconds
-            "finalizing": 5  # seconds
-        }
-        
-        # GitHub API configuration
-        github_token = os.getenv("GITHUB_TOKEN")
-        if not github_token:
-            logger.error("GITHUB_TOKEN environment variable not found!")
-            logger.info(f"Environment variables: {list(os.environ.keys())}")
-            raise ValueError("GITHUB_TOKEN environment variable is required")
-        
-        # Log token presence (but not the actual token)
-        logger.debug(f"GitHub token loaded: {'*' * 10}{github_token[-4:]}")
-        
-        self.headers = {
-            "Authorization": f"token {github_token}",
-            "Accept": "application/vnd.github.v3+json"
-        }
-        
-        # File paths
-        self.index_dir = Path(f"index_{self.repo_key.replace('/', '_')}")
+        self.instance_id = str(uuid.uuid4())[:8]
+
+        token = os.getenv("GITHUB_TOKEN")
+        if not token: raise ValueError("GITHUB_TOKEN required")
+        self.headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+
+        self.index_dir = Path(f"index_{repo_owner}_{repo_name}")
         self.index_dir.mkdir(exist_ok=True)
         self.patch_links_file = self.index_dir / "patch_links.jsonl"
-        self.open_prs_file = self.index_dir / "open_prs.jsonl"  # NEW FILE
+        self.open_prs_file = self.index_dir / "open_prs.jsonl"
         self.diffs_dir = self.index_dir / "diffs"
         self.diffs_dir.mkdir(exist_ok=True)
-        
-        # Cache for PR data to avoid duplicate fetches - ensure isolation per instance
         self.pr_cache = {}
-        # Add instance-specific ID to help with debugging coroutine reuse issues
-        self.instance_id = str(uuid.uuid4())[:8]
-        
-        logger.info(f"Initialized PatchLinkageBuilder for {self.repo_key} (instance: {self.instance_id})")
-        logger.info(f"Index directory: {self.index_dir}")
-        logger.info(f"Diffs directory: {self.diffs_dir}")
-        
-    def _report_progress(self, stage: str, current_step: str, progress_percentage: float, 
-                        items_processed: int, total_items: int, current_item: str = None,
-                        details: Dict[str, Any] = None):
-        """Report progress update with detailed information"""
-        if not self.progress_callback:
-            return
-        
-        # Calculate estimated time remaining
-        estimated_time_remaining = None
-        if self.start_time and progress_percentage > 0:
-            elapsed = time.time() - self.start_time
-            if progress_percentage < 100:
-                total_estimated = elapsed / (progress_percentage / 100)
-                estimated_time_remaining = int(total_estimated - elapsed)
-        
-        update = ProgressUpdate(
-            stage=stage,
-            current_step=current_step,
-            progress_percentage=progress_percentage,
-            items_processed=items_processed,
-            total_items=total_items,
-            current_item=current_item,
-            estimated_time_remaining=estimated_time_remaining,
-            details=details or {}
-        )
-        
+
+    def _progress(self, stage: str, step: str, pct: float, done: int, total: int, item: str = ""):
+        if not self.progress_callback: return
+        eta = int((time.time() - self.start_time) / max(pct, 1) * 100 - (time.time() - self.start_time)) if self.start_time and pct > 0 else 0
+        try: self.progress_callback(ProgressUpdate(stage, step, pct, done, total, item, eta))
+        except Exception as e: logger.error(f"Progress callback error: {e}")
+
+    @retry(attempts=3, delay=1.0, backoff=2.0)
+    async def _get(self, session: aiohttp.ClientSession, url: str) -> aiohttp.ClientResponse:
+        resp = await session.get(url, headers=self.headers)
+        if resp.status == 403 and resp.headers.get("X-RateLimit-Remaining") == "0":
+            reset = int(resp.headers.get("X-RateLimit-Reset", time.time() + 60))
+            await asyncio.sleep(max(0, reset - time.time()) + 1)
+            resp.close()
+            return await session.get(url, headers=self.headers)
+        return resp
+
+    async def _gql(self, session: aiohttp.ClientSession, query: str, variables: dict) -> Optional[dict]:
         try:
-            self.progress_callback(update)
+            async with session.post("https://api.github.com/graphql", json={"query": query, "variables": variables}, headers=self.headers) as r:
+                if r.status != 200: return None
+                data = await r.json()
+                return None if "errors" in data else data
         except Exception as e:
-            logger.error(f"Error in progress callback: {e}")
-
-    async def rate_limited_get(self, session: aiohttp.ClientSession, url: str, headers: Optional[Dict] = None, **kwargs) -> aiohttp.ClientResponse:
-        """Make rate-limited GET request with proper backoff and retry logic"""
-        request_headers = headers or self.headers
-        max_retries = 3
-        backoff = 1
-        
-        for attempt in range(max_retries):
-            try:
-                response = await session.get(url, headers=request_headers, **kwargs)
-                
-                if response.status == 403:
-                    # Check if we hit rate limit
-                    remaining = response.headers.get("X-RateLimit-Remaining", "1")
-                    if remaining == "0":
-                        reset_time = int(response.headers.get("X-RateLimit-Reset", time.time() + 60))
-                        sleep_duration = max(0, reset_time - time.time()) + 1
-                        logger.warning(f"Rate limit hit, sleeping for {sleep_duration} seconds")
-                        await asyncio.sleep(sleep_duration)
-                        response.close()
-                        continue
-                
-                return response
-                    
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                if attempt < max_retries - 1:
-                    logger.warning(f"Network error on attempt {attempt + 1}/{max_retries} for {url}: {e}. Retrying in {backoff}s...")
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 32)
-                    continue
-                else:
-                    logger.error(f"Final network error for {url}: {e}")
-                    raise
-            except Exception as e:
-                logger.error(f"Unexpected error for {url}: {e}")
-                raise
-
-    async def build_patch_linkage(self, max_issues: Optional[int] = None, max_prs: Optional[int] = None, download_diffs: bool = True, include_open_prs: bool = True) -> None:
-        """
-        Build complete patch linkage using optimized GraphQL queries with detailed progress tracking
-        """
-        self.start_time = time.time()
-        
-        # Use settings.MAX_ISSUES_TO_PROCESS if max_issues is None
-        max_issues = max_issues or settings.MAX_ISSUES_TO_PROCESS
-        max_prs = max_prs or settings.MAX_PR_TO_PROCESS
-        
-        logger.info(f"Building patch linkage for {self.repo_key} (max_issues={max_issues}, max_prs={max_prs}, download_diffs={download_diffs}, include_open_prs={include_open_prs})")
-        
-        self._report_progress(
-            stage="initialization",
-            current_step="Setting up connections",
-            progress_percentage=0,
-            items_processed=0,
-            total_items=1,
-            current_item=f"Initializing {self.repo_key}",
-            details={"max_issues": max_issues, "max_prs": max_prs, "download_diffs": download_diffs, "include_open_prs": include_open_prs}
-        )
-        
-        # Increase connection pool size for better parallelism
-        connector = aiohttp.TCPConnector(
-            limit=50,  # Increased from 10
-            ttl_dns_cache=300,
-            use_dns_cache=True,
-            force_close=True,
-            enable_cleanup_closed=True
-        )
-        
-        async with aiohttp.ClientSession(
-            connector=connector,
-            timeout=aiohttp.ClientTimeout(total=60, connect=10)
-        ) as session:
-            # Step 0: Smoke test - verify we can reach the repository
-            self._report_progress(
-                stage="connectivity",
-                current_step="Verifying GitHub API access",
-                progress_percentage=5,
-                items_processed=0,
-                total_items=1,
-                current_item=f"Connecting to {self.repo_key}"
-            )
-            logger.info("Step 0: Verifying connectivity to GitHub API...")
-            await self._verify_connectivity(session)
-            
-            # Step 1: Use GraphQL to fetch issues AND their linked PRs in ONE query
-            self._report_progress(
-                stage="issues_and_prs",
-                current_step="Fetching issues with linked PRs",
-                progress_percentage=10,
-                items_processed=0,
-                total_items=max_issues,
-                current_item="Starting GraphQL query for issues"
-            )
-            logger.info("Step 1: Fetching issues with linked PRs using GraphQL...")
-            all_patch_links = await self._fetch_issues_and_prs_graphql(session, max_issues)
-            
-            logger.info(f"Found {len(all_patch_links)} patch links")
-            
-            # Step 2: Save patch links
-            self._report_progress(
-                stage="processing",
-                current_step="Saving patch links",
-                progress_percentage=30,
-                items_processed=len(all_patch_links),
-                total_items=len(all_patch_links),
-                current_item=f"Saving {len(all_patch_links)} patch links"
-            )
-            await self._save_patch_links(all_patch_links)
-            
-            # Step 3: Fetch all merged PRs using GraphQL
-            self._report_progress(
-                stage="merged_prs",
-                current_step="Fetching merged pull requests",
-                progress_percentage=40,
-                items_processed=0,
-                total_items=max_prs,
-                current_item="Starting GraphQL query for merged PRs"
-            )
-            logger.info("Step 3: Fetching all merged PRs...")
-            merged_prs = await self._fetch_merged_prs_graphql_optimized(session, max_prs)
-            
-            # Step 3.5: Fetch open PRs if requested
-            open_prs_docs = []
-            if include_open_prs:
-                self._report_progress(
-                    stage="open_prs",
-                    current_step="Fetching open pull requests",
-                    progress_percentage=50,
-                    items_processed=0,
-                    total_items=max_prs // 2,  # Assume fewer open PRs than merged
-                    current_item="Starting GraphQL query for open PRs"
-                )
-                logger.info("Step 3.5: Fetching open PRs with review information...")
-                open_prs_docs = await self._fetch_open_prs_with_reviews(session, max_prs // 2)
-                
-                # Save open PRs
-                await self._save_open_prs(open_prs_docs)
-                logger.info(f"Collected {len(open_prs_docs)} open PRs")
-            
-            # Step 4: Download diffs if requested (with parallel downloads)
-            if download_diffs and (all_patch_links or merged_prs):
-                self._report_progress(
-                    stage="downloading_diffs",
-                    current_step="Preparing diff downloads",
-                    progress_percentage=60,
-                    items_processed=0,
-                    total_items=len(all_patch_links) + len(merged_prs),
-                    current_item="Preparing download tasks"
-                )
-                logger.info("Step 4: Downloading diffs in parallel...")
-                
-                # Prepare all diff download tasks
-                diff_tasks = []
-                task_sources = []  # Track what each task index corresponds to
-                
-                # Add tasks for issue-linked PRs
-                for link in all_patch_links:
-                    task = self._download_single_diff(session, link)
-                    diff_tasks.append(task)
-                    task_sources.append(('patch_link', link))
-                
-                # Add tasks for standalone merged PRs (avoid duplicates)
-                linked_pr_numbers = {link.pr_number for link in all_patch_links}
-                for pr in merged_prs:
-                    if pr["number"] not in linked_pr_numbers:
-                        # Create a temporary PatchLink for the PR
-                        link = PatchLink(
-                            issue_id=None,
-                            pr_number=pr["number"],
-                            merged_at=pr.get("merged_at"),
-                            pr_title=pr["title"],
-                            pr_url=pr["url"],
-                            pr_diff_url=pr["diff_url"],
-                            files_changed=pr.get("files_changed", [])
-                        )
-                        task = self._download_single_diff(session, link)
-                        diff_tasks.append(task)
-                        task_sources.append(('merged_pr', link))
-                
-                # Download diffs in batches to avoid overwhelming the API
-                batch_size = 10  # Reduced from 20 to be more conservative
-                all_diff_docs = []
-                failed_downloads = []
-                
-                total_diffs = len(diff_tasks)
-                processed_diffs = 0
-                
-                for i in range(0, len(diff_tasks), batch_size):
-                    batch = diff_tasks[i:i + batch_size]
-                    batch_results = await asyncio.gather(*batch, return_exceptions=True)
-                    
-                    rate_limited = False
-                    for j, result in enumerate(batch_results):
-                        if isinstance(result, Exception):
-                            logger.warning(f"Failed to download diff: {result}")
-                            failed_downloads.append(i + j)
-                        elif result is None:
-                            # This was rate limited
-                            rate_limited = True
-                            failed_downloads.append(i + j)
-                        else:
-                            all_diff_docs.append(result)
-                        processed_diffs += 1
-                        progress_percentage = 60 + (processed_diffs / total_diffs) * 25  # 60-85%
-                        self._report_progress(
-                            stage="downloading_diffs",
-                            current_step="Downloading diffs",
-                            progress_percentage=progress_percentage,
-                            items_processed=processed_diffs,
-                            total_items=total_diffs,
-                            current_item=f"Downloading diff {processed_diffs}/{total_diffs}"
-                        )
-                    
-                    # If we hit rate limit, wait longer before next batch
-                    if rate_limited:
-                        logger.info("Hit rate limit, waiting 60 seconds before continuing...")
-                        await asyncio.sleep(60)
-                    elif i + batch_size < len(diff_tasks):
-                        # Normal delay between batches
-                        await asyncio.sleep(1)
-                
-                # Retry failed downloads with larger delays
-                if failed_downloads:
-                    self._report_progress(
-                        stage="downloading_diffs",
-                        current_step="Retrying failed downloads",
-                        progress_percentage=85,
-                        items_processed=len(all_diff_docs),
-                        total_items=total_diffs,
-                        current_item=f"Retrying {len(failed_downloads)} failed downloads"
-                    )
-                    logger.info(f"Retrying {len(failed_downloads)} failed downloads...")
-                    for idx_num, idx in enumerate(failed_downloads):
-                        if idx < len(diff_tasks):
-                            await asyncio.sleep(2)  # Wait 2 seconds between retries
-                            self._report_progress(
-                                stage="downloading_diffs",
-                                current_step="Retrying failed downloads",
-                                progress_percentage=85 + (idx_num / len(failed_downloads)) * 5,
-                                items_processed=len(all_diff_docs),
-                                total_items=total_diffs,
-                                current_item=f"Retry {idx_num + 1}/{len(failed_downloads)}"
-                            )
-                            
-                            # Create a fresh coroutine for retry instead of reusing the awaited one
-                            if idx < len(task_sources):
-                                source_type, link = task_sources[idx]
-                                fresh_task = self._download_single_diff(session, link)
-                            else:
-                                logger.warning(f"Invalid retry index {idx}, skipping")
-                                continue
-                            
-                            try:
-                                result = await fresh_task
-                                if result and not isinstance(result, Exception):
-                                    all_diff_docs.append(result)
-                            except Exception as e:
-                                logger.warning(f"Retry failed for diff {idx}: {e}")
-                
-                self._report_progress(
-                    stage="processing_diffs",
-                    current_step="Saving processed diffs",
-                    progress_percentage=95,
-                    items_processed=len(all_diff_docs),
-                    total_items=len(all_diff_docs),
-                    current_item=f"Saving {len(all_diff_docs)} processed diffs"
-                )
-                await self._save_diff_docs(all_diff_docs)
-                logger.info(f"Downloaded and processed {len(all_diff_docs)} diffs total")
-            
-        self._report_progress(
-            stage="finalizing",
-            current_step="Completing patch linkage",
-            progress_percentage=100,
-            items_processed=1,
-            total_items=1,
-            current_item="Patch linkage build complete!",
-            details={"open_prs_collected": len(open_prs_docs) if include_open_prs else 0}
-        )
-        logger.info(f"Patch linkage build complete! Files saved to {self.index_dir}")
-
-    async def _verify_connectivity(self, session: aiohttp.ClientSession) -> None:
-        """Verify we can connect to GitHub API and access the repository"""
-        try:
-            # Test basic GitHub API connectivity
-            test_url = f"https://api.github.com/repos/{self.repo_owner}/{self.repo_name}"
-            response = await self.rate_limited_get(session, test_url)
-            
-            if response.status == 404:
-                raise RuntimeError(f"Repository {self.repo_key} not found or not accessible. Check repository name and token permissions.")
-            elif response.status != 200:
-                raise RuntimeError(f"Cannot access repository metadata: HTTP {response.status}")
-            
-            repo_data = await response.json()
-            logger.info(f"✅ Connected to {repo_data['full_name']} (⭐ {repo_data['stargazers_count']}, 🍴 {repo_data['forks_count']})")
-            
-        except Exception as e:
-            logger.error(f"❌ Connectivity check failed: {e}")
-            raise
-
-    async def _fetch_issues_and_prs_graphql(self, session: aiohttp.ClientSession, max_issues: int) -> List[PatchLink]:
-        """
-        Fetch issues and their linked PRs in a single GraphQL query for maximum efficiency
-        """
-        logger.info(f"Fetching up to {max_issues} issues with linked PRs using GraphQL...")
-        
-        # GraphQL query that fetches issues and their linked PRs in one go
-        query = """
-        query($owner: String!, $name: String!, $after: String, $first: Int!) {
-            repository(owner: $owner, name: $name) {
-                issues(
-                    first: $first,
-                    after: $after,
-                    states: [CLOSED],
-                    orderBy: {field: UPDATED_AT, direction: DESC}
-                ) {
-                    nodes {
-                        number
-                        title
-                        state
-                        closedAt
-                        timelineItems(first: 10, itemTypes: [CLOSED_EVENT, REFERENCED_EVENT, CONNECTED_EVENT, CROSS_REFERENCED_EVENT]) {
-                            nodes {
-                                __typename
-                                ... on ClosedEvent {
-                                    closer {
-                                        __typename
-                                        ... on PullRequest {
-                                            number
-                                            title
-                                            state
-                                            mergedAt
-                                            url
-                                            files(first: 10) {
-                                                nodes {
-                                                    path
-                                                }
-                                            }
-                                        }
-                                        ... on Commit {
-                                            oid
-                                            message
-                                            associatedPullRequests(first: 1) {
-                                                nodes {
-                                                    number
-                                                    title
-                                                    state
-                                                    mergedAt
-                                                    url
-                                                    files(first: 100) {
-                                                        nodes {
-                                                            path
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                ... on ReferencedEvent {
-                                    commit {
-                                        oid
-                                        message
-                                        associatedPullRequests(first: 1) {
-                                            nodes {
-                                                number
-                                                title
-                                                state
-                                                mergedAt
-                                                url
-                                                files(first: 100) {
-                                                    nodes {
-                                                        path
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                ... on CrossReferencedEvent {
-                                    source {
-                                        __typename
-                                        ... on PullRequest {
-                                            number
-                                            title
-                                            state
-                                            mergedAt
-                                            url
-                                            files(first: 100) {
-                                                nodes {
-                                                    path
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    pageInfo {
-                        hasNextPage
-                        endCursor
-                    }
-                }
-            }
-        }
-        """
-        
-        all_patch_links = []
-        seen_pr_issue_pairs = set()  # Track (issue_id, pr_number) to avoid duplicates
-        has_next_page = True
-        after_cursor = None
-        
-        # Process in larger batches for efficiency
-        batch_size = min(100, max_issues)  # GraphQL max is 100
-        issues_processed = 0
-        
-        while has_next_page and issues_processed < max_issues:
-            variables = {
-                "owner": self.repo_owner,
-                "name": self.repo_name,
-                "first": batch_size,
-                "after": after_cursor
-            }
-            
-            # Report progress for this batch
-            progress_percentage = 10 + (issues_processed / max_issues) * 30  # 10-40% for this stage
-            self._report_progress(
-                stage="issues_and_prs",
-                current_step="Fetching issues with linked PRs",
-                progress_percentage=progress_percentage,
-                items_processed=issues_processed,
-                total_items=max_issues,
-                current_item=f"Processing batch {issues_processed//batch_size + 1}"
-            )
-            
-            try:
-                async with session.post(
-                    "https://api.github.com/graphql",
-                    json={"query": query, "variables": variables},
-                    headers=self.headers
-                ) as response:
-                    if response.status != 200:
-                        logger.error(f"GraphQL request failed with status {response.status}")
-                        break
-                    
-                    data = await response.json()
-                    
-                    if "errors" in data:
-                        logger.error(f"GraphQL errors: {data['errors']}")
-                        break
-                    
-                    issues_data = data["data"]["repository"]["issues"]
-                    issues = issues_data["nodes"]
-                    page_info = issues_data["pageInfo"]
-                    
-                    # Process issues and extract PR links
-                    for issue in issues:
-                        issue_number = issue["number"]
-                        issues_processed += 1
-                        
-                        # Report progress for individual issues periodically
-                        if issues_processed % 10 == 0:
-                            progress_percentage = 10 + (issues_processed / max_issues) * 30
-                            self._report_progress(
-                                stage="issues_and_prs",
-                                current_step="Processing issues",
-                                progress_percentage=progress_percentage,
-                                items_processed=issues_processed,
-                                total_items=max_issues,
-                                current_item=f"Processing issue #{issue_number}"
-                            )
-                        
-                        # Look through timeline items for linked PRs
-                        for item in issue["timelineItems"]["nodes"]:
-                            pr_data = None
-                            
-                            if item["__typename"] == "ClosedEvent" and item.get("closer"):
-                                closer = item["closer"]
-                                if closer["__typename"] == "PullRequest":
-                                    pr_data = closer
-                                elif closer["__typename"] == "Commit" and closer.get("associatedPullRequests"):
-                                    prs = closer["associatedPullRequests"]["nodes"]
-                                    if prs:
-                                        pr_data = prs[0]
-                            
-                            elif item["__typename"] == "ReferencedEvent" and item.get("commit"):
-                                commit = item["commit"]
-                                if commit.get("associatedPullRequests"):
-                                    prs = commit["associatedPullRequests"]["nodes"]
-                                    if prs:
-                                        pr_data = prs[0]
-                            
-                            elif item["__typename"] == "CrossReferencedEvent" and item.get("source"):
-                                source = item["source"]
-                                if source["__typename"] == "PullRequest":
-                                    pr_data = source
-                            
-                            # Create patch link if we found a PR
-                            if pr_data and pr_data.get("mergedAt"):
-                                pair = (issue_number, pr_data["number"])
-                                if pair not in seen_pr_issue_pairs:
-                                    seen_pr_issue_pairs.add(pair)
-                                    
-                                    files_changed = [f["path"] for f in pr_data.get("files", {}).get("nodes", [])]
-                                    
-                                    patch_link = PatchLink(
-                                        issue_id=issue_number,
-                                        pr_number=pr_data["number"],
-                                        merged_at=pr_data["mergedAt"],
-                                        pr_title=pr_data["title"],
-                                        pr_url=pr_data["url"],
-                                        pr_diff_url=f"https://github.com/{self.repo_owner}/{self.repo_name}/pull/{pr_data['number']}.diff",
-                                        files_changed=files_changed
-                                    )
-                                    all_patch_links.append(patch_link)
-                    
-                    # Update pagination
-                    has_next_page = page_info["hasNextPage"]
-                    after_cursor = page_info["endCursor"]
-                    
-                    if len(issues) < batch_size:
-                        has_next_page = False
-                        
-            except Exception as e:
-                logger.error(f"Error in GraphQL query: {e}")
-                break
-        
-        logger.info(f"Found {len(all_patch_links)} patch links from GraphQL query")
-        return all_patch_links
-
-    async def _fetch_merged_prs_graphql_optimized(self, session: aiohttp.ClientSession, max_prs: int) -> List[Dict[str, Any]]:
-        """
-        Fetch merged PRs using optimized GraphQL query
-        """
-        logger.info(f"Fetching up to {max_prs} merged PRs using optimized GraphQL...")
-        
-        # Simpler query focused on just what we need
-        query = """
-        query($owner: String!, $name: String!, $after: String, $first: Int!) {
-            repository(owner: $owner, name: $name) {
-                pullRequests(
-                    first: $first,
-                    after: $after,
-                    states: [MERGED],
-                    orderBy: {field: UPDATED_AT, direction: DESC}
-                ) {
-                    nodes {
-                        number
-                        title
-                        state
-                        mergedAt
-                        url
-                        changedFiles
-                        files(first: 100) {
-                            nodes {
-                                path
-                            }
-                        }
-                    }
-                    pageInfo {
-                        hasNextPage
-                        endCursor
-                    }
-                }
-            }
-        }
-        """
-        
-        all_prs = []
-        has_next_page = True
-        after_cursor = None
-        batch_size = 100  # Maximum allowed by GitHub
-        
-        while has_next_page and len(all_prs) < max_prs:
-            variables = {
-                "owner": self.repo_owner,
-                "name": self.repo_name,
-                "first": min(batch_size, max_prs - len(all_prs)),
-                "after": after_cursor
-            }
-            
-            # Report progress for this batch
-            progress_percentage = 50 + (len(all_prs) / max_prs) * 10  # 50-60% for this stage
-            self._report_progress(
-                stage="merged_prs",
-                current_step="Fetching merged pull requests",
-                progress_percentage=progress_percentage,
-                items_processed=len(all_prs),
-                total_items=max_prs,
-                current_item=f"Processing batch {len(all_prs)//batch_size + 1}"
-            )
-            
-            try:
-                async with session.post(
-                    "https://api.github.com/graphql",
-                    json={"query": query, "variables": variables},
-                    headers=self.headers
-                ) as response:
-                    if response.status != 200:
-                        logger.error(f"GraphQL request failed with status {response.status}")
-                        break
-                        
-                    data = await response.json()
-                    
-                    if "errors" in data:
-                        logger.error(f"GraphQL errors: {data['errors']}")
-                        break
-                    
-                    prs_data = data["data"]["repository"]["pullRequests"]
-                    prs = prs_data["nodes"]
-                    page_info = prs_data["pageInfo"]
-                    
-                    # Process PRs
-                    for pr in prs:
-                        if len(all_prs) >= max_prs:
-                            break
-                            
-                        pr_processed = {
-                            "number": pr["number"],
-                            "title": pr["title"],
-                            "state": pr["state"],
-                            "merged_at": pr["mergedAt"],
-                            "url": pr["url"],
-                            "diff_url": f"https://github.com/{self.repo_owner}/{self.repo_name}/pull/{pr['number']}.diff",
-                            "files_changed": [f["path"] for f in pr.get("files", {}).get("nodes", [])]
-                        }
-                        all_prs.append(pr_processed)
-                        
-                        # Report progress every 10 PRs
-                        if len(all_prs) % 10 == 0:
-                            progress_percentage = 50 + (len(all_prs) / max_prs) * 10
-                            self._report_progress(
-                                stage="merged_prs",
-                                current_step="Processing merged PRs",
-                                progress_percentage=progress_percentage,
-                                items_processed=len(all_prs),
-                                total_items=max_prs,
-                                current_item=f"Processed PR #{pr['number']}"
-                            )
-                    
-                    # Update pagination
-                    has_next_page = page_info["hasNextPage"]
-                    after_cursor = page_info["endCursor"]
-                    
-                    if len(prs) < batch_size:
-                        has_next_page = False
-                
-            except Exception as e:
-                logger.error(f"Error in GraphQL query: {e}")
-                break
-        
-        logger.info(f"Fetched {len(all_prs)} merged PRs")
-        return all_prs
-    
-    async def _save_patch_links(self, patch_links: List[PatchLink]) -> None:
-        """Save patch links to JSONL file"""
-        logger.info(f"Saving {len(patch_links)} patch links to {self.patch_links_file}")
-        
-        with open(self.patch_links_file, 'w', encoding='utf-8') as f:
-            for link in patch_links:
-                link_dict = {
-                    "issue_id": link.issue_id,
-                    "pr_number": link.pr_number,
-                    "merged_at": link.merged_at,
-                    "pr_title": link.pr_title,
-                    "pr_url": link.pr_url,
-                    "pr_diff_url": link.pr_diff_url,
-                    "files_changed": link.files_changed,
-                    "created_at": datetime.now().isoformat()
-                }
-                f.write(json.dumps(link_dict, ensure_ascii=False) + '\n')
-    
-    def load_patch_links(self) -> Dict[int, List[PatchLink]]:
-        """Load existing patch links from file"""
-        if not self.patch_links_file.exists():
-            return {}
-        
-        links_by_issue = {}
-        
-        try:
-            with open(self.patch_links_file, 'r', encoding='utf-8') as f:
-                for line_num, line in enumerate(f, 1):
-                    try:
-                        link_data = json.loads(line.strip())
-                        
-                        patch_link = PatchLink(
-                            issue_id=link_data["issue_id"],
-                            pr_number=link_data["pr_number"],
-                            merged_at=link_data.get("merged_at"),
-                            pr_title=link_data["pr_title"],
-                            pr_url=link_data["pr_url"],
-                            pr_diff_url=link_data["pr_diff_url"],
-                            files_changed=link_data.get("files_changed", [])
-                        )
-                        
-                        if patch_link.issue_id not in links_by_issue:
-                            links_by_issue[patch_link.issue_id] = []
-                        links_by_issue[patch_link.issue_id].append(patch_link)
-                        
-                    except Exception as e:
-                        logger.warning(f"Failed to parse line {line_num} in patch links file: {e}")
-                        continue
-                        
-        except Exception as e:
-            logger.error(f"Error loading patch links: {e}")
-            return {}
-        
-        logger.info(f"Loaded patch links for {len(links_by_issue)} issues")
-        return links_by_issue
-    
-    def get_patch_url_for_issue(self, issue_id: int) -> Optional[str]:
-        """Get the patch URL for a specific issue"""
-        links_by_issue = self.load_patch_links()
-        
-        if issue_id in links_by_issue:
-            # Return the first (and usually only) patch URL
-            return links_by_issue[issue_id][0].pr_diff_url
-        
-        return None
-
-    async def _download_single_diff(self, session: aiohttp.ClientSession, link: PatchLink) -> Optional[DiffDoc]:
-        """Download and process a single diff file"""
-        try:
-            # Download the diff
-            response = await self.rate_limited_get(session, link.pr_diff_url)
-            
-            if response.status == 429:
-                # Rate limited - return None so it can be retried later
-                logger.warning(f"Rate limited on PR #{link.pr_number}, will retry later")
-                return None
-            
-            if response.status != 200:
-                logger.warning(f"Failed to download diff for PR #{link.pr_number}: HTTP {response.status}")
-                return None
-            
-            diff_text = await response.text()
-            
-            # Process the diff
-            diff_summary = self._extract_diff_hunks(diff_text)
-            
-            # Save to file
-            diff_filename = f"pr_{link.pr_number}.diff"
-            diff_path = self.diffs_dir / diff_filename
-            
-            with open(diff_path, 'w', encoding='utf-8') as f:
-                f.write(diff_text)
-            
-            # Create DiffDoc
-            diff_doc = DiffDoc(
-                pr_number=link.pr_number,
-                issue_id=link.issue_id,
-                files_changed=link.files_changed,
-                diff_path=str(diff_path),
-                diff_text=diff_text,
-                diff_summary=diff_summary,
-                merged_at=link.merged_at # Populate merged_at
-            )
-            
-            return diff_doc
-            
-        except Exception as e:
-            logger.warning(f"Error downloading diff for PR #{link.pr_number}: {e}")
+            logger.error(f"GraphQL error: {e}")
             return None
 
-    def _extract_diff_hunks(self, diff_text: str, max_chars: int = 4000) -> str:
-        """Extract and format diff hunks for embedding, with size limit"""
-        if not diff_text.strip():
-            return "No diff content available"
-        
-        lines = diff_text.split('\n')
-        files_changed = set()
-        hunk_lines = []
-        current_file = None
-        current_file_path = None
-        current_length = 0
-        
-        # Extract file names and changes
-        for line in lines:
-            if line.startswith('diff --git'):
-                # Extract filename
-                parts = line.split()
-                if len(parts) >= 4:
-                    file_path = parts[3]  # Keep full path
-                    files_changed.add(file_path.split('/')[-1])  # Just filename for the list
-            elif line.startswith('--- a/') or line.startswith('+++ b/'):
-                # Track current file being processed
-                if line.startswith('+++ b/'):
-                    file_path = line[6:]  # Remove '+++ b/'
-                    current_file_path = file_path  # Keep full path
-                    current_file = file_path.split('/')[-1]  # Just filename for display
-            elif line.startswith('@@'):
-                # New hunk header
-                if current_file_path:
-                    hunk_lines.append(f"\n--- {current_file_path} ---")  # Use full path
-                hunk_lines.append(line)
-                current_length = len('\n'.join(hunk_lines))
-                if current_length > max_chars:
-                    hunk_lines.append(DIFF_TRUNCATION_SENTINEL)
-                    break
-            elif line.startswith(('+', '-', ' ')) and len(line.strip()) > 0:
-                # Actual diff line
-                hunk_lines.append(line)
-                current_length = len('\n'.join(hunk_lines))
-                if current_length > max_chars:
-                    hunk_lines.append(DIFF_TRUNCATION_SENTINEL)
-                    break
-        
-        # Build summary
-        files_list = list(files_changed) if files_changed else ["unknown"]
-        metadata_lines = [
-            f"Patch summary for PR (max {max_chars} chars):",
-            f"Files changed: {', '.join(files_list)}",
-            "--- Changes ---"
-        ]
-        
-        summary = '\n'.join(hunk_lines) if hunk_lines else "No changes detected"
-        final_summary = '\n'.join(metadata_lines) + '\n' + summary
-        
-        # Ensure we don't exceed limit while preserving sentinel
-        if len(final_summary) > max_chars:
-            # Reserve space for the sentinel if we need to truncate
-            cut_point = max_chars - len(DIFF_TRUNCATION_SENTINEL)
-            final_summary = final_summary[:cut_point] + DIFF_TRUNCATION_SENTINEL
-        
-        return final_summary
+    async def build_patch_linkage(self, max_issues: Optional[int] = None, max_prs: Optional[int] = None,
+                                  download_diffs: bool = True, include_open_prs: bool = True) -> None:
+        self.start_time = time.time()
+        max_issues = max_issues or settings.MAX_ISSUES_TO_PROCESS
+        max_prs = max_prs or settings.MAX_PR_TO_PROCESS
+        logger.info(f"Building patch linkage for {self.repo_key}")
 
-    async def _save_diff_docs(self, diff_docs: List[DiffDoc]) -> None:
-        """Save diff docs metadata to JSON for indexing"""
-        diff_docs_file = self.index_dir / "diff_docs.jsonl"
-        
-        logger.info(f"Saving {len(diff_docs)} diff docs to {diff_docs_file}")
-        
-        with open(diff_docs_file, 'w', encoding='utf-8') as f:
-            for doc in diff_docs:
-                doc_dict = {
-                    "pr_number": doc.pr_number,
-                    "issue_id": doc.issue_id,
-                    "files_changed": doc.files_changed,
-                    "diff_path": doc.diff_path,
-                    "diff_summary": doc.diff_summary,
-                    "merged_at": doc.merged_at, # Save merged_at
-                    "created_at": datetime.now().isoformat()
-                }
-                f.write(json.dumps(doc_dict, ensure_ascii=False) + '\n')
+        connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300, force_close=True)
+        async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=60)) as session:
+            # Verify connectivity
+            self._progress("connectivity", "Verifying API access", 5, 0, 1, self.repo_key)
+            resp = await self._get(session, f"https://api.github.com/repos/{self.repo_owner}/{self.repo_name}")
+            if resp.status != 200: raise RuntimeError(f"Cannot access {self.repo_key}")
+
+            # Fetch issues with linked PRs
+            self._progress("issues_and_prs", "Fetching issues", 10, 0, max_issues)
+            patch_links = await self._fetch_issues_prs(session, max_issues)
+            self._save_jsonl(self.patch_links_file, [self._link_to_dict(l) for l in patch_links])
+
+            # Fetch merged PRs
+            self._progress("merged_prs", "Fetching merged PRs", 40, 0, max_prs)
+            merged_prs = await self._fetch_merged_prs(session, max_prs)
+
+            # Fetch open PRs
+            open_prs = []
+            if include_open_prs:
+                self._progress("open_prs", "Fetching open PRs", 50, 0, max_prs // 2)
+                open_prs = await self._fetch_open_prs(session, max_prs // 2)
+                self._save_jsonl(self.open_prs_file, [self._open_pr_to_dict(p) for p in open_prs])
+
+            # Download diffs
+            if download_diffs and (patch_links or merged_prs):
+                self._progress("downloading_diffs", "Downloading diffs", 60, 0, len(patch_links) + len(merged_prs))
+                diff_docs = await self._download_diffs(session, patch_links, merged_prs)
+                self._save_jsonl(self.index_dir / "diff_docs.jsonl", [self._diff_to_dict(d) for d in diff_docs])
+
+            self._progress("finalizing", "Complete", 100, 1, 1, "Done!")
+            logger.info(f"Patch linkage complete: {len(patch_links)} links, {len(open_prs)} open PRs")
+
+    async def _fetch_issues_prs(self, session: aiohttp.ClientSession, max_issues: int) -> List[PatchLink]:
+        links, seen = [], set()
+        cursor, processed = None, 0
+
+        while processed < max_issues:
+            data = await self._gql(session, GQL_ISSUES_WITH_PRS, {"owner": self.repo_owner, "name": self.repo_name, "first": min(100, max_issues - processed), "after": cursor})
+            if not data: break
+
+            issues = data["data"]["repository"]["issues"]
+            for issue in issues["nodes"]:
+                processed += 1
+                for item in issue["timelineItems"]["nodes"]:
+                    pr = self._extract_pr(item)
+                    if pr and pr.get("mergedAt") and (pair := (issue["number"], pr["number"])) not in seen:
+                        seen.add(pair)
+                        links.append(PatchLink(
+                            issue_id=issue["number"], pr_number=pr["number"], merged_at=pr["mergedAt"],
+                            pr_title=pr["title"], pr_url=pr["url"],
+                            pr_diff_url=f"https://github.com/{self.repo_owner}/{self.repo_name}/pull/{pr['number']}.diff",
+                            files_changed=[f["path"] for f in pr.get("files", {}).get("nodes", [])]))
+
+            if not issues["pageInfo"]["hasNextPage"]: break
+            cursor = issues["pageInfo"]["endCursor"]
+            self._progress("issues_and_prs", "Processing issues", 10 + (processed / max_issues) * 30, processed, max_issues)
+
+        return links
+
+    def _extract_pr(self, item: dict) -> Optional[dict]:
+        if item["__typename"] == "ClosedEvent" and (c := item.get("closer")):
+            if c["__typename"] == "PullRequest": return c
+            if c["__typename"] == "Commit" and (prs := c.get("associatedPullRequests", {}).get("nodes")): return prs[0]
+        if item["__typename"] == "ReferencedEvent" and (commit := item.get("commit")):
+            if prs := commit.get("associatedPullRequests", {}).get("nodes"): return prs[0]
+        if item["__typename"] == "CrossReferencedEvent" and (src := item.get("source")):
+            if src["__typename"] == "PullRequest": return src
+        return None
+
+    async def _fetch_merged_prs(self, session: aiohttp.ClientSession, max_prs: int) -> List[dict]:
+        prs, cursor = [], None
+        while len(prs) < max_prs:
+            data = await self._gql(session, GQL_MERGED_PRS, {"owner": self.repo_owner, "name": self.repo_name, "first": min(100, max_prs - len(prs)), "after": cursor})
+            if not data: break
+            pr_data = data["data"]["repository"]["pullRequests"]
+            for pr in pr_data["nodes"]:
+                if len(prs) >= max_prs: break
+                prs.append({"number": pr["number"], "title": pr["title"], "merged_at": pr["mergedAt"], "url": pr["url"],
+                           "diff_url": f"https://github.com/{self.repo_owner}/{self.repo_name}/pull/{pr['number']}.diff",
+                           "files_changed": [f["path"] for f in pr.get("files", {}).get("nodes", [])]})
+            if not pr_data["pageInfo"]["hasNextPage"]: break
+            cursor = pr_data["pageInfo"]["endCursor"]
+        return prs
+
+    async def _fetch_open_prs(self, session: aiohttp.ClientSession, max_prs: int) -> List[OpenPRDoc]:
+        prs, cursor = [], None
+        while len(prs) < max_prs:
+            data = await self._gql(session, GQL_OPEN_PRS, {"owner": self.repo_owner, "name": self.repo_name, "first": min(50, max_prs - len(prs)), "after": cursor})
+            if not data: break
+            pr_data = data["data"]["repository"]["pullRequests"]
+            for pr in pr_data["nodes"]:
+                prs.append(self._create_open_pr(pr))
+            if not pr_data["pageInfo"]["hasNextPage"]: break
+            cursor = pr_data["pageInfo"]["endCursor"]
+        return prs
+
+    def _create_open_pr(self, pr: dict) -> OpenPRDoc:
+        reviews = pr.get("reviews", {}).get("nodes", [])
+        rev_counts = {"APPROVED": 0, "CHANGES_REQUESTED": 0, "COMMENTED": 0}
+        for r in reviews: rev_counts[r["state"]] = rev_counts.get(r["state"], 0) + 1
+        reviews_summary = f"{len(reviews)} reviews: {rev_counts['APPROVED']} approved, {rev_counts['CHANGES_REQUESTED']} changes"
+
+        status_parts = []
+        if commits := pr.get("commits", {}).get("nodes"):
+            if rollup := commits[0].get("commit", {}).get("statusCheckRollup"):
+                status_parts.append(f"CI: {rollup.get('state', 'UNKNOWN')}")
+
+        return OpenPRDoc(
+            pr_number=pr["number"], title=pr["title"], body=pr.get("body", ""),
+            author=pr.get("author", {}).get("login", "Unknown"),
+            created_at=pr["createdAt"], updated_at=pr["updatedAt"],
+            files_changed=[f["path"] for f in pr.get("files", {}).get("nodes", [])],
+            review_decision=pr.get("reviewDecision"), reviews_summary=reviews_summary,
+            status_summary=". ".join(status_parts), draft=pr.get("isDraft", False),
+            mergeable=pr.get("mergeable"), url=pr.get("url"))
+
+    async def _download_diffs(self, session: aiohttp.ClientSession, links: List[PatchLink], merged_prs: List[dict]) -> List[DiffDoc]:
+        # Prepare all tasks
+        tasks = [(l, l) for l in links]
+        linked_prs = {l.pr_number for l in links}
+        for pr in merged_prs:
+            if pr["number"] not in linked_prs:
+                link = PatchLink(issue_id=None, pr_number=pr["number"], merged_at=pr.get("merged_at"),
+                               pr_title=pr["title"], pr_url=pr["url"], pr_diff_url=pr["diff_url"],
+                               files_changed=pr.get("files_changed", []))
+                tasks.append((link, link))
+
+        docs, total = [], len(tasks)
+        for i in range(0, total, 10):
+            batch = [self._download_diff(session, t[0]) for t in tasks[i:i+10]]
+            results = await asyncio.gather(*batch, return_exceptions=True)
+            docs.extend([r for r in results if r and not isinstance(r, Exception)])
+            self._progress("downloading_diffs", "Downloading", 60 + (min(i + 10, total) / total) * 30, min(i + 10, total), total)
+            if i + 10 < total: await asyncio.sleep(0.5)
+        return docs
+
+    async def _download_diff(self, session: aiohttp.ClientSession, link: PatchLink) -> Optional[DiffDoc]:
+        try:
+            resp = await self._get(session, link.pr_diff_url)
+            if resp.status != 200: return None
+            diff_text = await resp.text()
+            diff_path = self.diffs_dir / f"pr_{link.pr_number}.diff"
+            diff_path.write_text(diff_text)
+            return DiffDoc(pr_number=link.pr_number, issue_id=link.issue_id, files_changed=link.files_changed,
+                          diff_path=str(diff_path), diff_text=diff_text, diff_summary=self._extract_hunks(diff_text),
+                          merged_at=link.merged_at)
+        except Exception as e:
+            logger.warning(f"Diff download failed PR#{link.pr_number}: {e}")
+            return None
+
+    def _extract_hunks(self, diff: str, max_chars: int = 4000) -> str:
+        if not diff.strip(): return "No diff content"
+        lines, hunks, files = diff.split('\n'), [], set()
+        for line in lines:
+            if line.startswith('diff --git') and (p := line.split()) and len(p) >= 4:
+                files.add(p[3].split('/')[-1])
+            elif line.startswith('+++ b/'): hunks.append(f"\n--- {line[6:]} ---")
+            elif line.startswith('@@') or (line.startswith(('+', '-', ' ')) and line.strip()):
+                hunks.append(line)
+            if len('\n'.join(hunks)) > max_chars:
+                hunks.append(DIFF_TRUNCATION_SENTINEL); break
+        header = f"Files: {', '.join(files) or 'unknown'}\n--- Changes ---\n"
+        return header + '\n'.join(hunks)
+
+    # Save/Load helpers
+    def _save_jsonl(self, path: Path, items: List[dict]):
+        with open(path, 'w') as f:
+            for item in items: f.write(json.dumps(item, ensure_ascii=False) + '\n')
+
+    def _load_jsonl(self, path: Path) -> List[dict]:
+        if not path.exists(): return []
+        items = []
+        with open(path) as f:
+            for line in f:
+                try: items.append(json.loads(line.strip()))
+                except: pass
+        return items
+
+    def _link_to_dict(self, l: PatchLink) -> dict:
+        return {"issue_id": l.issue_id, "pr_number": l.pr_number, "merged_at": l.merged_at, "pr_title": l.pr_title,
+                "pr_url": l.pr_url, "pr_diff_url": l.pr_diff_url, "files_changed": l.files_changed, "created_at": datetime.now().isoformat()}
+
+    def _diff_to_dict(self, d: DiffDoc) -> dict:
+        return {"pr_number": d.pr_number, "issue_id": d.issue_id, "files_changed": d.files_changed,
+                "diff_path": d.diff_path, "diff_summary": d.diff_summary, "merged_at": d.merged_at, "created_at": datetime.now().isoformat()}
+
+    def _open_pr_to_dict(self, p: OpenPRDoc) -> dict:
+        return {"pr_number": p.pr_number, "title": p.title, "body": p.body, "author": p.author,
+                "created_at": p.created_at, "updated_at": p.updated_at, "files_changed": p.files_changed,
+                "review_decision": p.review_decision, "reviews_summary": p.reviews_summary,
+                "status_summary": p.status_summary, "draft": p.draft, "mergeable": p.mergeable, "url": p.url}
+
+    def load_patch_links(self) -> Dict[int, List[PatchLink]]:
+        links_by_issue = {}
+        for d in self._load_jsonl(self.patch_links_file):
+            link = PatchLink(issue_id=d["issue_id"], pr_number=d["pr_number"], merged_at=d.get("merged_at"),
+                           pr_title=d["pr_title"], pr_url=d["pr_url"], pr_diff_url=d["pr_diff_url"],
+                           files_changed=d.get("files_changed", []))
+            links_by_issue.setdefault(link.issue_id, []).append(link)
+        return links_by_issue
+
+    def get_patch_url_for_issue(self, issue_id: int) -> Optional[str]:
+        links = self.load_patch_links()
+        return links[issue_id][0].pr_diff_url if issue_id in links else None
 
     def load_diff_docs(self) -> List[DiffDoc]:
-        """Load diff docs from saved metadata"""
-        diff_docs_file = self.index_dir / "diff_docs.jsonl"
-        
-        if not diff_docs_file.exists():
-            return []
-        
-        diff_docs = []
-        
-        try:
-            with open(diff_docs_file, 'r', encoding='utf-8') as f:
-                for line_num, line in enumerate(f, 1):
-                    try:
-                        doc_data = json.loads(line.strip())
-                        
-                        diff_doc = DiffDoc(
-                            pr_number=doc_data["pr_number"],
-                            issue_id=doc_data["issue_id"],
-                            files_changed=doc_data.get("files_changed", []),
-                            diff_path=doc_data["diff_path"],
-                            diff_text="",  # We'll load this on demand
-                            diff_summary=doc_data["diff_summary"],
-                            merged_at=doc_data.get("merged_at") # Load merged_at
-                        )
-                        
-                        diff_docs.append(diff_doc)
-                        
-                    except Exception as e:
-                        logger.warning(f"Failed to parse diff doc line {line_num}: {e}")
-                        continue
-                        
-        except Exception as e:
-            logger.error(f"Error loading diff docs: {e}")
-            return []
-        
-        logger.info(f"Loaded {len(diff_docs)} diff docs")
-        return diff_docs
+        return [DiffDoc(pr_number=d["pr_number"], issue_id=d["issue_id"], files_changed=d.get("files_changed", []),
+                       diff_path=d["diff_path"], diff_text="", diff_summary=d["diff_summary"], merged_at=d.get("merged_at"))
+                for d in self._load_jsonl(self.index_dir / "diff_docs.jsonl")]
 
-    async def _fetch_open_prs_with_reviews(self, session: aiohttp.ClientSession, max_prs: int) -> List[OpenPRDoc]:
-        """
-        Fetch open PRs with review information using GraphQL
-        """
-        logger.info(f"Fetching up to {max_prs} open PRs with reviews using GraphQL...")
-        
-        query = """
-        query OpenPullRequests($owner: String!, $name: String!, $after: String, $first: Int!) {
-            repository(owner: $owner, name: $name) {
-                pullRequests(
-                    first: $first,
-                    after: $after,
-                    states: [OPEN],
-                    orderBy: {field: UPDATED_AT, direction: DESC}
-                ) {
-                    nodes {
-                        number
-                        title
-                        body
-                        createdAt
-                        updatedAt
-                        url
-                        isDraft
-                        author {
-                            login
-                        }
-                        
-                        # Review information
-                        reviewDecision
-                        
-                        reviews(last: 10) {
-                            nodes {
-                                author {
-                                    login
-                                }
-                                state
-                                submittedAt
-                                body
-                            }
-                        }
-                        
-                        reviewRequests(first: 10) {
-                            nodes {
-                                requestedReviewer {
-                                    __typename
-                                    ... on User { login }
-                                    ... on Team { name }
-                                }
-                            }
-                        }
-                        
-                        # Status information
-                        mergeable
-                        
-                        commits(last: 1) {
-                            nodes {
-                                commit {
-                                    statusCheckRollup {
-                                        state
-                                        contexts(first: 5) {
-                                            nodes {
-                                                __typename
-                                                ... on StatusContext {
-                                                    context
-                                                    state
-                                                }
-                                                ... on CheckRun {
-                                                    name
-                                                    conclusion
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        
-                        # Files changed
-                        files(first: 50) {
-                            nodes {
-                                path
-                            }
-                        }
-                    }
-                    pageInfo {
-                        hasNextPage
-                        endCursor
-                    }
-                }
-            }
-        }
-        """
-        
-        all_open_prs = []
-        has_next_page = True
-        after_cursor = None
-        batch_size = min(50, max_prs)
-        
-        while has_next_page and len(all_open_prs) < max_prs:
-            variables = {
-                "owner": self.repo_owner,
-                "name": self.repo_name,
-                "first": min(batch_size, max_prs - len(all_open_prs)),
-                "after": after_cursor
-            }
-            
-            try:
-                async with session.post(
-                    "https://api.github.com/graphql",
-                    json={"query": query, "variables": variables},
-                    headers=self.headers
-                ) as response:
-                    if response.status != 200:
-                        logger.error(f"GraphQL request failed with status {response.status}")
-                        break
-                    
-                    data = await response.json()
-                    
-                    if "errors" in data:
-                        logger.error(f"GraphQL errors: {data['errors']}")
-                        break
-                    
-                    prs_data = data["data"]["repository"]["pullRequests"]
-                    prs = prs_data["nodes"]
-                    page_info = prs_data["pageInfo"]
-                    
-                    # Process PRs and create OpenPRDoc objects
-                    for pr in prs:
-                        open_pr_doc = self._create_open_pr_doc(pr)
-                        all_open_prs.append(open_pr_doc)
-                    
-                    # Update pagination
-                    has_next_page = page_info["hasNextPage"]
-                    after_cursor = page_info["endCursor"]
-                    
-                    if len(prs) < batch_size:
-                        has_next_page = False
-                        
-            except Exception as e:
-                logger.error(f"Error in open PRs GraphQL query: {e}")
-                break
-        
-        logger.info(f"Fetched {len(all_open_prs)} open PRs with review information")
-        return all_open_prs
-    
-    def _create_open_pr_doc(self, pr_data: Dict[str, Any]) -> OpenPRDoc:
-        """Create an OpenPRDoc from GraphQL PR data"""
-        
-        # Extract files changed
-        files_changed = [f["path"] for f in pr_data.get("files", {}).get("nodes", [])]
-        
-        # Create reviews summary
-        reviews = pr_data.get("reviews", {}).get("nodes", [])
-        reviews_summary_parts = []
-        
-        if reviews:
-            approval_count = sum(1 for r in reviews if r["state"] == "APPROVED")
-            changes_requested_count = sum(1 for r in reviews if r["state"] == "CHANGES_REQUESTED")
-            comment_count = sum(1 for r in reviews if r["state"] == "COMMENTED")
-            
-            reviews_summary_parts.append(f"Reviews: {len(reviews)} total")
-            if approval_count > 0:
-                reviews_summary_parts.append(f"{approval_count} approvals")
-            if changes_requested_count > 0:
-                reviews_summary_parts.append(f"{changes_requested_count} change requests")
-            if comment_count > 0:
-                reviews_summary_parts.append(f"{comment_count} comments")
-            
-            # Add recent review details
-            for review in reviews[-3:]:  # Last 3 reviews
-                author = review.get("author", {}).get("login", "Unknown")
-                state = review["state"]
-                reviews_summary_parts.append(f"{author}: {state}")
-        
-        reviews_summary = ". ".join(reviews_summary_parts)
-        
-        # Create status summary
-        status_summary_parts = []
-        commits = pr_data.get("commits", {}).get("nodes", [])
-        if commits:
-            rollup = commits[0].get("commit", {}).get("statusCheckRollup")
-            if rollup:
-                overall_state = rollup.get("state", "UNKNOWN")
-                status_summary_parts.append(f"CI Status: {overall_state}")
-                
-                contexts = rollup.get("contexts", {}).get("nodes", [])
-                for context in contexts[:3]:  # First 3 contexts
-                    if context.get("__typename") == "StatusContext":
-                        name = context.get("context", "Unknown")
-                        state = context.get("state", "UNKNOWN")
-                        status_summary_parts.append(f"{name}: {state}")
-                    elif context.get("__typename") == "CheckRun":
-                        name = context.get("name", "Unknown")
-                        conclusion = context.get("conclusion", "PENDING")
-                        status_summary_parts.append(f"{name}: {conclusion}")
-        
-        status_summary = ". ".join(status_summary_parts)
-        
-        return OpenPRDoc(
-            pr_number=pr_data["number"],
-            title=pr_data["title"],
-            body=pr_data.get("body", ""),
-            author=pr_data.get("author", {}).get("login", "Unknown"),
-            created_at=pr_data["createdAt"],
-            updated_at=pr_data["updatedAt"],
-            files_changed=files_changed,
-            review_decision=pr_data.get("reviewDecision"),
-            reviews_summary=reviews_summary,
-            status_summary=status_summary,
-            draft=pr_data.get("isDraft", False),
-            mergeable=pr_data.get("mergeable"),
-            url=pr_data.get("url")
-        )
-    
-    async def _save_open_prs(self, open_prs: List[OpenPRDoc]) -> None:
-        """Save open PRs to JSONL file"""
-        logger.info(f"Saving {len(open_prs)} open PRs to {self.open_prs_file}")
-        
-        with open(self.open_prs_file, 'w', encoding='utf-8') as f:
-            for pr_doc in open_prs:
-                pr_dict = {
-                    "pr_number": pr_doc.pr_number,
-                    "title": pr_doc.title,
-                    "body": pr_doc.body,
-                    "author": pr_doc.author,
-                    "created_at": pr_doc.created_at,
-                    "updated_at": pr_doc.updated_at,
-                    "files_changed": pr_doc.files_changed,
-                    "review_decision": pr_doc.review_decision,
-                    "reviews_summary": pr_doc.reviews_summary,
-                    "status_summary": pr_doc.status_summary,
-                    "draft": pr_doc.draft,
-                    "mergeable": pr_doc.mergeable,
-                    "url": pr_doc.url,
-                    "created_at_indexed": datetime.now().isoformat()
-                }
-                f.write(json.dumps(pr_dict, ensure_ascii=False) + '\n')
-    
     def load_open_prs(self) -> List[OpenPRDoc]:
-        """Load open PRs from saved data"""
-        if not self.open_prs_file.exists():
-            return []
-        
-        open_prs = []
-        
-        try:
-            with open(self.open_prs_file, 'r', encoding='utf-8') as f:
-                for line_num, line in enumerate(f, 1):
-                    try:
-                        pr_data = json.loads(line.strip())
-                        
-                        open_pr = OpenPRDoc(
-                            pr_number=pr_data["pr_number"],
-                            title=pr_data["title"],
-                            body=pr_data.get("body", ""),
-                            author=pr_data["author"],
-                            created_at=pr_data["created_at"],
-                            updated_at=pr_data["updated_at"],
-                            files_changed=pr_data.get("files_changed", []),
-                            review_decision=pr_data.get("review_decision"),
-                            reviews_summary=pr_data.get("reviews_summary", ""),
-                            status_summary=pr_data.get("status_summary", ""),
-                            draft=pr_data.get("draft", False),
-                            mergeable=pr_data.get("mergeable"),
-                            url=pr_data.get("url")
-                        )
-                        
-                        open_prs.append(open_pr)
-                        
-                    except Exception as e:
-                        logger.warning(f"Failed to parse open PR line {line_num}: {e}")
-                        continue
-                        
-        except Exception as e:
-            logger.error(f"Error loading open PRs: {e}")
-            return []
-        
-        logger.info(f"Loaded {len(open_prs)} open PRs")
-        return open_prs
+        return [OpenPRDoc(pr_number=d["pr_number"], title=d["title"], body=d.get("body", ""), author=d["author"],
+                         created_at=d["created_at"], updated_at=d["updated_at"], files_changed=d.get("files_changed", []),
+                         review_decision=d.get("review_decision"), reviews_summary=d.get("reviews_summary", ""),
+                         status_summary=d.get("status_summary", ""), draft=d.get("draft", False),
+                         mergeable=d.get("mergeable"), url=d.get("url"))
+                for d in self._load_jsonl(self.open_prs_file)]
 
-# Utility function to build patch linkage for a repository
+
 async def build_repository_patch_linkage(repo_owner: str, repo_name: str, max_issues: Optional[int] = None, max_prs: Optional[int] = None) -> None:
-    """Build patch linkage for a repository - convenience function"""
-    # Use settings.MAX_ISSUES_TO_PROCESS if max_issues is None
-    max_issues = max_issues or settings.MAX_ISSUES_TO_PROCESS
-    max_prs = max_prs or settings.MAX_PR_TO_PROCESS
     builder = PatchLinkageBuilder(repo_owner, repo_name)
-    await builder.build_patch_linkage(max_issues, max_prs)
+    await builder.build_patch_linkage(max_issues or settings.MAX_ISSUES_TO_PROCESS, max_prs or settings.MAX_PR_TO_PROCESS)
 
-# Command-line interface for testing
+
 if __name__ == "__main__":
     import sys
-    
-    if len(sys.argv) != 3:
-        print("Usage: python -m src.patch_linkage <owner> <repo>")
-        sys.exit(1)
-    
-    owner, repo = sys.argv[1], sys.argv[2]
-    
-    async def main():
-        await build_repository_patch_linkage(owner, repo, max_issues=500, max_prs=500)  # Smaller limit for testing
-    
-    asyncio.run(main)
+    if len(sys.argv) != 3: print("Usage: python -m src.patch_linkage <owner> <repo>"); sys.exit(1)
+    asyncio.run(build_repository_patch_linkage(sys.argv[1], sys.argv[2], 500, 500))

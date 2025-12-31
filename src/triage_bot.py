@@ -338,62 +338,7 @@ class TriageBot:
         result += "\n\n"
         
         return result
-    
-    def _format_analysis_summary(self, analysis_result: Dict[str, Any]) -> str:
-        """Format a complete analysis summary for GitHub comment"""
-        comment_parts = []
-        
-        # Header
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
-        comment_parts.append(f"# 🔍 Triage Analysis Report\n\n*Generated on {timestamp}*\n")
-        
-        # Status check
-        status = analysis_result.get('status', 'unknown')
-        if status == 'skipped':
-            reason = analysis_result.get('reason', 'Unknown reason')
-            comment_parts.append(f"⚠️ **Analysis Skipped:** {reason}\n\n")
-            return ''.join(comment_parts) + self.bot_signature
-        elif status == 'error':
-            error = analysis_result.get('error', 'Unknown error')
-            comment_parts.append(f"❌ **Analysis Failed:** {error}\n\n")
-            return ''.join(comment_parts) + self.bot_signature
-        
-        # Classification
-        if analysis_result.get('final_result', {}).get('classification'):
-            classification_text = self._format_classification(
-                analysis_result['final_result']['classification']
-            )
-            if classification_text:
-                comment_parts.append(classification_text)
-        
-        # PR Detection
-        pr_detection_step = None
-        for step in analysis_result.get('steps', []):
-            if step.get('step') == 'PR Detection':
-                pr_detection_step = step.get('result')
-                break
-        
-        if pr_detection_step:
-            pr_detection_text = self._format_pr_detection(pr_detection_step)
-            if pr_detection_text:
-                comment_parts.append(pr_detection_text)
-        
-        # Solution Plan (will be handled in the main method with gists)
-        # This is a placeholder - the actual formatting happens in post_analysis_to_issue
-        
-        # Related Files (if available)
-        related_files = analysis_result.get('final_result', {}).get('related_files')
-        if related_files and isinstance(related_files, list) and len(related_files) > 0:
-            comment_parts.append("## 📁 Key Files Identified\n\n")
-            for file_path in related_files[:10]:  # Limit to top 10 files
-                comment_parts.append(f"- `{file_path}`\n")
-            comment_parts.append("\n")
-        
-        # Add bot signature
-        comment_parts.append(self.bot_signature)
-        
-        return ''.join(comment_parts)
-    
+
     async def post_analysis_to_issue(
         self, 
         issue_url: str, 

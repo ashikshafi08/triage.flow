@@ -1,12 +1,11 @@
 from fastapi import APIRouter, HTTPException, Query, Depends, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from ...models import (
-    PromptRequest, PromptResponse, SessionResponse, 
-    RepoRequest, RepoSessionResponse, SessionListResponse
+    SessionResponse, RepoRequest, RepoSessionResponse, SessionListResponse
 )
 from ..dependencies import (
-    session_manager, github_client, prompt_generator, 
-    llm_client, get_session, get_agentic_rag, logger, settings
+    session_manager, github_client, llm_client,
+    get_session, get_agentic_rag, logger, settings
 )
 import asyncio
 from typing import Optional, Dict, Any, List
@@ -97,52 +96,6 @@ async def broadcast_to_session(session_id: str, message: dict):
         # Clean up empty session
         if not active_connections[session_id]:
             del active_connections[session_id]
-
-@router.post("/sessions", response_model=SessionResponse)
-async def create_session(request: PromptRequest):
-    try:
-        # Create new session
-        session_id = await session_manager.create_session(
-            request.issue_url, 
-            request.prompt_type,
-            request.llm_config
-        )
-        
-        # Initialize session context in background
-        await session_manager.initialize_session_context(session_id)
-        
-        # Get initial prompt
-        session = await session_manager.get_session(session_id)
-        if not session or not session.get("issue_data"):
-            raise HTTPException(status_code=404, detail="Issue not found")
-            
-        prompt_response = await prompt_generator.generate_prompt(
-            request, 
-            session["issue_data"]
-        )
-        
-        if prompt_response.status == "error":
-            raise HTTPException(status_code=400, detail=prompt_response.error)
-            
-        # Process initial prompt with LLM
-        llm_response = await llm_client.process_prompt(
-            prompt_response.prompt,
-            prompt_type=request.prompt_type,
-            model=request.llm_config.name,
-            context=request.context
-        )
-        
-        # Add initial messages to session
-        await session_manager.add_message(session_id, "system", prompt_response.prompt)
-        await session_manager.add_message(session_id, "assistant", llm_response.prompt)
-        
-        return {
-            "session_id": session_id,
-            "initial_message": llm_response.prompt
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/assistant/sessions", response_model=RepoSessionResponse)
 async def create_assistant_session(request: RepoRequest):

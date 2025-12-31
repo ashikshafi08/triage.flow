@@ -33,7 +33,7 @@ from ..dependencies import get_session, session_manager, logger, settings
 
 router = APIRouter(prefix="/assistant/sessions", tags=["workflows"])
 
-# Pydantic models for API
+
 class CreateWorkflowRequest(BaseModel):
     workflow_type: str = Field(..., description="Type of workflow: linear_swarm, orchestrator, custom_planner")
     name: Optional[str] = Field(None, description="Custom name for the workflow")

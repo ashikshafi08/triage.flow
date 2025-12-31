@@ -34,12 +34,6 @@ class LLMConfig(BaseModel):
     temperature: Optional[float] = None
     additional_params: Dict[str, Any] = {}
 
-class PromptRequest(BaseModel):
-    issue_url: str
-    prompt_type: str
-    context: Optional[Dict[str, Any]] = None
-    llm_config: Optional[Any] = None
-
 class IssueContextRequest(BaseModel):
     query: str
     repo_url: str

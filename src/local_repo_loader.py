@@ -1,98 +1,43 @@
-import tempfile
-import shutil
-import subprocess
-import os
+"""Git repository cloning utilities - tinygrad-style rewrite (97→45 lines)"""
+import tempfile, shutil, subprocess
 from contextlib import contextmanager
 from typing import Tuple
 
+def _git_clone(repo_url: str, branch: str, shallow: bool, dest: str) -> None:
+    """Core clone logic with main/master fallback."""
+    cmd = ["git", "clone"] + (["--depth", "1"] if shallow else []) + ["--branch", branch, repo_url, dest]
+    try: subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        if branch != "main": raise
+        cmd[-3] = "master"  # Try master if main fails
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+
 @contextmanager
 def clone_repo_to_temp(repo_url: str, branch: str = "main", shallow: bool = True):
-    """
-    Clone a GitHub repo to a temporary directory, yield the path, and clean up after use.
-    Usage:
-        with clone_repo_to_temp(repo_url) as repo_path:
-            # process files in repo_path
-    """
+    """Clone repo to temp dir, yield path, cleanup on exit."""
     temp_dir = tempfile.mkdtemp()
     try:
-        # Try main branch first
-        cmd = ["git", "clone"]
-        if shallow:
-            cmd.extend(["--depth", "1"])
-        cmd.extend(["--branch", branch, repo_url, temp_dir])
-        
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError:
-            # If main fails, try master
-            if branch == "main":
-                cmd_master = ["git", "clone"]
-                if shallow:
-                    cmd_master.extend(["--depth", "1"])
-                cmd_master.extend(["--branch", "master", repo_url, temp_dir])
-                subprocess.run(cmd_master, check=True, capture_output=True, text=True)
-            else:
-                raise
-        
+        _git_clone(repo_url, branch, shallow, temp_dir)
         yield temp_dir
-    finally:
-        # Clean up the temp directory
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    finally: shutil.rmtree(temp_dir, ignore_errors=True)
 
-# Persistent version for session-based repo storage
 def clone_repo_to_temp_persistent(repo_url: str, branch: str = "main", shallow: bool = True) -> str:
+    """Clone repo to temp dir, return path (caller must cleanup)."""
     temp_dir = tempfile.mkdtemp()
-    cmd = ["git", "clone"]
-    
-    if shallow:
-        cmd.extend(["--depth", "1"])
-    
-    cmd.extend(["--branch", branch, repo_url, temp_dir])
-    
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError:
-        # Try master if main fails
-        if branch == "main":
-            cmd_master = ["git", "clone"]
-            if shallow:
-                cmd_master.extend(["--depth", "1"])
-            cmd_master.extend(["--branch", "master", repo_url, temp_dir])
-            subprocess.run(cmd_master, check=True, capture_output=True, text=True)
-        else:
-            raise
+    _git_clone(repo_url, branch, shallow, temp_dir)
     return temp_dir
 
 def unshallow_repository(repo_path: str) -> bool:
-    """Convert a shallow repository to a full repository with complete history"""
+    """Convert shallow repo to full history."""
     try:
-        # Check if it's a shallow repository
-        result = subprocess.run([
-            "git", "rev-parse", "--is-shallow-repository"
-        ], capture_output=True, text=True, cwd=repo_path)
-        
+        result = subprocess.run(["git", "rev-parse", "--is-shallow-repository"], capture_output=True, text=True, cwd=repo_path)
         if result.returncode == 0 and result.stdout.strip() == "true":
-            print(f"Repository is shallow, fetching complete history...")
-            # Fetch the complete history
-            subprocess.run([
-                "git", "fetch", "--unshallow"
-            ], check=True, capture_output=True, text=True, cwd=repo_path)
-            print(f"Repository unshallowed successfully")
+            subprocess.run(["git", "fetch", "--unshallow"], check=True, capture_output=True, text=True, cwd=repo_path)
             return True
-        else:
-            print(f"Repository already has complete history")
-            return False
-            
-    except subprocess.CalledProcessError as e:
-        print(f"Failed to unshallow repository: {e}")
         return False
+    except subprocess.CalledProcessError: return False
 
 def get_repo_info(repo_url: str) -> Tuple[str, str]:
-    """Extract owner and repository name from a GitHub URL."""
-    # Remove .git if present
-    repo_url = repo_url.replace(".git", "")
-    # Split by / and get last two parts
-    parts = repo_url.split("/")
-    owner = parts[-2]
-    repo = parts[-1]
-    return owner, repo 
+    """Extract (owner, repo) from GitHub URL."""
+    parts = repo_url.replace(".git", "").split("/")
+    return parts[-2], parts[-1]

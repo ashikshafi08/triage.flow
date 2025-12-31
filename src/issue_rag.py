@@ -1,29 +1,18 @@
-"""
-Issue-Aware RAG System
-Integrates GitHub issue history into the existing RAG pipeline for enhanced context
-"""
-
-import os
-import json
-import asyncio
-import logging
-import time
+"""Issue-Aware RAG System - tinygrad-style rewrite (1,927→~600 lines)"""
+import os, json, asyncio, logging, time, re, faiss
+import numpy as np
 from typing import Dict, Any, Optional, List, Tuple, Callable
 from pathlib import Path
-import re
-import faiss
-import numpy as np
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from llama_index.core import VectorStoreIndex, StorageContext, Settings, Document
 from llama_index.vector_stores.faiss import FaissVectorStore
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core.node_parser import SimpleNodeParser
 from llama_index.retrievers.bm25 import BM25Retriever
-from llama_index.core.postprocessor import LLMRerank
 import Stemmer
-from tqdm.auto import tqdm # Import tqdm
+from tqdm.auto import tqdm
 
 from src.config import settings
 from .github_client import GitHubIssueClient
@@ -32,1896 +21,678 @@ from .models import IssueDoc, IssueSearchResult, IssueContextResponse, PatchSear
 from .cache import rag_cache
 from .patch_linkage import PatchLinkageBuilder
 from .commit_index import CommitIndexManager
+from .utils.decorators import safe_op, retry
 
 logger = logging.getLogger(__name__)
 
-def to_int(issue_id: Any) -> Optional[int]:
-    """Safely convert issue_id to integer, returning None if conversion fails"""
-    try:
-        return int(issue_id)
-    except (ValueError, TypeError):
-        return None
+def to_int(v: Any) -> Optional[int]:
+    try: return int(v)
+    except (ValueError, TypeError): return None
+
 
 class IssueIndexer:
     """Handles indexing and storage of GitHub issues"""
-    
+
     def __init__(self, repo_owner: str, repo_name: str):
-        self.repo_owner = repo_owner
-        self.repo_name = repo_name
+        self.repo_owner, self.repo_name = repo_owner, repo_name
         self.repo_key = f"{repo_owner}/{repo_name}"
-        self.github_client = GitHubIssueClient()
-        self.llm_client = LLMClient()
-        
-        # Initialize patch linkage builder
+        self.github_client, self.llm_client = GitHubIssueClient(), LLMClient()
         self.patch_builder = PatchLinkageBuilder(repo_owner, repo_name)
-        
-        # Initialize commit index manager (optional enhancement)
-        self.commit_index_manager = CommitIndexManager(
-            repo_path=".",  # Assume we're running from repo root
-            repo_owner=repo_owner,
-            repo_name=repo_name
-        )
-        
-        # Initialize embedding model
-        self.embed_model = OpenAIEmbedding(
-            model="text-embedding-3-small",  # Changed from large to small
-            api_key=settings.openai_api_key
-        )
-        
-        # Setup storage paths
+        self.commit_index_manager = CommitIndexManager(".", repo_owner, repo_name)
+        self.embed_model = OpenAIEmbedding(model="text-embedding-3-small", api_key=settings.openai_api_key)
+
+        # Storage paths
         self.index_dir = Path(f".faiss_issues_{repo_owner}_{repo_name}")
         self.index_dir.mkdir(exist_ok=True)
-        
         self.issues_file = self.index_dir / "issues.jsonl"
         self.metadata_file = self.index_dir / "metadata.json"
         self.faiss_index_file = self.index_dir / "index.faiss"
         self.faiss_nodes_file = self.index_dir / "nodes.json"
-        
-        # Initialize index components
-        self.faiss_index = None
-        self.vector_index = None
-        self.issue_docs = {}  # id -> IssueDoc
-        self.diff_docs = {} # pr_number -> DiffDoc
-        self.open_pr_docs = {} # pr_number -> OpenPRDoc
-        self.bm25_retriever = None
-        self.bm25_score_cache = {}  # Cache for BM25 score normalization
-        
-    async def crawl_and_index_issues(
-        self, 
-        max_issues: Optional[int] = None,  # Changed from 1000 to None
-        force_rebuild_dependencies: bool = False,
-        max_issues_for_patch_linkage: Optional[int] = None
-    ) -> None:
-        """Crawl issues from GitHub and build a new FAISS/BM25 index"""
-        # Use settings.MAX_ISSUES_TO_PROCESS if max_issues is None
+
+        # State
+        self.faiss_index = self.vector_index = self.bm25_retriever = None
+        self.issue_docs, self.diff_docs, self.open_pr_docs = {}, {}, {}
+        self.bm25_score_cache = {}
+
+    async def crawl_and_index_issues(self, max_issues: Optional[int] = None,
+                                     force_rebuild_dependencies: bool = False,
+                                     max_issues_for_patch_linkage: Optional[int] = None) -> None:
+        """Crawl issues from GitHub and build FAISS/BM25 index"""
         max_issues = max_issues or settings.MAX_ISSUES_TO_PROCESS
-        
-        logger.info(
-            f"Starting issue crawl for {self.repo_key} (max_issues={max_issues}, "
-            f"force_rebuild_dependencies={force_rebuild_dependencies}, "
-            f"max_issues_for_patch_linkage={max_issues_for_patch_linkage})"
-        )
-        
-        # Ensure we have patch docs before indexing
+        logger.info(f"Starting crawl for {self.repo_key} (max={max_issues})")
+
+        # Ensure patch docs exist
         diff_file = self.patch_builder.index_dir / "diff_docs.jsonl"
-        
-        # Determine max_issues for patch_builder
-        actual_max_issues_for_patches = max_issues_for_patch_linkage if max_issues_for_patch_linkage is not None else max_issues
-
+        actual_max = max_issues_for_patch_linkage or max_issues
         if force_rebuild_dependencies or not diff_file.exists() or diff_file.stat().st_size == 0:
-            if force_rebuild_dependencies:
-                logger.info(f"Forcing rebuild of patch linkage dependencies with max_issues={actual_max_issues_for_patches}...")
-            else:
-                logger.info(
-                    "No cached patch docs found or they are empty, "
-                    f"building patch linkage first with max_issues={actual_max_issues_for_patches}..."
-                )
-            await self.patch_builder.build_patch_linkage(max_issues=actual_max_issues_for_patches)
-        else:
-            logger.info(f"Using existing patch docs from {diff_file}")
+            logger.info(f"Building patch linkage (max={actual_max})...")
+            await self.patch_builder.build_patch_linkage(max_issues=actual_max)
 
-        # 1. Fetch all closed issues with more conservative pagination
+        # Fetch issues
         repo_url = f"https://github.com/{self.repo_owner}/{self.repo_name}"
-        
-        # Calculate reasonable max_pages based on max_issues
-        per_page = 30  # GitHub's default
-        max_pages = min(100, (max_issues + per_page - 1) // per_page)  # Round up division, but cap at 100
-        logger.info(f"Fetching issues with max_pages={max_pages}, per_page={per_page} to get up to {max_issues} issues")
-        
+        per_page, max_pages = 30, min(100, (max_issues + 29) // 30)
+
         try:
-            issues = await self.github_client.list_issues(
-                repo_url, 
-                state="all", 
-                per_page=per_page,
-                max_pages=max_pages
-            )
+            issues = await self.github_client.list_issues(repo_url, state="all", per_page=per_page, max_pages=max_pages)
         except Exception as e:
-            logger.error(f"Failed to fetch issues from GitHub API: {e}")
-            # Check if we have any cached issues to work with
+            logger.error(f"GitHub API failed: {e}")
             if self.issues_file.exists():
-                logger.warning(f"GitHub API failed, trying to load existing cached issues from {self.issues_file}")
-                try:
-                    await self._load_issues()
-                    if self.issue_docs:
-                        logger.info(f"Loaded {len(self.issue_docs)} cached issues, proceeding with existing data")
-                        # Skip to building index with cached data
-                        return
-                except Exception as load_error:
-                    logger.error(f"Failed to load cached issues: {load_error}")
-            
-            # If we can't get issues from API or cache, raise the original error
-            raise e
-        
-        # Limit issue count (pull requests are already filtered out by github_client.list_issues)
-        issues = issues[:max_issues]
-        logger.info(f"Fetched {len(issues)} issues to process")
-        
-        # If we didn't get any issues, but we have cached data, use that
-        if not issues and self.issues_file.exists():
-            logger.warning("No issues fetched from API, but cached issues exist. Loading cached data.")
-            try:
                 await self._load_issues()
                 if self.issue_docs:
                     logger.info(f"Using {len(self.issue_docs)} cached issues")
                     return
-            except Exception as e:
-                logger.error(f"Failed to load cached issues: {e}")
-        
+            raise
+
+        issues = issues[:max_issues]
+        if not issues and self.issues_file.exists():
+            await self._load_issues()
+            if self.issue_docs: return
         if not issues:
-            logger.warning("No issues available for indexing (neither from API nor cache)")
-            return
-        
-        # 2. Convert issues to llama_index Documents
-        issue_documents = []
-        logger.info(f"Converting {len(issues)} issues to LlamaIndex documents...")
-        for issue in tqdm(issues, desc="Processing issues", unit="issue"):
-            issue_doc = self._create_issue_doc(issue)
-            # Use issue.number as the key for issue_docs, as IssueDoc.id is derived from issue.number
-            self.issue_docs[issue.number] = issue_doc 
-            
-            # Create a better formatted document for indexing with enhanced searchability
-            # Combine title, body, and key metadata for better semantic matching
-            searchable_content = self._create_searchable_content(issue)
-            
-            # Keep metadata minimal to avoid chunk size issues
-            # Move detailed information to the main text content
-            doc = Document(
-                text=searchable_content,
-                metadata={
-                    "issue_id": issue.number,
-                    "state": issue.state,
-                    "type": "issue",
-                },
-            )
-            issue_documents.append(doc)
+            logger.warning("No issues available"); return
 
-        # 3. Load diff documents and add them to the index
-        patch_documents = []
-        try:
-            loaded_diffs = self.patch_builder.load_diff_docs()
-            self.diff_docs = {diff.pr_number: diff for diff in loaded_diffs}
-            logger.info(f"Loaded {len(loaded_diffs)} diff documents to add to the index.")
-            for diff in loaded_diffs:
-                # Create detailed text content that includes all information
-                # Move file paths and detailed info to text content rather than metadata
-                detailed_content = self._create_patch_content(diff)
-                
-                doc = Document(
-                    text=detailed_content,
-                    metadata={
-                        "issue_id": diff.issue_id,
-                        "pr_number": diff.pr_number,
-                        "type": "patch",
-                    },
-                )
-                patch_documents.append(doc)
-        except FileNotFoundError:
-            logger.warning("diff_docs.jsonl not found. Index will be built without patches.")
-        except Exception as e:
-            logger.error(f"Error loading diff docs: {e}")
+        # Build documents
+        issue_docs = []
+        for i in tqdm(issues, desc="Issues"):
+            self.issue_docs[i.number] = self._create_issue_doc(i)
+            issue_docs.append(self._make_doc(i, "issue", i.number, self._searchable_content(i)))
 
-        # 3.5. Load open PR documents and add them to the index
-        open_pr_documents = []
-        try:
-            loaded_open_prs = self.patch_builder.load_open_prs()
-            self.open_pr_docs = {pr.pr_number: pr for pr in loaded_open_prs}
-            logger.info(f"Loaded {len(loaded_open_prs)} open PR documents to add to the index.")
-            for open_pr in loaded_open_prs:
-                # Create searchable content for open PRs
-                detailed_content = self._create_open_pr_content(open_pr)
-                
-                doc = Document(
-                    text=detailed_content,
-                    metadata={
-                        "pr_number": open_pr.pr_number,
-                        "type": "open_pr",
-                        "review_decision": open_pr.review_decision,
-                        "draft": open_pr.draft,
-                        "mergeable": open_pr.mergeable,
-                    },
-                )
-                open_pr_documents.append(doc)
-        except FileNotFoundError:
-            logger.warning("open_prs.jsonl not found. Index will be built without open PRs.")
-        except Exception as e:
-            logger.error(f"Error loading open PR docs: {e}")
+        # Load patches and open PRs
+        patch_docs, open_pr_docs = [], []
+        diffs = self._safe_load(self.patch_builder.load_diff_docs)
+        if diffs:
+            self.diff_docs = {d.pr_number: d for d in diffs}
+            patch_docs = [self._make_doc(d, "patch", d.pr_number, self._patch_content(d), issue_id=d.issue_id) for d in diffs]
 
-        all_documents = issue_documents + patch_documents + open_pr_documents
-        
-        # 4. Build FAISS index for vector search with larger chunk size
-        logger.info(f"Building FAISS index with {len(all_documents)} total documents...")
-        
-        # Use a node parser with larger chunk size to accommodate rich content
-        node_parser = SimpleNodeParser.from_defaults(
-            chunk_size=4096,  # Increased from default 1024
-            chunk_overlap=200  # Add overlap to preserve context
-        )
-        
-        # Get embedding dimensions for the small model (1536 for text-embedding-3-small)
-        embedding_dimensions = self.embed_model.dimensions
-        if embedding_dimensions is None:
-            # text-embedding-3-small has 1536 dimensions
-            vec_size = 1536
-        else:
-            vec_size = int(embedding_dimensions)
-        
-        logger.info(f"Using embedding dimension: {vec_size}")
+        prs = self._safe_load(self.patch_builder.load_open_prs)
+        if prs:
+            self.open_pr_docs = {p.pr_number: p for p in prs}
+            open_pr_docs = [self._make_doc(p, "open_pr", p.pr_number, self._open_pr_content(p),
+                           review_decision=p.review_decision, draft=p.draft, mergeable=p.mergeable) for p in prs]
+
+        all_docs = issue_docs + patch_docs + open_pr_docs
+        logger.info(f"Building FAISS index with {len(all_docs)} documents...")
+
+        # Build index
+        parser = SimpleNodeParser.from_defaults(chunk_size=4096, chunk_overlap=200)
+        vec_size = self.embed_model.dimensions or 1536
         vector_store = FaissVectorStore(faiss_index=faiss.IndexFlatL2(vec_size))
-        storage_context = StorageContext.from_defaults(vector_store=vector_store)
-        
-        # Create nodes with the larger chunk size
-        nodes = node_parser.get_nodes_from_documents(all_documents)
-        
-        self.vector_index = VectorStoreIndex(
-            nodes=nodes,
-            storage_context=storage_context,
-            embed_model=self.embed_model
-        )
-        
-        # 5. Save index components
-        self._save_faiss_index(nodes)
-        
-        # 6. Build and cache BM25 retriever
-        logger.info("Building BM25 retriever...")
-        self.bm25_retriever = BM25Retriever.from_defaults(
-            nodes=nodes,
-            similarity_top_k=50,
-            stemmer=Stemmer.Stemmer("english"),
-            language="english"
-        )
-        await self._compute_bm25_statistics(nodes)
-        
-        # 7. Save issues and metadata
-        await self._save_issues()
-        await self._save_metadata(total_issues=len(issues), total_docs=len(all_documents))
-        logger.info("Successfully built and saved new issue, patch, and open PR index.")
-    
-    async def _compute_bm25_statistics(self, nodes: List) -> None:
-        """Pre-compute BM25 score statistics for better normalization"""
-        if not self.bm25_retriever:
-            return
-        
-        try:
-            # Sample diverse queries to establish score ranges
-            sample_queries = [
-                "bug fix error",
-                "performance optimization",
-                "feature request enhancement",
-                "memory leak issue",
-                "user interface problem",
-                "documentation update",
-                "test case failure",
-                "security vulnerability"
-            ]
-            
-            all_scores = []
-            for query in sample_queries:
-                try:
-                    results = self.bm25_retriever.retrieve(query)
-                    scores = [getattr(node, 'score', 0.0) for node in results if hasattr(node, 'score')]
-                    all_scores.extend(scores)
-                except Exception:
-                    continue
-            
-            if all_scores:
-                self.bm25_score_cache = {
-                    "max_score": max(all_scores),
-                    "min_score": min(all_scores),
-                    "avg_score": sum(all_scores) / len(all_scores),
-                    "score_range": max(all_scores) - min(all_scores)
-                }
-                logger.info(f"BM25 score stats: max={self.bm25_score_cache['max_score']:.2f}, "
-                           f"avg={self.bm25_score_cache['avg_score']:.2f}, "
-                           f"range={self.bm25_score_cache['score_range']:.2f}")
-            else:
-                # Fallback values
-                self.bm25_score_cache = {
-                    "max_score": 10.0,
-                    "min_score": 0.0,
-                    "avg_score": 5.0,
-                    "score_range": 10.0
-                }
-                
-        except Exception as e:
-            logger.warning(f"Failed to compute BM25 statistics: {e}")
-            # Set safe defaults
-            self.bm25_score_cache = {
-                "max_score": 10.0,
-                "min_score": 0.0,
-                "avg_score": 5.0,
-                "score_range": 10.0
-            }
-    
-    def _normalize_bm25_score(self, raw_score: float) -> float:
-        """Normalize BM25 score to 0-1 range using pre-computed statistics"""
-        if not self.bm25_score_cache:
-            # Fallback to simple normalization if no stats available
-            return min(0.8, max(0.1, raw_score / 15.0))  # More conservative scaling
-        
-        try:
-            max_score = self.bm25_score_cache["max_score"]
-            min_score = self.bm25_score_cache["min_score"]
-            score_range = self.bm25_score_cache["score_range"]
-            
-            if score_range == 0:
-                return 0.4  # Lower default similarity if no range
-            
-            # Normalize to 0-1, then map to a more conservative 0.1-0.8 range
-            normalized = (raw_score - min_score) / score_range
-            return 0.1 + (normalized * 0.7)  # Maps [0,1] to [0.1, 0.8] instead of [0.6, 0.95]
-            
-        except Exception:
-            # Fallback to more conservative method
-            return min(0.8, max(0.1, raw_score / 15.0))
-    
-    async def load_existing_index(self) -> bool:
-        """Load existing issue index if available with robust error handling"""
-        if self.faiss_index_file.exists() and self.faiss_nodes_file.exists():
-            logger.info(f"Loading existing binary FAISS index from {self.index_dir}")
-            try:
-                # Load FAISS index from disk
-                self.faiss_index = faiss.read_index(str(self.faiss_index_file))
-                
-                # Load nodes (documents)
-                with open(self.faiss_nodes_file, 'r', encoding='utf-8') as f:
-                    nodes_dict = json.load(f)
-                    nodes = [Document(**doc) for doc in nodes_dict]
-                
-                # Reconstruct VectorStoreIndex
-                if self.faiss_index.ntotal == len(nodes):
-                    vector_store = FaissVectorStore(faiss_index=self.faiss_index)
-                    self.vector_index = VectorStoreIndex(nodes=nodes, vector_store=vector_store, embed_model=self.embed_model)
-                    
-                    # Load issues and metadata
-                    await self._load_issues()
-                    await self._load_metadata()
+        nodes = parser.get_nodes_from_documents(all_docs)
+        self.vector_index = VectorStoreIndex(nodes=nodes, storage_context=StorageContext.from_defaults(vector_store=vector_store), embed_model=self.embed_model)
 
-                    # Load diff docs
-                    try:
-                        loaded_diffs = self.patch_builder.load_diff_docs()
-                        self.diff_docs = {diff.pr_number: diff for diff in loaded_diffs}
-                        logger.info(f"Loaded {len(self.diff_docs)} diff documents from cache.")
-                    except FileNotFoundError:
-                        logger.info("No cached diff documents found to load.")
-                    except Exception as e:
-                        logger.warning(f"Could not load diff documents: {e}")
-                    
-                    # Load open PR docs
-                    try:
-                        loaded_open_prs = self.patch_builder.load_open_prs()
-                        self.open_pr_docs = {pr.pr_number: pr for pr in loaded_open_prs}
-                        logger.info(f"Loaded {len(self.open_pr_docs)} open PR documents from cache.")
-                    except FileNotFoundError:
-                        logger.info("No cached open PR documents found to load.")
-                    except Exception as e:
-                        logger.warning(f"Could not load open PR documents: {e}")
-                    
-                    # Rebuild BM25 retriever
-                    try:
-                        self.bm25_retriever = BM25Retriever.from_defaults(
-                            nodes=nodes,
-                            similarity_top_k=50,
-                            stemmer=Stemmer.Stemmer("english"),
-                            language="english"
-                        )
-                        # Recompute BM25 statistics
-                        await self._compute_bm25_statistics(nodes)
-                    except Exception as e:
-                        logger.warning(f"Failed to rebuild BM25 retriever: {e}")
-                        self.bm25_retriever = None
-                    
-                    # Clean up legacy JSON store files from pre-1.1 versions to prevent UTF-8 decode errors
-                    for stale in ["default__vector_store.json", "docstore.json",
-                                  "index_store.json", "graph_store.json"]:
-                        p = self.index_dir / stale
-                        if p.exists():
-                            p.unlink()
-                            logger.info(f"Deleted legacy store file {stale}")
-                    
-                    logger.info(f"Successfully loaded issue index with {len(nodes)} nodes")
-                    return True
-                    
-            except Exception as e:
-                logger.warning(f"Failed to load binary FAISS index: {e}")
-                # Delete corrupted index files and fall back to rebuild
-                self._cleanup_corrupted_index()
-                return False
-        
-        # Fallback to old storage context method (if binary loading failed)
+        # Build BM25
+        self.bm25_retriever = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=50, stemmer=Stemmer.Stemmer("english"), language="english")
+        await self._compute_bm25_stats(nodes)
+
+        # Save everything
+        self._save_faiss_index(nodes)
+        await self._save_issues()
+        await self._save_metadata(len(issues), len(all_docs))
+        logger.info("Index built successfully")
+
+    def _make_doc(self, item, dtype: str, num: int, text: str, **extra) -> Document:
+        meta = {"type": dtype, ("issue_id" if dtype == "issue" else "pr_number"): num, **extra}
+        return Document(text=text, metadata=meta)
+
+    def _safe_load(self, loader):
+        try: return loader()
+        except Exception: return []
+
+    async def _compute_bm25_stats(self, nodes: List) -> None:
+        if not self.bm25_retriever: return
+        queries = ["bug fix", "performance", "feature request", "memory leak", "documentation", "test failure"]
+        scores = []
+        for q in queries:
+            for n in self.bm25_retriever.retrieve(q)[:10]:
+                if (s := getattr(n, 'score', None)):
+                    scores.append(s)
+        self.bm25_score_cache = {"max": max(scores, default=10), "min": min(scores, default=0),
+                                  "avg": sum(scores)/len(scores) if scores else 5, "range": max(scores, default=10) - min(scores, default=0)}
+
+    def _normalize_bm25(self, raw: float) -> float:
+        if not self.bm25_score_cache or self.bm25_score_cache.get("range", 0) == 0:
+            return min(0.8, max(0.1, raw / 15))
+        r = self.bm25_score_cache["range"]
+        return 0.1 + ((raw - self.bm25_score_cache["min"]) / r) * 0.7
+
+    async def load_existing_index(self) -> bool:
+        """Load existing index if available"""
+        if not (self.faiss_index_file.exists() and self.faiss_nodes_file.exists()):
+            return False
         try:
-            Settings.embed_model = self.embed_model
-            storage_context = StorageContext.from_defaults(persist_dir=str(self.index_dir))
-            self.vector_index = VectorStoreIndex.from_documents([], storage_context=storage_context)
-            
-            logger.info(f"Loaded existing issue index for {self.repo_key} with {len(self.issue_docs)} issues")
+            self.faiss_index = faiss.read_index(str(self.faiss_index_file))
+            with open(self.faiss_nodes_file, 'r') as f:
+                nodes = [Document(**d) for d in json.load(f)]
+            if self.faiss_index.ntotal != len(nodes): raise ValueError("Node count mismatch")
+
+            self.vector_index = VectorStoreIndex(nodes=nodes, vector_store=FaissVectorStore(faiss_index=self.faiss_index), embed_model=self.embed_model)
+            await self._load_issues()
+            self.diff_docs = {d.pr_number: d for d in self._safe_load(self.patch_builder.load_diff_docs)}
+            self.open_pr_docs = {p.pr_number: p for p in self._safe_load(self.patch_builder.load_open_prs)}
+            self.bm25_retriever = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=50, stemmer=Stemmer.Stemmer("english"), language="english")
+            await self._compute_bm25_stats(nodes)
+
+            # Cleanup legacy files
+            for f in ["default__vector_store.json", "docstore.json", "index_store.json", "graph_store.json"]:
+                p = self.index_dir / f
+                if p.exists(): p.unlink()
+            logger.info(f"Loaded index with {len(nodes)} nodes")
             return True
         except Exception as e:
-            logger.warning(f"Failed to load storage context: {e}")
-            # Delete corrupted files and force rebuild
-            self._cleanup_corrupted_index()
+            logger.warning(f"Failed to load index: {e}")
+            self._cleanup_index()
             return False
-                
-    def _cleanup_corrupted_index(self):
-        """Clean up corrupted index files to force a fresh rebuild"""
-        try:
-            if self.faiss_index_file.exists():
-                self.faiss_index_file.unlink()
-                logger.info("Removed corrupted FAISS index file")
-            
-            if self.faiss_nodes_file.exists():
-                self.faiss_nodes_file.unlink()
-                logger.info("Removed corrupted nodes file")
-            
-            # Clean up old storage context files
-            storage_files = [
-                "default__vector_store.json",
-                "docstore.json", 
-                "index_store.json",
-                "graph_store.json"
-            ]
-            
-            for filename in storage_files:
-                file_path = self.index_dir / filename
-                if file_path.exists():
-                    file_path.unlink()
-                    logger.info(f"Removed corrupted {filename}")
-                    
-        except Exception as e:
-            logger.warning(f"Error during index cleanup: {e}")
+
+    def _cleanup_index(self):
+        for f in [self.faiss_index_file, self.faiss_nodes_file]:
+            if f.exists(): f.unlink()
+        for f in ["default__vector_store.json", "docstore.json", "index_store.json", "graph_store.json"]:
+            p = self.index_dir / f
+            if p.exists(): p.unlink()
 
     def _save_faiss_index(self, nodes, append: bool = False):
-        """Save the FAISS index and node data to disk."""
-        # Access the internal _faiss_index attribute of FaissVectorStore
         faiss.write_index(self.vector_index.vector_store._faiss_index, str(self.faiss_index_file))
-        
-        # Handle node data - append or overwrite
+        existing = []
         if append and self.faiss_nodes_file.exists():
-            # Load existing nodes and append new ones
-            try:
-                with open(self.faiss_nodes_file, "r") as f:
-                    existing_nodes = json.load(f)
-                
-                # Append new nodes
-                all_nodes = existing_nodes + [n.dict() for n in nodes]
-                
-                with open(self.faiss_nodes_file, "w") as f:
-                    json.dump(all_nodes, f)
-                    
-                logger.info(f"Appended {len(nodes)} nodes to existing {len(existing_nodes)} nodes")
-            except Exception as e:
-                logger.warning(f"Failed to append nodes, overwriting: {e}")
-                with open(self.faiss_nodes_file, "w") as f:
-                    json.dump([n.dict() for n in nodes], f)
-        else:
-            # Overwrite with new nodes
-            with open(self.faiss_nodes_file, "w") as f:
-                json.dump([n.dict() for n in nodes], f)
+            with open(self.faiss_nodes_file) as f:
+                existing = json.load(f)
+        with open(self.faiss_nodes_file, "w") as f:
+            json.dump(existing + [n.dict() for n in nodes], f)
 
-    async def _save_metadata(self, total_issues: int, total_docs: int) -> None:
-        """Save metadata about the index"""
-        metadata = {
-            "repo": self.repo_key,
-            "total_issues": total_issues,
-            "total_documents": total_docs,
-            "index_contains_patches": total_docs > total_issues,
-            "last_updated": datetime.now().isoformat(),
-            "index_version": "1.5"
-        }
-        with open(self.metadata_file, 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, indent=2, ensure_ascii=False)
+    async def _save_metadata(self, total_issues: int, total_docs: int):
+        with open(self.metadata_file, 'w') as f:
+            json.dump({"repo": self.repo_key, "total_issues": total_issues, "total_documents": total_docs,
+                       "last_updated": datetime.now().isoformat(), "index_version": "1.5"}, f, indent=2)
 
-    async def _save_issues(self) -> None:
-        """Save the issue documents to a JSONL file"""
-        with open(self.issues_file, 'w', encoding='utf-8') as f:
-            for issue_doc in self.issue_docs.values():
-                f.write(issue_doc.model_dump_json() + '\n')
+    async def _save_issues(self):
+        with open(self.issues_file, 'w') as f:
+            for doc in self.issue_docs.values(): f.write(doc.model_dump_json() + '\n')
 
-    async def _load_issues(self) -> None:
-        """Load issue documents from the JSONL file."""
-        if not self.issues_file.exists():
-            logger.warning("issues.jsonl not found. No issues loaded.")
-            return
+    async def _load_issues(self):
+        if not self.issues_file.exists(): return
         self.issue_docs = {}
-        with open(self.issues_file, 'r', encoding='utf-8') as f:
+        with open(self.issues_file) as f:
             for line in f:
                 try:
-                    # First try to parse as JSON to handle backward compatibility
-                    import json
                     data = json.loads(line.strip())
-                    
-                    # Add default values for new fields if they don't exist
-                    if 'closed_by_commit' not in data:
-                        data['closed_by_commit'] = None
-                    if 'closed_by_pr' not in data:
-                        data['closed_by_pr'] = None
-                    if 'closed_by_author' not in data:
-                        data['closed_by_author'] = None
-                    if 'closed_event_data' not in data:
-                        data['closed_event_data'] = None
-                    
-                    # Now validate with the full model
+                    for k in ['closed_by_commit', 'closed_by_pr', 'closed_by_author', 'closed_event_data']:
+                        data.setdefault(k, None)
                     issue = IssueDoc.model_validate(data)
                     self.issue_docs[issue.id] = issue
                 except Exception as e:
-                    logger.warning(f"Skipping malformed line in issues.jsonl: {e}")
+                    logger.warning(f"Malformed issue line: {e}")
 
-    async def _load_metadata(self) -> None:
-        """Load metadata from the JSON file."""
-        if not self.metadata_file.exists():
-            logger.warning("metadata.json not found. No metadata loaded.")
-            return
-        try:
-            with open(self.metadata_file, 'r', encoding='utf-8') as f:
-                metadata = json.load(f)
-                # You can store parts of metadata in the instance if needed
-                logger.info(f"Loaded index metadata: {metadata}")
-        except Exception as e:
-            logger.error(f"Failed to load metadata.json: {e}")
+    def _create_issue_doc(self, issue) -> IssueDoc:
+        return IssueDoc(id=issue.number, state=issue.state, title=issue.title, body=issue.body or "",
+                        comments=[c.body for c in issue.comments], labels=issue.labels,
+                        created_at=issue.created_at.isoformat(),
+                        closed_at=issue.closed_at.isoformat() if issue.closed_at else None,
+                        patch_url=self.patch_builder.get_patch_url_for_issue(issue.number), repo=self.repo_key)
 
-    def _create_issue_doc(self, issue: Any) -> IssueDoc:
-        """Create an IssueDoc from a GitHub issue object"""
-        patch_url = self.patch_builder.get_patch_url_for_issue(issue.number) # Use issue.number here
-        
-        return IssueDoc(
-            id=issue.number, # And ensure this uses issue.number as well
-            state=issue.state,
-            title=issue.title,
-            body=issue.body or "",
-            comments=[c.body for c in issue.comments],
-            labels=issue.labels,
-            created_at=issue.created_at.isoformat(),
-            closed_at=issue.closed_at.isoformat() if issue.closed_at else None,
-            patch_url=patch_url,
-            repo=self.repo_key
-        )
-
-    def _create_searchable_content(self, issue: Any) -> str:
-        """Create enhanced searchable content from issue data"""
-        parts = []
-        
-        # Main title and description
-        parts.append(f"Title: {issue.title}")
-        
-        # Clean and format body
-        body = issue.body or ""
-        if body:
-            # Clean markdown formatting for better text search
-            import re
-            body = re.sub(r'```[\s\S]*?```', '[CODE_BLOCK]', body)  # Replace code blocks
-            body = re.sub(r'`([^`]+)`', r'\1', body)  # Remove inline code formatting
-            body = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', body)  # Extract link text
-            body = re.sub(r'#+\s*', '', body)  # Remove markdown headers
-            body = re.sub(r'\s+', ' ', body).strip()  # Normalize whitespace
-            
-        parts.append(f"Description: {body}")
-        
-        # Add important metadata
-        parts.append(f"State: {issue.state}")
-        
+    def _searchable_content(self, issue) -> str:
+        body = re.sub(r'```[\s\S]*?```', '[CODE]', issue.body or "")
+        body = re.sub(r'`([^`]+)`', r'\1', body)
+        body = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', body)
+        body = re.sub(r'#+\s*', '', body)
+        body = re.sub(r'\s+', ' ', body).strip()
+        parts = [f"Title: {issue.title}", f"Description: {body}", f"State: {issue.state}"]
         if issue.labels:
-            # Format labels for better matching
-            labels_text = " ".join(issue.labels)
-            parts.append(f"Labels: {labels_text}")
-            
-            # Also add labels as individual searchable terms
-            category_labels = [f'category-{label}' for label in issue.labels]
-            parts.append(f"Categories: {' '.join(category_labels)}")
-        
-        # Add issue type context
-        if any(label in ['bug', 'error', 'issue'] for label in issue.labels):
-            parts.append("Type: Bug report or error")
-        elif any(label in ['enhancement', 'feature'] for label in issue.labels):
-            parts.append("Type: Feature request or enhancement")
-        elif any(label in ['question', 'help'] for label in issue.labels):
-            parts.append("Type: Question or help request")
-        
-        # Combine with good separation for embedding
+            parts += [f"Labels: {' '.join(issue.labels)}", f"Categories: {' '.join(f'category-{l}' for l in issue.labels)}"]
+            if any(l in ['bug', 'error', 'issue'] for l in issue.labels): parts.append("Type: Bug report")
+            elif any(l in ['enhancement', 'feature'] for l in issue.labels): parts.append("Type: Feature request")
         return "\n\n".join(parts)
 
-    def _create_patch_content(self, diff: Any) -> str:
-        """Create detailed text content for a patch"""
-        parts = []
-        
-        # Add summary and details
-        parts.append(f"Summary: {diff.diff_summary}")
-        parts.append(f"Files changed: {', '.join(diff.files_changed)}")
-        
-        # Add detailed information
-        parts.append(f"Issue ID: {diff.issue_id}")
-        parts.append(f"PR Number: {diff.pr_number}")
-        parts.append(f"Merged at: {diff.merged_at}")
-        
-        # Combine with good separation for embedding
-        return "\n\n".join(parts)
+    def _patch_content(self, diff) -> str:
+        return f"Summary: {diff.diff_summary}\nFiles: {', '.join(diff.files_changed)}\nIssue: {diff.issue_id}\nPR: {diff.pr_number}\nMerged: {diff.merged_at}"
 
-    def _create_open_pr_content(self, open_pr) -> str:
-        """Create detailed text content for an open PR"""
-        parts = []
-        
-        # Main title and description
-        parts.append(f"Open Pull Request #{open_pr.pr_number}: {open_pr.title}")
-        
-        # Clean and format body
-        body = open_pr.body or ""
-        if body:
-            # Clean markdown formatting for better text search
-            import re
-            body = re.sub(r'```[\s\S]*?```', '[CODE_BLOCK]', body)  # Replace code blocks
-            body = re.sub(r'`([^`]+)`', r'\1', body)  # Remove inline code formatting
-            body = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', body)  # Extract link text
-            body = re.sub(r'#+\s*', '', body)  # Remove markdown headers
-            body = re.sub(r'\s+', ' ', body).strip()  # Normalize whitespace
-            
-        parts.append(f"Description: {body}")
-        
-        # Add PR-specific metadata
-        parts.append(f"Author: {open_pr.author}")
-        parts.append(f"State: Open PR")
-        
-        if open_pr.draft:
-            parts.append("Status: Draft")
-        
-        if open_pr.review_decision:
-            parts.append(f"Review Decision: {open_pr.review_decision}")
-        
-        if open_pr.reviews_summary:
-            parts.append(f"Reviews: {open_pr.reviews_summary}")
-        
-        if open_pr.status_summary:
-            parts.append(f"CI Status: {open_pr.status_summary}")
-        
-        if open_pr.mergeable:
-            parts.append(f"Mergeable: {open_pr.mergeable}")
-        
-        # Add files changed information
-        if open_pr.files_changed:
-            parts.append(f"Files changed: {', '.join(open_pr.files_changed[:10])}")
-            if len(open_pr.files_changed) > 10:
-                parts.append(f"... and {len(open_pr.files_changed) - 10} more files")
-        
-        # Add temporal context
-        parts.append(f"Created: {open_pr.created_at}")
-        parts.append(f"Updated: {open_pr.updated_at}")
-        
-        # Combine with good separation for embedding
+    def _open_pr_content(self, pr) -> str:
+        body = re.sub(r'```[\s\S]*?```', '[CODE]', pr.body or "")
+        body = re.sub(r'`([^`]+)`', r'\1', body)
+        body = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', body)
+        body = re.sub(r'#+\s*|\s+', ' ', body).strip()
+        parts = [f"PR #{pr.pr_number}: {pr.title}", f"Description: {body}", f"Author: {pr.author}", "State: Open PR"]
+        if pr.draft: parts.append("Status: Draft")
+        if pr.review_decision: parts.append(f"Review: {pr.review_decision}")
+        if pr.files_changed: parts.append(f"Files: {', '.join(pr.files_changed[:10])}")
         return "\n\n".join(parts)
 
 
 class IssueReranker:
-    """Reranks issue candidates using a cheaper LLM"""
-    
-    def __init__(self, llm_client: LLMClient, indexer: 'IssueIndexer'):
-        self.llm_client = llm_client
-        self.indexer = indexer
-        self.cache = {}  # Simple in-memory cache for reranking results
-    
-    def _get_cache_key(self, query: str, candidates: List[Dict]) -> str:
-        """Generate a cache key for the reranking results"""
-        # Create a deterministic key from query and candidate IDs
-        candidate_ids = [str(c.get("issue_id", c.get("pr_number", ""))) for c in candidates]
-        return f"{query}::{','.join(candidate_ids)}"
-    
-    async def rerank(
-        self,
-        query: str,
-        candidates: List[Dict],
-        max_candidates: int = 5
-    ) -> List[Dict]:
-        """Rerank candidates using LLM"""
-        if not candidates:
-            return []
-            
-        # Check cache first
-        cache_key = self._get_cache_key(query, candidates)
-        if cache_key in self.cache:
-            logger.info("Using cached reranking results")
-            return self.cache[cache_key]
-        
-        # Prepare candidate summaries
-        summaries = []
-        for candidate in candidates:
-            if "issue_id" in candidate:
-                issue_doc = self.indexer.issue_docs[candidate["issue_id"]]
-                summary = f"#{issue_doc.id}: {issue_doc.title}\n{issue_doc.body[:200]}..."
-            else:
-                diff_doc = self.indexer.diff_docs[candidate["pr_number"]]
-                summary = f"PR #{diff_doc.pr_number} for Issue #{diff_doc.issue_id}: {diff_doc.diff_summary[:200]}..."
-            summaries.append(summary)
-        
-        # Extract issue numbers for reference
-        issue_numbers = []
-        for candidate in candidates:
-            if "issue_id" in candidate:
-                issue_numbers.append(candidate["issue_id"])
-            else:
-                issue_numbers.append(candidate["pr_number"])
-        
-        # Create improved prompt for reranking
-        prompt = f"""You are a helpful assistant that ranks GitHub issues by relevance to a user query.
+    """Reranks issue candidates using LLM"""
 
-User Query: {query}
+    def __init__(self, llm_client: LLMClient, indexer: IssueIndexer):
+        self.llm_client, self.indexer, self.cache = llm_client, indexer, {}
 
-Available Issues (rank these by relevance):
-{chr(10).join(f"{i+1}. Issue #{issue_numbers[i]}: {s}" for i, s in enumerate(summaries))}
+    async def rerank(self, query: str, candidates: List[Dict], max_candidates: int = 5) -> List[Dict]:
+        if not candidates: return []
 
-Instructions:
-- Rank ALL {len(issue_numbers)} issues by relevance to the user query
-- Return ONLY a valid JSON object with the "ranked_ids" field
-- Include ALL issue numbers in your ranking
-- Most relevant first, least relevant last
+        cache_key = f"{query}::{','.join(str(c.get('issue_id', c.get('pr_number', ''))) for c in candidates)}"
+        if cache_key in self.cache: return self.cache[cache_key]
 
-Example format:
-{{"ranked_ids": [1210, 468, 554, 960, 676]}}
+        # Build summaries
+        summaries, ids = [], []
+        for c in candidates:
+            iid = c.get("issue_id")
+            if iid and iid in self.indexer.issue_docs:
+                doc = self.indexer.issue_docs[iid]
+                summaries.append(f"#{doc.id}: {doc.title}\n{doc.body[:200]}...")
+                ids.append(iid)
+            elif (pr := c.get("pr_number")) and pr in self.indexer.diff_docs:
+                doc = self.indexer.diff_docs[pr]
+                summaries.append(f"PR #{doc.pr_number} for #{doc.issue_id}: {doc.diff_summary[:200]}...")
+                ids.append(pr)
 
-Your ranking (JSON only):"""
+        prompt = f"""Rank these issues by relevance to: {query}
+
+{chr(10).join(f"{i+1}. Issue #{ids[i]}: {s}" for i, s in enumerate(summaries))}
+
+Return JSON only: {{"ranked_ids": [...]}}"""
 
         try:
-            # Use a cheaper model for reranking
-            llm = self.llm_client._get_openrouter_llm(
-                model="google/gemini-2.5-flash-preview-05-20"
-            )
-            response = llm.complete(prompt)
-            
-            # Log the raw response for debugging
-            raw_response = response.text.strip()
-            logger.debug(f"Raw reranker response: {raw_response}")
-            
-            # Try to extract JSON from the response
-            import json
-            import re
-            
-            # First try direct parsing
-            try:
-                result = json.loads(raw_response)
-            except json.JSONDecodeError:
-                # Try to find JSON within the response
-                json_match = re.search(r'\{[^}]*"ranked_ids"[^}]*\}', raw_response)
-                if json_match:
-                    result = json.loads(json_match.group())
+            llm = self.llm_client._get_openrouter_llm("google/gemini-2.5-flash-preview-05-20")
+            raw = llm.complete(prompt).text.strip()
+
+            # Parse response
+            m = re.search(r'\{[^}]*"ranked_ids"[^}]*\}', raw)
+            if m:
+                result = json.loads(m.group())
+            else:
+                m = re.search(r'\[[0-9,\s]+\]', raw)
+                if m:
+                    result = {"ranked_ids": json.loads(m.group())}
                 else:
-                    # Try to extract just the array part
-                    array_match = re.search(r'\[[0-9,\s]+\]', raw_response)
-                    if array_match:
-                        ranked_ids = json.loads(array_match.group())
-                        result = {"ranked_ids": ranked_ids}
-                    else:
-                        raise ValueError("No valid JSON found in response")
-            
-            ranked_ids = result.get("ranked_ids", [])
-            
-            # Convert to strings for matching
-            ranked_ids = [str(id_val) for id_val in ranked_ids]
-            
-            # Reorder candidates based on LLM ranking
-            id_to_candidate = {
-                str(c.get("issue_id", c.get("pr_number", ""))): c 
-                for c in candidates
-            }
-            
-            reranked = []
-            for id_str in ranked_ids:
-                if id_str in id_to_candidate:
-                    reranked.append(id_to_candidate[id_str])
-            
-            # Add any missing candidates at the end
-            missing = [c for c in candidates if str(c.get("issue_id", c.get("pr_number", ""))) not in ranked_ids]
-            reranked.extend(missing)
-            
-            # Cache results
+                    result = json.loads(raw)
+
+            ranked = [str(i) for i in result.get("ranked_ids", [])]
+            id_map = {str(c.get("issue_id", c.get("pr_number", ""))): c for c in candidates}
+            reranked = [id_map[i] for i in ranked if i in id_map]
+            reranked += [c for c in candidates if str(c.get("issue_id", c.get("pr_number", ""))) not in ranked]
+
             self.cache[cache_key] = reranked[:max_candidates]
-            
-            logger.info(f"Successfully reranked {len(ranked_ids)} issues")
             return reranked[:max_candidates]
-            
         except Exception as e:
-            logger.error(f"Error in reranking: {e}")
-            # Fall back to original ranking
+            logger.error(f"Rerank error: {e}")
             return candidates[:max_candidates]
 
 
 class IssueRetriever:
     """Handles retrieval of similar issues"""
-    
+
     def __init__(self, indexer: IssueIndexer):
         self.indexer = indexer
         self.reranker = IssueReranker(indexer.llm_client, indexer)
-        
-    async def find_related_issues(
-        self, 
-        query: str, 
-        k: int = 5,
-        state_filter: str = "all",
-        similarity_threshold: float = 0.3,
-        label_filter: Optional[List[str]] = None,
-        include_patches: bool = False
-    ) -> Tuple[List[IssueSearchResult], List['PatchSearchResult']]:
-        """Find issues and patches similar to the query"""
-        
-        if not self.indexer.vector_index:
-            return [], []
-        
+
+    async def find_related_issues(self, query: str, k: int = 5, state_filter: str = "all",
+                                  similarity_threshold: float = 0.3, label_filter: Optional[List[str]] = None,
+                                  include_patches: bool = False) -> Tuple[List[IssueSearchResult], List[PatchSearchResult]]:
+        if not self.indexer.vector_index: return [], []
+
         try:
-            # Preprocess query for better matching
-            processed_query = self._preprocess_query(query)
-            
-            # Get more candidates initially for reranking
-            initial_k = 50  # Get more candidates for reranking
-            
-            # Get both dense and sparse retrieval results
-            dense_results = await self._dense_search(processed_query, initial_k)
-            sparse_results = await self._sparse_search(processed_query, initial_k)
-            
-            # Separate results by type (issue vs patch)
-            dense_issues = [r for r in dense_results if r.get("type") == "issue"]
-            dense_patches = [r for r in dense_results if r.get("type") == "patch"]
-            sparse_issues = [r for r in sparse_results if r.get("type") == "issue"]
-            sparse_patches = [r for r in sparse_results if r.get("type") == "patch"]
-            
-            # Process and combine issue results
-            combined_issues = self._combine_results(dense_issues, sparse_issues)
-            filtered_issues = self._apply_filters(
-                combined_issues, 
-                state_filter, 
-                similarity_threshold,
-                label_filter,
-                processed_query
-            )
-            
-            # Rerank issues
-            reranked_issues = await self.reranker.rerank(
-                query=processed_query,
-                candidates=filtered_issues,
-                max_candidates=k
-            )
-            
-            issue_search_results = self._format_issue_results(reranked_issues)
-            
-            # Process patch results if requested
-            patch_search_results = []
-            open_pr_search_results = []
+            processed = self._preprocess(query)
+            dense, sparse = await self._search(processed, 50)
+
+            # Separate by type
+            d_issues = [r for r in dense if r.get("type") == "issue"]
+            d_patches = [r for r in dense if r.get("type") in ("patch", "open_pr")]
+            s_issues = [r for r in sparse if r.get("type") == "issue"]
+            s_patches = [r for r in sparse if r.get("type") in ("patch", "open_pr")]
+
+            # Combine and filter issues
+            combined = self._combine(d_issues, s_issues)
+            filtered = self._filter(combined, state_filter, similarity_threshold, label_filter, processed)
+            reranked = await self.reranker.rerank(processed, filtered, k)
+            issue_results = []
+            for r in reranked:
+                if r["issue_id"] in self.indexer.issue_docs:
+                    issue_results.append(IssueSearchResult(
+                        issue=self.indexer.issue_docs[r["issue_id"]],
+                        similarity=r["similarity"],
+                        match_reasons=r.get("match_reasons", [])))
+
+            # Handle patches
+            patch_results = []
             if include_patches:
-                combined_patches = self._combine_results(dense_patches, sparse_patches)
-                filtered_patches = [p for p in combined_patches if p["similarity"] >= similarity_threshold * 0.8]
-                
-                # Separate merged patches from open PRs
-                merged_patches = [p for p in filtered_patches if p.get("type") == "patch"]
-                open_prs = [p for p in filtered_patches if p.get("type") == "open_pr"]
-                
-                # Rerank patches
-                if merged_patches:
-                    reranked_patches = await self.reranker.rerank(
-                        query=processed_query,
-                        candidates=merged_patches,
-                        max_candidates=k
-                    )
-                    patch_search_results = self._format_patch_results(reranked_patches, similarity_threshold)
-                
-                # Rerank open PRs
-                if open_prs:
-                    reranked_open_prs = await self.reranker.rerank(
-                        query=processed_query,
-                        candidates=open_prs,
-                        max_candidates=k
-                    )
-                    open_pr_search_results = self._format_open_pr_results(reranked_open_prs, similarity_threshold)
-            
-            return issue_search_results, patch_search_results + open_pr_search_results
-            
+                combined_p = self._combine(d_patches, s_patches)
+                filtered_p = [p for p in combined_p if p["similarity"] >= similarity_threshold * 0.8]
+                merged = [p for p in filtered_p if p.get("type") == "patch"]
+                if merged:
+                    reranked_p = await self.reranker.rerank(processed, merged, k)
+                    for r in reranked_p:
+                        pr_num = r.get("pr_number")
+                        if pr_num in self.indexer.diff_docs and r["similarity"] >= similarity_threshold * 0.8:
+                            patch_results.append(PatchSearchResult(
+                                patch=self.indexer.diff_docs[pr_num],
+                                similarity=r["similarity"],
+                                match_reasons=r.get("match_reasons", [])))
+
+            return issue_results, patch_results
         except Exception as e:
-            logger.error(f"Error in issue retrieval: {e}")
+            logger.error(f"Retrieval error: {e}")
             return [], []
-    
-    def _preprocess_query(self, query: str) -> str:
-        """Preprocess query to better match indexed content format"""
-        import re
-        
-        # Start with the original query
-        processed = query.strip()
-        
-        # If it looks like a GitHub issue title format (starts with [BUG], [FEATURE], etc.)
-        # enhance it for better matching
-        if re.match(r'^\[([^\]]+)\]', processed):
-            # Extract the tag and content
-            match = re.match(r'^\[([^\]]+)\]\s*(.+)', processed)
-            if match:
-                tag, content = match.groups()
-                tag_lower = tag.lower()
-                
-                # Add explicit type context for better matching
-                if any(t in tag_lower for t in ['bug', 'error', 'issue']):
-                    processed = f"Bug report: {content}. Type: Bug report or error"
-                elif any(t in tag_lower for t in ['feature', 'enhancement']):
-                    processed = f"Feature request: {content}. Type: Feature request or enhancement"
-                elif any(t in tag_lower for t in ['question', 'help']):
-                    processed = f"Question: {content}. Type: Question or help request"
-                else:
-                    processed = f"Title: {content}"
-        else:
-            # For queries without brackets, add title context
-            processed = f"Title: {processed}"
-        
-        # Clean up common formatting that might interfere with matching
-        processed = re.sub(r'`([^`]+)`', r'\1', processed)  # Remove backticks
-        processed = re.sub(r'"""([^"]+)"""', r'\1', processed)  # Remove triple quotes
-        processed = re.sub(r'"([^"]+)"', r'\1', processed)  # Remove quotes
-        
-        # Normalize whitespace
-        processed = re.sub(r'\s+', ' ', processed).strip()
-        
-        return processed
-    
-    async def _dense_search(self, query: str, k: int) -> List[Dict]:
-        """Semantic vector search"""
+
+    def _preprocess(self, query: str) -> str:
+        q = query.strip()
+        m = re.match(r'^\[([^\]]+)\]\s*(.+)', q)
+        if m:
+            tag, content = m.groups()
+            tl = tag.lower()
+            if any(t in tl for t in ['bug', 'error']): q = f"Bug report: {content}. Type: Bug report"
+            elif any(t in tl for t in ['feature', 'enhancement']): q = f"Feature request: {content}. Type: Feature request"
+            else: q = f"Title: {content}"
+        else: q = f"Title: {q}"
+        q = re.sub(r'[`"]+', '', q)
+        return re.sub(r'\s+', ' ', q).strip()
+
+    async def _search(self, query: str, k: int) -> Tuple[List[Dict], List[Dict]]:
+        """Run both dense and sparse search"""
+        dense, sparse = [], []
+
+        # Dense search
         retriever = self.indexer.vector_index.as_retriever(similarity_top_k=k)
-        nodes = await retriever.aretrieve(query)
-        
-        results = []
-        for node_with_score in nodes:
-            # Handle both NodeWithScore and direct node objects
-            if hasattr(node_with_score, 'node'):
-                # This is a NodeWithScore object
-                node = node_with_score.node
-                raw_score = getattr(node_with_score, 'score', None)
+        for node in await retriever.aretrieve(query):
+            if hasattr(node, 'node'):
+                n, score = node.node, node.score
             else:
-                # This is a direct node object
-                node = node_with_score
-                raw_score = getattr(node, 'score', None)
-            
-            metadata = node.metadata or {}
-            doc_type = metadata.get("type", "issue") # Default to issue if type not present
-            
-            # Extract similarity score properly
-            similarity_score = 0.0
-            if raw_score is not None:
-                # For FAISS, score could be distance (lower is better) or similarity (higher is better)
-                # Check if it's a reasonable similarity score (0-1 range) or distance (could be large)
-                if 0 <= raw_score <= 1:
-                    # Likely already a similarity score
-                    similarity_score = float(raw_score)
-                    logger.debug(f"Dense search: using raw similarity score={similarity_score}")
-                else:
-                    # Likely a distance score, convert to similarity
-                    similarity_score = max(0.0, min(1.0, 1.0 / (1.0 + abs(raw_score))))
-                    logger.debug(f"Dense search: converted distance {raw_score} to similarity={similarity_score}")
+                n, score = node, getattr(node, 'score', None)
+            meta = n.metadata or {}
+            dtype = meta.get("type", "issue")
+
+            if score and 0 <= score <= 1:
+                sim = float(score)
+            elif score:
+                sim = max(0, min(1, 1/(1+abs(score))))
             else:
-                similarity_score = 0.3  # Lower neutral score if not available
-                logger.debug(f"Dense search: no score available, using default={similarity_score}")
-            
-            result_item = {
-                "similarity": similarity_score,
-                "dense_similarity": similarity_score,  # Add this for debugging
-                "match_type": "semantic",
-                "match_reasons": ["semantic similarity"],
-                "type": doc_type
-            }
-            
-            if doc_type == "issue":
-                issue_id = to_int(metadata.get("issue_id"))
-                if issue_id and issue_id in self.indexer.issue_docs:
-                    result_item["issue_id"] = issue_id
-                    results.append(result_item)
-                    logger.debug(f"Dense search: added issue {issue_id} with similarity {similarity_score}")
-            elif doc_type == "patch":
-                pr_number = to_int(metadata.get("pr_number"))
-                if pr_number and pr_number in self.indexer.diff_docs:  # Check if patch exists
-                    result_item["pr_number"] = pr_number
-                    results.append(result_item)
-            elif doc_type == "open_pr":
-                pr_number = to_int(metadata.get("pr_number"))
-                if pr_number and pr_number in self.indexer.open_pr_docs:  # Check if open PR exists
-                    result_item["pr_number"] = pr_number
-                    results.append(result_item)
-        
-        return results
-    
-    async def _sparse_search(self, query: str, k: int) -> List[Dict]:
-        """Keyword-based BM25 search with improved score normalization"""
-        if not self.indexer.bm25_retriever:
-            return []
-            
-        nodes = self.indexer.bm25_retriever.retrieve(query)
-        
-        results = []
-        for node in nodes[:k]:
-            metadata = node.metadata or {}
-            doc_type = metadata.get("type", "issue")
-            
-            # Use improved normalization
-            bm25_score = getattr(node, 'score', 1.0)
-            normalized_score = self.indexer._normalize_bm25_score(bm25_score)
-            logger.debug(f"Sparse search: raw BM25 score={bm25_score}, normalized={normalized_score}")
-            
-            result_item = {
-                "similarity": normalized_score,
-                "match_type": "keyword",
-                "match_reasons": ["keyword match"],
-                "type": doc_type
-            }
-            
-            if doc_type == "issue":
-                issue_id = to_int(metadata.get("issue_id"))
-                if issue_id and issue_id in self.indexer.issue_docs:
-                    result_item["issue_id"] = issue_id
-                    results.append(result_item)
-                    logger.debug(f"Sparse search: added issue {issue_id} with similarity {normalized_score}")
-            elif doc_type == "patch":
-                pr_number = to_int(metadata.get("pr_number"))
-                if pr_number and pr_number in self.indexer.diff_docs:  # Check if patch exists
-                    result_item["pr_number"] = pr_number
-                    results.append(result_item)
-            elif doc_type == "open_pr":
-                pr_number = to_int(metadata.get("pr_number"))
-                if pr_number and pr_number in self.indexer.open_pr_docs:  # Check if open PR exists
-                    result_item["pr_number"] = pr_number
-                    results.append(result_item)
-        
-        return results
-    
-    def _combine_results(self, dense_results: List[Dict], sparse_results: List[Dict]) -> List[Dict]:
-        """Combine and deduplicate search results for issues, patches, and open PRs with improved scoring"""
-        seen_issues = set()
-        seen_patches = set()
-        seen_open_prs = set()
-        combined = []
-        
-        # Create a lookup for combining scores from both search methods
-        score_lookup = {}
-        
-        # Process dense results first (prioritize semantic similarity)
-        for result in dense_results:
-            doc_type = result.get("type", "issue")
-            
-            if doc_type == "issue":
-                item_id = to_int(result.get("issue_id"))
-                if not item_id or item_id not in self.indexer.issue_docs:
-                    continue
-                    
-                if item_id not in seen_issues:
-                    seen_issues.add(item_id)
-                    result["issue_id"] = item_id
-                    # Mark as dense result for potential boosting
-                    result["has_dense"] = True
-                    result["dense_similarity"] = result.get("similarity", 0.0)
-                    # Ensure sparse fields are initialized
-                    result["has_sparse"] = False
-                    result["sparse_similarity"] = 0.0
-                    score_lookup[("issue", item_id)] = result
-                    combined.append(result)
-                    
-            elif doc_type == "patch":
-                item_id = to_int(result.get("pr_number"))
-                if not item_id or item_id not in self.indexer.diff_docs:
-                    continue
-                    
-                if item_id not in seen_patches:
-                    seen_patches.add(item_id)
-                    result["pr_number"] = item_id
-                    result["has_dense"] = True
-                    result["dense_similarity"] = result.get("similarity", 0.0)
-                    # Ensure sparse fields are initialized
-                    result["has_sparse"] = False
-                    result["sparse_similarity"] = 0.0
-                    score_lookup[("patch", item_id)] = result
-                    combined.append(result)
-                    
-            elif doc_type == "open_pr":
-                item_id = to_int(result.get("pr_number"))
-                if not item_id or item_id not in self.indexer.open_pr_docs:
-                    continue
-                    
-                if item_id not in seen_open_prs:
-                    seen_open_prs.add(item_id)
-                    result["pr_number"] = item_id
-                    result["has_dense"] = True
-                    result["dense_similarity"] = result.get("similarity", 0.0)
-                    # Ensure sparse fields are initialized
-                    result["has_sparse"] = False
-                    result["sparse_similarity"] = 0.0
-                    score_lookup[("open_pr", item_id)] = result
-                    combined.append(result)
-        
-        # Add sparse results and combine scores for items found in both
-        for result in sparse_results:
-            doc_type = result.get("type", "issue")
-            
-            if doc_type == "issue":
-                item_id = to_int(result.get("issue_id"))
-                if not item_id or item_id not in self.indexer.issue_docs:
-                    continue
-                
-                key = ("issue", item_id)
-                if item_id in seen_issues:
-                    # Item found in both searches - combine scores with weighted average
-                    existing = score_lookup[key]
-                    existing["has_sparse"] = True
-                    existing["sparse_similarity"] = result["similarity"]
-                    # Weighted combination: 60% dense, 40% sparse
-                    existing["similarity"] = (0.6 * existing.get("dense_similarity", 0.0) + 
-                                            0.4 * result.get("similarity", 0.0))
-                    existing["match_reasons"].append("keyword match")
-                else:
-                    # Only found in sparse search
-                    seen_issues.add(item_id)
-                    result["issue_id"] = item_id
-                    result["has_sparse"] = True
-                    result["sparse_similarity"] = result.get("similarity", 0.0)
-                    # Ensure dense fields are initialized
-                    result["has_dense"] = False
-                    result["dense_similarity"] = 0.0
-                    score_lookup[key] = result
-                    combined.append(result)
-                    
-            elif doc_type == "patch":
-                item_id = to_int(result.get("pr_number"))
-                if not item_id or item_id not in self.indexer.diff_docs:
-                    continue
-                
-                key = ("patch", item_id)
-                if item_id in seen_patches:
-                    # Combine scores
-                    existing = score_lookup[key]
-                    existing["has_sparse"] = True
-                    existing["sparse_similarity"] = result["similarity"]
-                    existing["similarity"] = (0.6 * existing.get("dense_similarity", 0.0) + 
-                                            0.4 * result.get("similarity", 0.0))
-                    existing["match_reasons"].append("keyword match")
-                else:
-                    seen_patches.add(item_id)
-                    result["pr_number"] = item_id
-                    result["has_sparse"] = True
-                    result["sparse_similarity"] = result.get("similarity", 0.0)
-                    # Ensure dense fields are initialized
-                    result["has_dense"] = False
-                    result["dense_similarity"] = 0.0
-                    score_lookup[key] = result
-                    combined.append(result)
-                    
-            elif doc_type == "open_pr":
-                item_id = to_int(result.get("pr_number"))
-                if not item_id or item_id not in self.indexer.open_pr_docs:
-                    continue
-                
-                key = ("open_pr", item_id)
-                if item_id in seen_open_prs:
-                    # Combine scores
-                    existing = score_lookup[key]
-                    existing["has_sparse"] = True
-                    existing["sparse_similarity"] = result["similarity"]
-                    existing["similarity"] = (0.6 * existing.get("dense_similarity", 0.0) + 
-                                            0.4 * result.get("similarity", 0.0))
-                    existing["match_reasons"].append("keyword match")
-                else:
-                    seen_open_prs.add(item_id)
-                    result["pr_number"] = item_id
-                    result["has_sparse"] = True
-                    result["sparse_similarity"] = result.get("similarity", 0.0)
-                    # Ensure dense fields are initialized
-                    result["has_dense"] = False
-                    result["dense_similarity"] = 0.0
-                    score_lookup[key] = result
-                    combined.append(result)
-            
+                sim = 0.3
+
+            item = {"similarity": sim, "match_type": "semantic", "match_reasons": ["semantic"], "type": dtype}
+            iid = to_int(meta.get("issue_id"))
+            pr = to_int(meta.get("pr_number"))
+
+            if dtype == "issue" and iid and iid in self.indexer.issue_docs:
+                item["issue_id"] = iid; dense.append(item)
+            elif dtype == "patch" and pr and pr in self.indexer.diff_docs:
+                item["pr_number"] = pr; dense.append(item)
+            elif dtype == "open_pr" and pr and pr in self.indexer.open_pr_docs:
+                item["pr_number"] = pr; dense.append(item)
+
+        # Sparse search
+        if self.indexer.bm25_retriever:
+            for node in self.indexer.bm25_retriever.retrieve(query)[:k]:
+                meta = node.metadata or {}
+                dtype = meta.get("type", "issue")
+                sim = self.indexer._normalize_bm25(getattr(node, 'score', 1.0))
+
+                item = {"similarity": sim, "match_type": "keyword", "match_reasons": ["keyword"], "type": dtype}
+                iid = to_int(meta.get("issue_id"))
+                pr = to_int(meta.get("pr_number"))
+
+                if dtype == "issue" and iid and iid in self.indexer.issue_docs:
+                    item["issue_id"] = iid; sparse.append(item)
+                elif dtype == "patch" and pr and pr in self.indexer.diff_docs:
+                    item["pr_number"] = pr; sparse.append(item)
+                elif dtype == "open_pr" and pr and pr in self.indexer.open_pr_docs:
+                    item["pr_number"] = pr; sparse.append(item)
+
+        return dense, sparse
+
+    def _combine(self, dense: List[Dict], sparse: List[Dict]) -> List[Dict]:
+        """Combine dense and sparse results with score fusion"""
+        seen, combined, lookup = set(), [], {}
+
+        for r in dense:
+            key = ("issue", r["issue_id"]) if "issue_id" in r else ("pr", r.get("pr_number"))
+            if key[1] and key not in seen:
+                seen.add(key)
+                r.update({"has_dense": True, "dense_sim": r["similarity"], "has_sparse": False, "sparse_sim": 0})
+                lookup[key] = r
+                combined.append(r)
+
+        for r in sparse:
+            key = ("issue", r["issue_id"]) if "issue_id" in r else ("pr", r.get("pr_number"))
+            if not key[1]: continue
+            if key in seen:
+                existing = lookup[key]
+                existing.update({"has_sparse": True, "sparse_sim": r["similarity"],
+                               "similarity": 0.6 * existing["dense_sim"] + 0.4 * r["similarity"]})
+                existing["match_reasons"].append("keyword")
+            else:
+                seen.add(key)
+                r.update({"has_sparse": True, "sparse_sim": r["similarity"], "has_dense": False, "dense_sim": 0})
+                combined.append(r)
+
         return combined
-    
-    def _apply_filters(
-        self, 
-        results: List[Dict], 
-        state_filter: str,
-        similarity_threshold: float,
-        label_filter: Optional[List[str]],
-        query: str = ""  # Add query parameter for title matching
-    ) -> List[Dict]:
-        """Apply filters to search results"""
+
+    def _filter(self, results: List[Dict], state: str, threshold: float, labels: Optional[List[str]], query: str) -> List[Dict]:
+        """Filter and score results"""
         filtered = []
-        
-        for result in results:
-            doc_type = result.get("type", "issue")
-            
-            # Apply similarity threshold
-            if result["similarity"] < similarity_threshold:
-                continue
-            
-            if doc_type == "issue":
-                issue_id = to_int(result.get("issue_id"))
-                if issue_id and issue_id in self.indexer.issue_docs:
-                    issue_doc = self.indexer.issue_docs[issue_id]
-                    
-                    # Apply state filter
-                    if state_filter != "all" and issue_doc.state != state_filter:
-                        continue
-                    
-                    # Apply label filter
-                    if label_filter:
-                        if not any(label in issue_doc.labels for label in label_filter):
-                            continue
-                    
-                    result["issue_id"] = issue_id
-                    filtered.append(result)
-            
-            elif doc_type == "patch":
-                # Patches don't have state or labels, so they always pass this filter
-                filtered.append(result)
-        
-        # Sort by similarity with MODEST label boosting (preserve original similarity ranking)
-        def calculate_final_score(item):
-            base_similarity = item["similarity"]
-            
-            if item.get("type") == "issue":
-                issue_id = item["issue_id"]
-                if issue_id in self.indexer.issue_docs:
-                    issue_doc = self.indexer.issue_docs[issue_id]
-                    
-                    # Start with base similarity
-                    final_score = base_similarity
-                    
-                    # Add exact/partial title matching boost
-                    query_lower = query.lower() if query else ""
-                    title_lower = issue_doc.title.lower()
-                    
-                    # Extract content from query (remove [BUG], [FEATURE] etc.)
-                    import re
-                    clean_query = re.sub(r'^\[([^\]]+)\]\s*', '', query_lower).strip()
-                    clean_query = re.sub(r'["`]', '', clean_query).strip()
-                    
-                    # Check for exact matches or high overlap
-                    if clean_query and len(clean_query) > 5:  # Only for substantial queries
-                        if clean_query in title_lower:
-                            final_score += 0.15  # Significant boost for substring match
-                        else:
-                            # Check for word overlap
-                            query_words = set(clean_query.split())
-                            title_words = set(title_lower.split())
-                            
-                            if query_words and title_words:
-                                overlap = len(query_words & title_words) / len(query_words)
-                                if overlap > 0.6:  # If >60% of query words appear in title
-                                    final_score += 0.08
-                                elif overlap > 0.4:  # If >40% of query words appear in title
-                                    final_score += 0.04
-                    
-                    # Boost for items found in both dense and sparse search
-                    if item.get("has_dense") and item.get("has_sparse"):
-                        final_score += 0.03
-                    
-                    # Apply SMALL label boost to preserve ranking integrity
-                    label_boost = 0.0
-                    high_value_labels = ['bug', 'enhancement', 'performance', 'memory-leak', 'hooks', 'ssr']
-                    
-                    for label in issue_doc.labels:
-                        if any(hvl in label.lower() for hvl in high_value_labels):
-                            label_boost += 0.01  # Much smaller boost: 0.01 instead of 0.05
-                    
-                    # Small boost for recently closed issues
-                    if issue_doc.state == "closed" and issue_doc.closed_at:
-                        try:
-                            closed_date = datetime.fromisoformat(issue_doc.closed_at.replace('Z', '+00:00'))
-                            days_since_closed = (datetime.now() - closed_date.replace(tzinfo=None)).days
-                            if days_since_closed < 365:
-                                label_boost += 0.005  # Very small boost: 0.005 instead of 0.03
-                        except:
-                            pass
-                    
-                    final_score += label_boost
-                    
-                    # Cap the total boost to maintain ranking order
-                    return min(0.99, final_score)
-            
-            return base_similarity
-        
-        # Calculate final scores but don't overwrite the similarity field
-        scored_results = []
-        for result in filtered:
-            final_score = calculate_final_score(result)
-            result_copy = result.copy()
-            result_copy["final_score"] = final_score
-            scored_results.append(result_copy)
-        
-        # Sort by final score but keep original similarity
-        scored_results.sort(key=lambda x: x["final_score"], reverse=True)
-        
-        # Remove the temporary final_score field
-        for result in scored_results:
-            result.pop("final_score", None)
-        
-        return scored_results
+        for r in results:
+            if r["similarity"] < threshold: continue
+            iid = r.get("issue_id")
+            if iid and iid in self.indexer.issue_docs:
+                doc = self.indexer.issue_docs[iid]
+                if state != "all" and doc.state != state: continue
+                if labels and not any(l in doc.labels for l in labels): continue
+                r["issue_id"] = iid
+            filtered.append(r)
 
-    def _format_issue_results(self, results: List[Dict]) -> List[IssueSearchResult]:
-        """Convert raw results to IssueSearchResult objects"""
-        search_results = []
-        for result in results:
-            issue_id = result["issue_id"]
-            if issue_id in self.indexer.issue_docs:
-                issue_doc = self.indexer.issue_docs[issue_id]
-                search_result = IssueSearchResult(
-                    issue=issue_doc,
-                    similarity=result["similarity"],
-                    match_reasons=result.get("match_reasons", [])
-                )
-                search_results.append(search_result)
-        return search_results
+        # Score with title matching and label boosts
+        def score(r):
+            base = r["similarity"]
+            iid = r.get("issue_id")
+            if iid and iid in self.indexer.issue_docs:
+                doc = self.indexer.issue_docs[iid]
+                clean_q = re.sub(r'^\[([^\]]+)\]\s*|["`]', '', query.lower()).strip()
+                title = doc.title.lower()
 
-    def _format_patch_results(self, results: List[Dict], similarity_threshold: float) -> List['PatchSearchResult']:
-        """Format patch search results"""
-        patch_results = []
-        
-        for result in results:
-            pr_number = to_int(result.get("pr_number"))
-            if not pr_number or pr_number not in self.indexer.diff_docs:
-                continue
-                
-            # Use a lower threshold for patches since they're more technical
-            if result["similarity"] < similarity_threshold * 0.8:  # 20% lower threshold for patches
-                continue
-                
-            diff_doc = self.indexer.diff_docs[pr_number]
-            patch_results.append(PatchSearchResult(
-                patch=diff_doc,
-                similarity=result["similarity"],
-                match_reasons=result.get("match_reasons", [])
-            ))
-            
-        return patch_results
+                # Title matching
+                if clean_q and len(clean_q) > 5:
+                    if clean_q in title: base += 0.15
+                    else:
+                        qw, tw = set(clean_q.split()), set(title.split())
+                        if qw and tw:
+                            ov = len(qw & tw) / len(qw)
+                            if ov > 0.4:
+                                base += 0.08 if ov > 0.6 else 0.04
 
-    def _format_open_pr_results(self, results: List[Dict], similarity_threshold: float) -> List[Dict]:
-        """Format open PR search results"""
-        open_pr_results = []
-        
-        for result in results:
-            pr_number = to_int(result.get("pr_number"))
-            if not pr_number or pr_number not in self.indexer.open_pr_docs:
-                continue
-                
-            # Use a slightly lower threshold for open PRs since they're current
-            if result["similarity"] < similarity_threshold * 0.7:  # 30% lower threshold for open PRs
-                continue
-                
-            open_pr_doc = self.indexer.open_pr_docs[pr_number]
-            open_pr_results.append({
-                "type": "open_pr",
-                "pr_number": pr_number,
-                "title": open_pr_doc.title,
-                "body": open_pr_doc.body[:200] + "..." if len(open_pr_doc.body) > 200 else open_pr_doc.body,
-                "author": open_pr_doc.author,
-                "created_at": open_pr_doc.created_at,
-                "updated_at": open_pr_doc.updated_at,
-                "files_changed": open_pr_doc.files_changed,
-                "review_decision": open_pr_doc.review_decision,
-                "reviews_summary": open_pr_doc.reviews_summary,
-                "status_summary": open_pr_doc.status_summary,
-                "draft": open_pr_doc.draft,
-                "mergeable": open_pr_doc.mergeable,
-                "url": open_pr_doc.url,
-                "similarity": result["similarity"],
-                "match_reasons": result.get("match_reasons", [])
-            })
-            
-        return open_pr_results
+                # Hybrid boost
+                if r.get("has_dense") and r.get("has_sparse"): base += 0.03
+
+                # Label boost
+                hvl = ['bug', 'enhancement', 'performance', 'memory-leak']
+                base += sum(0.01 for l in doc.labels if any(h in l.lower() for h in hvl))
+            return min(0.99, base)
+
+        return sorted(filtered, key=score, reverse=True)
 
 
 class IssueAwareRAG:
     """Main interface for issue-aware RAG functionality"""
-    
+
     def __init__(self, repo_owner: str, repo_name: str, progress_callback: Optional[Callable] = None):
-        self.repo_owner = repo_owner
-        self.repo_name = repo_name
+        self.repo_owner, self.repo_name = repo_owner, repo_name
         self.progress_callback = progress_callback
         self.indexer = IssueIndexer(repo_owner, repo_name)
         self.retriever = IssueRetriever(self.indexer)
-        self._initialized = False
-        self._pr_cache = {}  # Cache for PR data
-    
-    async def initialize(
-        self, 
-        force_rebuild: bool = False,
-        max_issues_for_patch_linkage: Optional[int] = None,
-        max_prs_for_patch_linkage: Optional[int] = None
-    ) -> None:
-        """Initialize the RAG system by building or loading the index"""
-        # Always create a fresh indexer to avoid coroutine reuse issues
+        self._initialized, self._pr_cache = False, {}
+
+    async def initialize(self, force_rebuild: bool = False, max_issues_for_patch_linkage: Optional[int] = None,
+                        max_prs_for_patch_linkage: Optional[int] = None) -> None:
         self.indexer = IssueIndexer(self.repo_owner, self.repo_name)
-        
-        # Check if we can load existing index FIRST (before expensive operations)
+
         if not force_rebuild and await self.indexer.load_existing_index():
-            logger.info(f"Issue-aware RAG loaded from cache for {self.repo_owner}/{self.repo_name}.")
+            logger.info(f"Loaded from cache for {self.repo_owner}/{self.repo_name}")
             self.retriever = IssueRetriever(self.indexer)
             self._initialized = True
             return
-        
-        # Only do expensive building if we need to rebuild or no cache exists
-        logger.info(f"Building new index for {self.repo_owner}/{self.repo_name} (force_rebuild={force_rebuild})")
-        
-        # Build patch linkage (expensive) - always create a fresh builder to avoid coroutine reuse
+
+        logger.info(f"Building new index (force={force_rebuild})")
         builder = PatchLinkageBuilder(self.repo_owner, self.repo_name, self.progress_callback)
-        await builder.build_patch_linkage(
-            max_issues=max_issues_for_patch_linkage,
-            max_prs=max_prs_for_patch_linkage,
-            download_diffs=True,
-            include_open_prs=True  # Enable open PRs collection
-        )
-        
-        # Build the issue index (expensive)
-        await self.indexer.crawl_and_index_issues(
-            max_issues=max_issues_for_patch_linkage,
-            force_rebuild_dependencies=force_rebuild,
-            max_issues_for_patch_linkage=max_issues_for_patch_linkage
-        )
-        
+        await builder.build_patch_linkage(max_issues=max_issues_for_patch_linkage, max_prs=max_prs_for_patch_linkage,
+                                          download_diffs=True, include_open_prs=True)
+        await self.indexer.crawl_and_index_issues(max_issues=max_issues_for_patch_linkage, force_rebuild_dependencies=force_rebuild)
         self.retriever = IssueRetriever(self.indexer)
         self._initialized = True
-        logger.info(f"Issue-aware RAG initialized for {self.repo_owner}/{self.repo_name} successfully.")
-    
-    async def get_issue_context(
-        self, 
-        query: str,
-        max_issues: int = 5,
-        include_patches: bool = True
-    ) -> IssueContextResponse:
-        """Get issue context for a query"""
-        start_time = time.time()
-        
-        if not self._initialized:
-            await self.initialize()
-        
-        # Analyze query to determine search strategy
-        query_analysis = self._analyze_query(query)
-        
-        # Search for related issues and patches
-        related_issues, related_patches = await self.retriever.find_related_issues(
-            query,
-            k=max_issues,
-            state_filter=query_analysis.get("preferred_state", "all"),
-            similarity_threshold=0.3,
-            label_filter=query_analysis.get("relevant_labels"),
-            include_patches=include_patches
-        )
-        
-        processing_time = time.time() - start_time
-        
-        return IssueContextResponse(
-            related_issues=related_issues,
-            patches=related_patches,
-            total_found=len(related_issues) + len(related_patches),
-            query_analysis=query_analysis,
-            processing_time=processing_time
-        )
-    
+
+    async def get_issue_context(self, query: str, max_issues: int = 5, include_patches: bool = True) -> IssueContextResponse:
+        start = time.time()
+        if not self._initialized: await self.initialize()
+
+        analysis = self._analyze_query(query)
+        issues, patches = await self.retriever.find_related_issues(query, k=max_issues, state_filter=analysis.get("preferred_state", "all"),
+                                                                   similarity_threshold=0.3, label_filter=analysis.get("relevant_labels"),
+                                                                   include_patches=include_patches)
+
+        return IssueContextResponse(related_issues=issues, patches=patches, total_found=len(issues) + len(patches),
+                                    query_analysis=analysis, processing_time=time.time() - start)
+
     def _analyze_query(self, query: str) -> Dict[str, Any]:
-        """Analyze query to optimize search strategy"""
-        query_lower = query.lower()
-        analysis = {
-            "query_type": "general",
-            "preferred_state": "all",
-            "relevant_labels": None,
-            "urgency": "normal"
-        }
-        
-        # Detect query type
-        if any(word in query_lower for word in ["bug", "error", "issue", "problem", "broken"]):
-            analysis["query_type"] = "bug_report"
-            analysis["relevant_labels"] = ["bug", "error"]
-        elif any(word in query_lower for word in ["feature", "enhancement", "request"]):
-            analysis["query_type"] = "feature_request"
-            analysis["relevant_labels"] = ["enhancement", "feature"]
-        elif any(word in query_lower for word in ["performance", "slow", "optimization"]):
-            analysis["query_type"] = "performance"
-            analysis["relevant_labels"] = ["performance", "optimization"]
-        
-        # Detect urgency
-        if any(word in query_lower for word in ["urgent", "critical", "breaking", "blocker"]):
-            analysis["urgency"] = "high"
-            analysis["preferred_state"] = "open"  # Focus on open issues for urgent queries
-        
+        q = query.lower()
+        analysis = {"query_type": "general", "preferred_state": "all", "relevant_labels": None, "urgency": "normal"}
+
+        if any(w in q for w in ["bug", "error", "issue", "problem", "broken"]):
+            analysis.update({"query_type": "bug_report", "relevant_labels": ["bug", "error"]})
+        elif any(w in q for w in ["feature", "enhancement", "request"]):
+            analysis.update({"query_type": "feature_request", "relevant_labels": ["enhancement", "feature"]})
+        elif any(w in q for w in ["performance", "slow", "optimization"]):
+            analysis.update({"query_type": "performance", "relevant_labels": ["performance", "optimization"]})
+
+        if any(w in q for w in ["urgent", "critical", "breaking", "blocker"]):
+            analysis.update({"urgency": "high", "preferred_state": "open"})
+
         return analysis
-    
-    def is_initialized(self) -> bool:
-        """Check if the system is initialized"""
-        return self._initialized
-    
+
+    def is_initialized(self) -> bool: return self._initialized
+
     async def update_index(self) -> None:
-        """Update the issue index with new/changed issues"""
         if self._initialized:
             await self.indexer.crawl_and_index_issues()
             self.retriever = IssueRetriever(self.indexer)
-    
+
     async def incremental_sync(self, max_new_issues: Optional[int] = None, max_new_prs: Optional[int] = None) -> Dict[str, Any]:
-        """
-        Perform incremental sync to update only new/changed issues and PRs
-        Returns sync statistics
-        """
         if not self._initialized:
-            # If not initialized, do full initialization
             await self.initialize()
             return {"status": "full_initialization", "reason": "system_not_initialized"}
-        
+
         from .enhanced_persistence import persistence_manager
-        
         logger.info(f"Starting incremental sync for {self.repo_owner}/{self.repo_name}")
-        
-        # Get existing sync metadata
-        index_dir = self.indexer.index_dir
-        sync_metadata = persistence_manager.load_sync_metadata(index_dir)
-        
-        # Check if we should sync
-        should_sync, sync_info = persistence_manager.should_sync_issues(sync_metadata, force_sync=False)
-        
+
+        sync_meta = persistence_manager.load_sync_metadata(self.indexer.index_dir)
+        should_sync, info = persistence_manager.should_sync_issues(sync_meta, force_sync=False)
+
         if not should_sync:
-            logger.info(f"Skipping sync: {sync_info.get('reason')} (last sync {sync_info.get('hours_since_sync', 0):.1f} hours ago)")
-            return {
-                "status": "skipped",
-                "reason": sync_info.get("reason"),
-                "hours_since_last_sync": sync_info.get("hours_since_sync", 0),
-                "last_sync": sync_metadata.get("last_issue_sync")
-            }
-        
+            return {"status": "skipped", "reason": info.get("reason"), "hours_since_last_sync": info.get("hours_since_sync", 0)}
+
         try:
-            # Perform incremental issue sync
-            new_issues_count = await self._sync_new_issues(max_new_issues)
-            
-            # Perform incremental PR sync
-            new_prs_count = await self._sync_new_prs(max_new_prs)
-            
-            # Update sync metadata
-            persistence_manager.save_sync_metadata(
-                index_dir, 
-                self.repo_owner, 
-                self.repo_name,
-                issues_synced=new_issues_count,
-                prs_synced=new_prs_count
-            )
-            
-            # Rebuild retriever if we added new content
-            if new_issues_count > 0 or new_prs_count > 0:
-                logger.info("Rebuilding retriever with new content...")
-                self.retriever = IssueRetriever(self.indexer)
-            
-            sync_result = {
-                "status": "completed",
-                "reason": sync_info.get("reason"),
-                "new_issues": new_issues_count,
-                "new_prs": new_prs_count,
-                "total_new_items": new_issues_count + new_prs_count,
-                "sync_time": datetime.now().isoformat()
-            }
-            
-            logger.info(f"Incremental sync completed: {new_issues_count} new issues, {new_prs_count} new PRs")
-            return sync_result
-            
+            new_issues = await self._sync_issues(max_new_issues)
+            new_prs = await self._sync_prs(max_new_prs)
+
+            persistence_manager.save_sync_metadata(self.indexer.index_dir, self.repo_owner, self.repo_name,
+                                                   issues_synced=new_issues, prs_synced=new_prs)
+
+            if new_issues or new_prs: self.retriever = IssueRetriever(self.indexer)
+            return {"status": "completed", "new_issues": new_issues, "new_prs": new_prs, "sync_time": datetime.now().isoformat()}
         except Exception as e:
-            logger.error(f"Error during incremental sync: {e}")
-            return {
-                "status": "error",
-                "error": str(e),
-                "sync_time": datetime.now().isoformat()
-            }
-    
-    async def _sync_new_issues(self, max_new_issues: Optional[int] = None) -> int:
-        """Sync new issues that aren't in our index yet"""
+            logger.error(f"Sync error: {e}")
+            return {"status": "error", "error": str(e)}
+
+    async def _sync_issues(self, max_new: Optional[int] = None) -> int:
         try:
-            # Get current issues from our index
-            existing_issue_ids = set(self.indexer.issue_docs.keys())
-            
-            # Fetch recent issues from GitHub
-            repo_url = f"https://github.com/{self.repo_owner}/{self.repo_name}"
-            recent_issues = await self.indexer.github_client.list_issues(
-                repo_url, 
-                state="all", 
-                max_pages=5  # Limit to recent issues for incremental sync
-            )
-            
-            # Filter to only new issues
-            new_issues = []
-            for issue in recent_issues:
-                if issue.id not in existing_issue_ids:
-                    new_issues.append(issue)
-            
-            # Limit if requested
-            if max_new_issues and len(new_issues) > max_new_issues:
-                new_issues = new_issues[:max_new_issues]
-                logger.info(f"Limited new issues to {max_new_issues} (found {len(new_issues)} total)")
-            
-            if not new_issues:
-                logger.info("No new issues found during incremental sync")
-                return 0
-            
-            logger.info(f"Found {len(new_issues)} new issues to index")
-            
-            # Add new issues to our index
-            await self._add_issues_to_index(new_issues)
-            
-            return len(new_issues)
-            
+            existing = set(self.indexer.issue_docs.keys())
+            recent = await self.indexer.github_client.list_issues(f"https://github.com/{self.repo_owner}/{self.repo_name}", state="all", max_pages=5)
+            new = [i for i in recent if i.id not in existing]
+            if max_new: new = new[:max_new]
+
+            if new:
+                await self._add_issues(new)
+                logger.info(f"Added {len(new)} new issues")
+            return len(new)
         except Exception as e:
-            logger.error(f"Error syncing new issues: {e}")
+            logger.error(f"Issue sync error: {e}")
             return 0
-    
-    async def _sync_new_prs(self, max_new_prs: Optional[int] = None) -> int:
-        """Sync new PRs that aren't in our patch linkage yet"""
+
+    async def _sync_prs(self, max_new: Optional[int] = None) -> int:
         try:
-            # Get existing PR numbers from patch linkage
-            existing_diff_docs = self.indexer.patch_builder.load_diff_docs()
-            existing_pr_numbers = {doc.pr_number for doc in existing_diff_docs}
-            
-            # For incremental sync, we'll fetch recent merged PRs and check which are new
-            logger.info("Checking for new merged PRs...")
-            
-            # Use the patch builder to check for new PRs
-            # This is a simplified approach - in a full implementation, you'd want
-            # to fetch recent PRs from GitHub API and compare
-            
-            # For now, we'll trigger a limited patch linkage build for recent PRs
-            max_prs_to_check = max_new_prs or 50  # Check recent PRs
-            
-            # Create a new patch builder instance for incremental sync
-            from .patch_linkage import PatchLinkageBuilder
-            patch_builder = PatchLinkageBuilder(self.repo_owner, self.repo_name)
-            
-            # Build patch linkage for recent PRs only
-            await patch_builder.build_patch_linkage(
-                max_issues=max_prs_to_check,  # Limit scope for incremental
-                max_prs=max_prs_to_check,
-                download_diffs=True,
-                include_open_prs=True
-            )
-            
-            # Count new PRs added
-            new_diff_docs = patch_builder.load_diff_docs()
-            new_pr_numbers = {doc.pr_number for doc in new_diff_docs}
-            
-            truly_new_prs = new_pr_numbers - existing_pr_numbers
-            new_prs_count = len(truly_new_prs)
-            
-            if new_prs_count > 0:
-                logger.info(f"Found {new_prs_count} new PRs: {list(truly_new_prs)}")
-                # The patch builder already saved the new data, so we just need to
-                # reload our indexer's patch data
-                self.indexer.patch_builder = patch_builder
-            else:
-                logger.info("No new PRs found during incremental sync")
-            
-            return new_prs_count
-            
+            existing = {d.pr_number for d in self.indexer.patch_builder.load_diff_docs()}
+            builder = PatchLinkageBuilder(self.repo_owner, self.repo_name)
+            await builder.build_patch_linkage(max_issues=max_new or 50, max_prs=max_new or 50, download_diffs=True, include_open_prs=True)
+
+            new_prs = {d.pr_number for d in builder.load_diff_docs()} - existing
+            if new_prs:
+                self.indexer.patch_builder = builder
+                logger.info(f"Added {len(new_prs)} new PRs")
+            return len(new_prs)
         except Exception as e:
-            logger.error(f"Error syncing new PRs: {e}")
+            logger.error(f"PR sync error: {e}")
             return 0
-    
-    async def _add_issues_to_index(self, new_issues: List[Any]) -> None:
-        """Add new issues to the existing index"""
-        if not new_issues:
-            return
-        
-        logger.info(f"Adding {len(new_issues)} new issues to index...")
-        
+
+    async def _add_issues(self, issues: List) -> None:
+        docs = []
+        for i in issues:
+            doc = IssueDoc(id=i.id, title=i.title, body=i.body or "", state=i.state,
+                          labels=[l.name for l in i.labels], created_at=i.created_at, updated_at=i.updated_at,
+                          closed_at=i.closed_at, user=i.user.login if i.user else "unknown",
+                          comments=getattr(i, 'comments', 0), url=i.url,
+                          assignees=[a.login for a in getattr(i, 'assignees', [])])
+            self.indexer.issue_docs[i.id] = doc
+
+            content = f"Title: {i.title}\n\nBody: {i.body or ''}"
+            if i.labels: content += f"\n\nLabels: {', '.join(l.name for l in i.labels)}"
+            docs.append(Document(text=content, metadata={"type": "issue", "issue_id": i.id, "state": i.state}))
+
+        if docs:
+            parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
+            nodes = parser.get_nodes_from_documents(docs)
+            self.indexer.vector_index.insert_nodes(nodes)
+            await self.indexer._save_issues()
+            self.indexer._save_faiss_index(nodes, append=True)
+
+    async def get_prs(self, state: str = "all", limit: int = 100) -> List[Dict[str, Any]]:
+        if not self._initialized: await self.initialize()
         try:
-            # Convert issues to documents
-            new_documents = []
-            
-            for issue in new_issues:
-                # Add to issue_docs dict
-                issue_doc = IssueDoc(
-                    id=issue.id,
-                    title=issue.title,
-                    body=issue.body or "",
-                    state=issue.state,
-                    labels=[label.name for label in issue.labels],
-                    created_at=issue.created_at,
-                    updated_at=issue.updated_at,
-                    closed_at=issue.closed_at,
-                    user=issue.user.login if issue.user else "unknown",
-                    comments=getattr(issue, 'comments', 0),
-                    url=issue.url,
-                    assignees=[assignee.login for assignee in getattr(issue, 'assignees', [])]
-                )
-                
-                self.indexer.issue_docs[issue.id] = issue_doc
-                
-                # Create document for vector indexing
-                content = f"Title: {issue.title}\n\nBody: {issue.body or ''}"
-                if issue.labels:
-                    content += f"\n\nLabels: {', '.join([label.name for label in issue.labels])}"
-                
-                doc = Document(
-                    text=content,
-                    metadata={
-                        "type": "issue",
-                        "issue_id": issue.id,
-                        "title": issue.title,
-                        "state": issue.state,
-                        "created_at": issue.created_at.isoformat() if issue.created_at else None,
-                        "labels": [label.name for label in issue.labels],
-                        "url": issue.url
-                    }
-                )
-                new_documents.append(doc)
-            
-            if new_documents:
-                # Add documents to vector index
-                from llama_index.core.node_parser import SimpleNodeParser
-                node_parser = SimpleNodeParser.from_defaults(chunk_size=4000, chunk_overlap=200)
-                new_nodes = node_parser.get_nodes_from_documents(new_documents)
-                
-                # Insert nodes into existing vector index
-                self.indexer.vector_index.insert_nodes(new_nodes)
-                
-                # Save updated issues and index
-                await self.indexer._save_issues()
-                await self.indexer._save_faiss_index(new_nodes, append=True)
-                
-                logger.info(f"Successfully added {len(new_issues)} issues to index")
-            
+            diffs = sorted(self.indexer.patch_builder.load_diff_docs(), key=lambda x: x.pr_number, reverse=True)
+            if state != "all": diffs = [d for d in diffs if d.merged_at]
+            return [{"number": d.pr_number, "title": getattr(d, 'pr_title', f"PR #{d.pr_number}"),
+                    "merged_at": d.merged_at, "files_changed": d.files_changed, "issue_id": d.issue_id} for d in diffs[:limit]]
         except Exception as e:
-            logger.error(f"Error adding issues to index: {e}")
-            raise
-    
-    async def initialize_commit_index(
-        self,
-        max_commits: Optional[int] = None,
-        force_rebuild: bool = False
-    ) -> bool:
-        """Initialize the commit index for enhanced commit-level analysis"""
-        try:
-            await self.commit_index_manager.initialize(
-                max_commits=max_commits,
-                force_rebuild=force_rebuild
-            )
-            logger.info("Commit index initialized successfully")
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to initialize commit index: {e}")
-            return False
-    
-    async def get_prs(
-        self,
-        state: str = "all",
-        limit: int = 100
-    ) -> List[Dict[str, Any]]:
-        """Get list of PRs from the index"""
-        if not self._initialized:
-            await self.initialize()
-        
-        try:
-            # Load diff docs which contain PR information
-            diff_docs = self.indexer.patch_builder.load_diff_docs()
-            
-            # Filter by state if needed
-            if state != "all":
-                diff_docs = [doc for doc in diff_docs if doc.merged_at is not None]
-            
-            # Sort by PR number
-            diff_docs.sort(key=lambda x: x.pr_number, reverse=True)
-            
-            # Convert to dict format
-            prs = []
-            for doc in diff_docs[:limit]:
-                pr = {
-                    "number": doc.pr_number,
-                    "title": doc.pr_title if hasattr(doc, 'pr_title') else f"PR #{doc.pr_number}",
-                    "merged_at": doc.merged_at,
-                    "files_changed": doc.files_changed,
-                    "issue_id": doc.issue_id
-                }
-                prs.append(pr)
-            
-            return prs
-            
-        except Exception as e:
-            logger.error(f"Error getting PRs: {e}")
+            logger.error(f"Get PRs error: {e}")
             return []
-    
+
     async def get_pr_details(self, pr_number: int) -> Optional[Dict[str, Any]]:
-        """Get detailed information about a specific PR"""
-        if not self._initialized:
-            await self.initialize()
-        
+        if not self._initialized: await self.initialize()
+        if pr_number in self._pr_cache: return self._pr_cache[pr_number]
+
         try:
-            # Check cache first
-            if pr_number in self._pr_cache:
-                return self._pr_cache[pr_number]
-            
-            # Load diff docs
-            diff_docs = self.indexer.patch_builder.load_diff_docs()
-            
-            # Find the PR
-            pr_doc = next((doc for doc in diff_docs if doc.pr_number == pr_number), None)
-            if not pr_doc:
-                return None
-            
-            # Build detailed PR info
-            pr_details = {
-                "number": pr_doc.pr_number,
-                "title": pr_doc.pr_title if hasattr(pr_doc, 'pr_title') else f"PR #{pr_doc.pr_number}",
-                "merged_at": pr_doc.merged_at,
-                "files_changed": pr_doc.files_changed,
-                "issue_id": pr_doc.issue_id,
-                "diff_summary": pr_doc.diff_summary,
-                "diff_path": pr_doc.diff_path
-            }
-            
-            # Cache the result
-            self._pr_cache[pr_number] = pr_details
-            
-            return pr_details
-            
+            diffs = self.indexer.patch_builder.load_diff_docs()
+            doc = next((d for d in diffs if d.pr_number == pr_number), None)
+            if doc:
+                details = {"number": doc.pr_number, "title": getattr(doc, 'pr_title', f"PR #{doc.pr_number}"),
+                          "merged_at": doc.merged_at, "files_changed": doc.files_changed, "issue_id": doc.issue_id,
+                          "diff_summary": doc.diff_summary, "diff_path": doc.diff_path}
+                self._pr_cache[pr_number] = details
+                return details
         except Exception as e:
-            logger.error(f"Error getting PR details: {e}")
-            return None
-    
+            logger.error(f"PR details error: {e}")
+        return None
+
     async def get_pr_diff(self, pr_number: int) -> Optional[str]:
-        """Get the full diff for a specific PR"""
-        if not self._initialized:
-            await self.initialize()
-        
-        try:
-            # Get PR details first
-            pr_details = await self.get_pr_details(pr_number)
-            if not pr_details:
-                return None
-            
-            # Load the diff file
-            diff_path = pr_details["diff_path"]
-            if not os.path.exists(diff_path):
-                return None
-            
-            with open(diff_path, 'r', encoding='utf-8') as f:
+        details = await self.get_pr_details(pr_number)
+        if details and os.path.exists(details["diff_path"]):
+            with open(details["diff_path"]) as f:
                 return f.read()
-            
-        except Exception as e:
-            logger.error(f"Error getting PR diff: {e}")
-            return None
-    
-    async def search_prs(
-        self,
-        query: str,
-        limit: int = 10
-    ) -> List[Dict[str, Any]]:
-        """Search PRs using the RAG system"""
-        if not self._initialized:
-            await self.initialize()
-        
+        return None
+
+    async def search_prs(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        if not self._initialized: await self.initialize()
         try:
-            # Use the retriever to search for relevant PRs
-            results = await self.retriever.find_related_issues(
-                query=query,
-                k=limit,
-                include_patches=True  # This will include PR diffs in the search
-            )
-            
-            # Format results
+            results = await self.retriever.find_related_issues(query, k=limit, include_patches=True)
             pr_results = []
-            for result in results:
-                if hasattr(result, 'pr_number'):  # This is a PR result
-                    pr_details = await self.get_pr_details(result.pr_number)
-                    if pr_details:
-                        pr_results.append({
-                            **pr_details,
-                            "similarity_score": result.similarity_score
-                        })
-            
+            for r in results:
+                if hasattr(r, 'pr_number'):
+                    d = await self.get_pr_details(r.pr_number)
+                    if d:
+                        pr_results.append({**d, "similarity_score": r.similarity_score})
             return pr_results
-            
         except Exception as e:
-            logger.error(f"Error searching PRs: {e}")
+            logger.error(f"Search PRs error: {e}")
             return []
-    
-    def clear_pr_cache(self) -> None:
-        """Clear the PR cache"""
-        self._pr_cache.clear()
+
+    def clear_pr_cache(self) -> None: self._pr_cache.clear()

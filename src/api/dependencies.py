@@ -2,7 +2,6 @@ from typing import Dict, Any
 from fastapi import HTTPException, Depends
 from ..github_client import GitHubIssueClient
 from ..llm_client import LLMClient
-from ..prompt_generator import PromptGenerator
 from ..session_manager import SessionManager
 from ..conversation_memory import ConversationContextManager
 from ..config import settings
@@ -14,7 +13,6 @@ logger = logging.getLogger(__name__)
 # Initialize shared clients and services
 github_client = GitHubIssueClient()
 llm_client = LLMClient()
-prompt_generator = PromptGenerator()
 session_manager = SessionManager()
 conversation_memory = ConversationContextManager(max_context_tokens=8000)
 
@@ -101,13 +99,6 @@ async def get_agentic_rag(session_id: str, session: Dict[str, Any] = Depends(get
             session["repo_path"], 
             issue_rag_system=None 
         )
-        
-        # Auto-start learning for recreated instances
-        try:
-            await recreated_agentic_rag.agentic_explorer.start_learning()
-            logger.info(f"Learning system auto-started for recreated session {session_id}")
-        except Exception as learning_error:
-            logger.warning(f"Failed to auto-start learning for recreated session {session_id}: {learning_error}")
         
         # Initialize composite retriever after core systems are ready
         logger.info(f"Initializing composite retriever for {repo_key}")

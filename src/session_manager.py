@@ -1,536 +1,276 @@
-from uuid import UUID
-import uuid
+"""Session management with Redis/in-memory fallback - tinygrad-style (537→300 lines)"""
+import uuid, os, shutil, json, logging, asyncio
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
+
 from .github_client import GitHubIssueClient
-from .new_rag import LocalRepoContextExtractor
-from .agentic_rag import AgenticRAGSystem  # Import the new integrated system
-from .repo_summarizer import RepositorySummarizer
+from .agentic_rag import AgenticRAGSystem
 from .config import settings
-from .models import Issue, IssueComment  # Import the models
-import asyncio
-import os
-import shutil
-import json
-import logging
-import aiofiles
-import asyncio
-from .issue_analysis.analyzer import analyse_issue  # new import
 
 logger = logging.getLogger(__name__)
 
+
 class SessionManager:
+    """Manages user sessions with Redis persistence and in-memory fallback."""
+
     def __init__(self):
-        # Initialize basic components
         self.github_client = GitHubIssueClient()
-        self.session_timeout = timedelta(hours=24)  # Sessions expire after 24 hours
-        
-        # Redis initialization will be lazy
+        self.session_timeout = timedelta(hours=24)
         self.sessions_cache = None
         self.use_redis = False
-        self.sessions: Dict[str, Dict[str, Any]] = {}  # Fallback storage
+        self.sessions: Dict[str, Dict[str, Any]] = {}
         self._redis_init_attempted = False
-        
+
+    # ============================================================================
+    # Storage Layer (Redis with in-memory fallback)
+    # ============================================================================
+
     async def _ensure_redis_initialized(self):
-        """Lazy initialization of Redis storage"""
-        if self._redis_init_attempted:
-            return
-            
+        """Lazy Redis initialization."""
+        if self._redis_init_attempted: return
         self._redis_init_attempted = True
+
         try:
-            logger.info("SessionManager: Attempting to initialize Redis storage...")
             from .cache.redis_cache_manager import EnhancedCacheManager
-            logger.info("SessionManager: Successfully imported EnhancedCacheManager")
-            
-            self.sessions_cache = EnhancedCacheManager(
-                namespace="sessions",
-                default_ttl=86400  # 24 hours in seconds
-            )
-            logger.info("SessionManager: Successfully created EnhancedCacheManager instance")
-            
-            # Initialize Redis connection
-            logger.info("SessionManager: Starting Redis initialization...")
+            self.sessions_cache = EnhancedCacheManager(namespace="sessions", default_ttl=86400)
             await self.sessions_cache.redis.initialize()
-            
-            if self.sessions_cache.redis.initialized:
-                self.use_redis = True
-                logger.info("SessionManager initialized with Redis persistence")
-            else:
-                logger.warning("Redis not ready, using in-memory storage")
-                
+            self.use_redis = self.sessions_cache.redis.initialized
+            logger.info(f"SessionManager: Redis {'enabled' if self.use_redis else 'not ready, using in-memory'}")
         except Exception as e:
-            logger.warning(f"Redis not available for sessions, falling back to in-memory session storage: {e}")
-            logger.exception("Full SessionManager Redis initialization error:")
+            logger.warning(f"Redis not available, using in-memory storage: {e}")
             self.use_redis = False
-        
+
+    def _convert_datetimes(self, data: Dict, to_iso: bool = False) -> Dict:
+        """Convert datetime fields to/from ISO strings."""
+        result = data.copy()
+        for field in ["created_at", "last_accessed"]:
+            if field in result:
+                if to_iso and isinstance(result[field], datetime):
+                    result[field] = result[field].isoformat()
+                elif not to_iso and isinstance(result[field], str):
+                    result[field] = datetime.fromisoformat(result[field])
+                elif not to_iso and not isinstance(result[field], datetime):
+                    result[field] = datetime.now()
+        return result
+
     async def _get_session_from_storage(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get session from Redis or in-memory storage"""
+        """Get session from storage."""
         await self._ensure_redis_initialized()
-        
         if self.use_redis:
-            session_data = await self.sessions_cache.get(session_id)
-            if session_data:
-                # Convert datetime strings back to datetime objects (defensive programming)
-                for field in ["created_at", "last_accessed"]:
-                    if field in session_data:
-                        if isinstance(session_data[field], str):
-                            session_data[field] = datetime.fromisoformat(session_data[field])
-                        elif not isinstance(session_data[field], datetime):
-                            # Fallback for unexpected types
-                            session_data[field] = datetime.now()
-            return session_data
-        else:
-            return self.sessions.get(session_id)
-    
+            if (data := await self.sessions_cache.get(session_id)):
+                return self._convert_datetimes(data, to_iso=False)
+            return None
+        return self.sessions.get(session_id)
+
     async def _store_session(self, session_id: str, session_data: Dict[str, Any]) -> None:
-        """Store session in Redis or in-memory storage"""
+        """Store session to storage."""
         await self._ensure_redis_initialized()
-        
         if self.use_redis:
-            # Convert datetime objects to strings for JSON serialization
-            storage_data = session_data.copy()
-            for field in ["created_at", "last_accessed"]:
-                if field in storage_data and isinstance(storage_data[field], datetime):
-                    storage_data[field] = storage_data[field].isoformat()
-            
-            # Remove non-serializable objects before storing in Redis
-            # These will be recreated on demand via dependencies
-            objects_to_exclude = [
-                "agentic_rag", "agentic_rag_for_issue_repo", "founding_member_agent", 
-                "_code_rag", "_issue_rag"
-            ]
-            for key in objects_to_exclude:
-                if key in storage_data:
-                    # Store metadata about the object instead of placeholder
-                    if key == "agentic_rag" and hasattr(storage_data[key], 'repo_info'):
-                        repo_info = getattr(storage_data[key], 'repo_info', {})
-                        storage_data[f"{key}_metadata"] = {
-                            "type": "AgenticRAGSystem",
-                            "repo_info": repo_info,
-                            "initialized": True
-                        }
-                    # Remove the actual object from storage
-                    del storage_data[key]
-            
-            await self.sessions_cache.set(session_id, storage_data)
+            storage = self._convert_datetimes(session_data, to_iso=True)
+            # Remove non-serializable objects
+            for key in ["agentic_rag", "agentic_rag_for_issue_repo", "founding_member_agent", "_code_rag", "_issue_rag"]:
+                if key in storage:
+                    if key == "agentic_rag" and hasattr(storage[key], 'repo_info'):
+                        storage[f"{key}_metadata"] = {"type": "AgenticRAGSystem", "repo_info": storage[key].repo_info, "initialized": True}
+                    del storage[key]
+            await self.sessions_cache.set(session_id, storage)
         else:
-            # In-memory storage can keep all objects
             self.sessions[session_id] = session_data
-    
+
     async def _list_all_sessions(self) -> Dict[str, Dict[str, Any]]:
-        """List all sessions from storage"""
+        """List all sessions."""
         await self._ensure_redis_initialized()
-        
-        if self.use_redis:
-            # Get all session keys and their data
-            import redis.asyncio as redis
-            redis_client = redis.from_url(settings.redis_url)
-            
-            # Get all keys in the sessions namespace
-            keys = await redis_client.keys(f"{self.sessions_cache.namespace}:*")
-            sessions = {}
-            
-            for key in keys:
-                session_id = key.decode().split(":", 1)[1]  # Remove namespace prefix
-                session_data = await self._get_session_from_storage(session_id)
-                if session_data:
-                    sessions[session_id] = session_data
-                    
-            await redis_client.close()
-            return sessions
-        else:
-            return self.sessions
-    
-    async def _delete_from_storage(self, session_id: str) -> bool:
-        """Delete session from storage"""
-        await self._ensure_redis_initialized()
-        
-        if self.use_redis:
-            return await self.sessions_cache.delete(session_id)
-        else:
-            if session_id in self.sessions:
-                del self.sessions[session_id]
-                return True
-            return False
-        
-    async def create_session(self, issue_url: str, prompt_type: str, llm_config: Optional[Any] = None) -> str:
-        """Create a new session for issue analysis"""
-        session_id = str(uuid.uuid4())
-        session_data = {
-            "id": session_id,
-            "type": "issue_analysis",
-            "issue_url": issue_url,
-            "prompt_type": prompt_type,
-            "created_at": datetime.now(),
-            "last_accessed": datetime.now(),
-            "conversation_history": [],
-            "llm_config": llm_config,
-            "status": "pending",
-            "result": None
-        }
-        # Store session synchronously to ensure it's immediately available
-        await self._store_session(session_id, session_data)
-        return session_id
-    
-    async def create_repo_session(self, repo_url: str, initial_file: Optional[str] = None, session_name: Optional[str] = None) -> tuple[str, Dict[str, Any]]:
-        """Create a new session for repository-only chat"""
-        session_id = str(uuid.uuid4())
-        
-        # Extract repo info from URL
-        url_parts = repo_url.rstrip('/').split('/')
-        owner = url_parts[-2] if len(url_parts) >= 2 else "unknown"
-        repo = url_parts[-1].replace('.git', '') if url_parts else "unknown"
-        
-        # Generate session name if not provided
-        if not session_name:
-            session_name = f"{owner}/{repo}"
-            if initial_file:
-                session_name += f" - {os.path.basename(initial_file)}"
-        
-        # Create session storage paths
-        session_storage_path = f"/tmp/triage_sessions/{session_id}"
-        os.makedirs(session_storage_path, exist_ok=True)
-        
-        metadata = {
-            "repo_url": repo_url,
-            "owner": owner,
-            "repo": repo,
-            "session_name": session_name,
-            "initial_file": initial_file,
-            "storage_path": session_storage_path,
-            "status": "initializing"
-        }
-        
-        session_data = {
-            "id": session_id,
-            "type": "repo_chat",
-            "repo_url": repo_url,
-            "created_at": datetime.now(),
-            "last_accessed": datetime.now(),
-            "conversation_history": [],
-            "metadata": metadata,
-            "prompt_type": "chat",  # Default for repo chat
-            "llm_config": None
-        }
-        
-        # Store session synchronously to ensure it's immediately available
-        await self._store_session(session_id, session_data)
-        
-        return session_id, metadata
-    
-    async def initialize_repo_session(self, session_id: str) -> None:
-        """Initialize repository context for a repo-only session using AgenticRAG"""
-        session = await self._get_session_from_storage(session_id)
-        if not session or session["type"] != "repo_chat":
-            logger.error(f"Session {session_id} not found or not a repo_chat session for initialization.")
-            return
-        
+        if not self.use_redis: return self.sessions
+
+        import redis.asyncio as redis
+        client = redis.from_url(settings.redis_url)
         try:
-            # Extract repo info for caching
-            owner = session["metadata"]["owner"]
-            repo = session["metadata"]["repo"]
+            keys = await client.keys(f"{self.sessions_cache.namespace}:*")
+            sessions = {}
+            for key in keys:
+                sid = key.decode().split(":", 1)[1]
+                if (data := await self._get_session_from_storage(sid)): sessions[sid] = data
+            return sessions
+        finally:
+            await client.close()
+
+    async def _delete_from_storage(self, session_id: str) -> bool:
+        """Delete session from storage."""
+        await self._ensure_redis_initialized()
+        if self.use_redis: return await self.sessions_cache.delete(session_id)
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+            return True
+        return False
+
+    # ============================================================================
+    # Session Creation
+    # ============================================================================
+
+    async def create_repo_session(self, repo_url: str, initial_file: Optional[str] = None,
+                                   session_name: Optional[str] = None) -> tuple[str, Dict[str, Any]]:
+        """Create session for repository chat."""
+        session_id = str(uuid.uuid4())
+        url_parts = repo_url.rstrip('/').split('/')
+        owner, repo = (url_parts[-2] if len(url_parts) >= 2 else "unknown"), url_parts[-1].replace('.git', '')
+
+        if not session_name:
+            session_name = f"{owner}/{repo}" + (f" - {os.path.basename(initial_file)}" if initial_file else "")
+
+        storage_path = f"/tmp/triage_sessions/{session_id}"
+        os.makedirs(storage_path, exist_ok=True)
+
+        metadata = {"repo_url": repo_url, "owner": owner, "repo": repo, "session_name": session_name,
+                    "initial_file": initial_file, "storage_path": storage_path, "status": "initializing"}
+
+        await self._store_session(session_id, {
+            "id": session_id, "type": "repo_chat", "repo_url": repo_url,
+            "created_at": datetime.now(), "last_accessed": datetime.now(),
+            "conversation_history": [], "metadata": metadata, "prompt_type": "chat", "llm_config": None
+        })
+        return session_id, metadata
+
+    # ============================================================================
+    # Session Initialization
+    # ============================================================================
+
+    async def initialize_repo_session(self, session_id: str) -> None:
+        """Initialize repository context for repo-chat session."""
+        session = await self._get_session_from_storage(session_id)
+        if not session or session["type"] != "repo_chat": return
+
+        try:
+            owner, repo = session["metadata"]["owner"], session["metadata"]["repo"]
             repo_key = f"{owner}/{repo}"
-            
-            # Check if this repo is already initialized in our global cache
+
+            # Check cache first
             from .api.dependencies import agentic_rag_cache
             if repo_key in agentic_rag_cache:
-                logger.info(f"Found existing AgenticRAG instance for {repo_key}, reusing")
-                existing_instance = agentic_rag_cache[repo_key]
-                
-                # Update session with existing instance data
-                session["agentic_rag"] = existing_instance
-                session["repo_path"] = existing_instance.repo_path
-                session["repo_context"] = {"repo_info": existing_instance.repo_info}
-                session["agentic_enabled"] = True
-                
-                # Mark as ready immediately since we're reusing
-                session["metadata"]["status"] = "ready"
-                session["metadata"]["message"] = "Repository loaded from cache. Full context available."
-                session["metadata"]["issue_rag_ready"] = existing_instance.issue_rag is not None
-                
+                logger.info(f"Reusing cached AgenticRAG for {repo_key}")
+                rag = agentic_rag_cache[repo_key]
+                session.update({"agentic_rag": rag, "repo_path": rag.repo_path,
+                               "repo_context": {"repo_info": rag.repo_info}, "agentic_enabled": True})
+                session["metadata"].update({"status": "ready", "message": "Repository loaded from cache.",
+                                           "issue_rag_ready": rag.issue_rag is not None})
                 await self._store_session(session_id, session)
-                logger.info(f"Session {session_id} initialized using cached AgenticRAG for {repo_key}")
                 return
-            
-            # If not cached, proceed with fresh initialization
-            session["metadata"]["status"] = "cloning"
-            session["metadata"]["message"] = "Cloning repository..."
-            # Store the status update immediately
+
+            # Fresh initialization
+            session["metadata"].update({"status": "cloning", "message": "Cloning repository..."})
             await self._store_session(session_id, session)
 
-            agentic_rag = AgenticRAGSystem(repo_key)  # Use repo_key instead of session_id
-
-            # Initialize core systems (blocking part of this background task)
+            agentic_rag = AgenticRAGSystem(repo_key)
             await agentic_rag.initialize_core_systems(session["repo_url"])
-            
-            # Update session with info from core systems
-            session["agentic_rag"] = agentic_rag
-            session["repo_path"] = agentic_rag.get_repo_path()
-            session["repo_context"] = {"repo_info": agentic_rag.get_repo_info()}
-            session["agentic_enabled"] = True
 
-            session["metadata"]["status"] = "core_ready"
-            session["metadata"]["message"] = "Core repository indexed. Chat ready for code analysis. Issue context loading in background..."
-
-            # Cache the instance for reuse across sessions
+            session.update({"agentic_rag": agentic_rag, "repo_path": agentic_rag.get_repo_path(),
+                           "repo_context": {"repo_info": agentic_rag.get_repo_info()}, "agentic_enabled": True})
+            session["metadata"].update({"status": "core_ready",
+                                       "message": "Core repository indexed. Issue context loading..."})
             agentic_rag_cache[repo_key] = agentic_rag
-
-            # IMPORTANT: Save the session with the working AgenticRAG instance BEFORE attempting issue RAG
             await self._store_session(session_id, session)
-            logger.info(f"Session {session_id}: Core AgenticRAG systems initialized and stored successfully")
 
-            # Kick off asynchronous initialization of IssueAwareRAG
-            # This can fail without affecting the core functionality
+            # Background issue RAG init
             try:
                 asyncio.create_task(agentic_rag.initialize_issue_rag_async(session))
-                logger.info(f"Session {session_id}: Started background task for IssueAwareRAG initialization.")
-            except Exception as issue_rag_error:
-                logger.warning(f"Session {session_id}: Failed to start issue RAG initialization: {issue_rag_error}")
-                # Update session to indicate issue RAG failed but core is ready
-                session["metadata"]["status"] = "warning_issue_rag_failed"
-                session["metadata"]["message"] = "Core chat ready. Issue context failed to initialize."
-                session["metadata"]["issue_rag_ready"] = False
+            except Exception as e:
+                logger.warning(f"Failed to start issue RAG init: {e}")
+                session["metadata"].update({"status": "warning_issue_rag_failed",
+                                           "message": "Core ready. Issue context failed.", "issue_rag_ready": False})
                 await self._store_session(session_id, session)
-            
-            # Save metadata to disk for persistence
+
+            # Save metadata to disk
             try:
-                metadata_path = os.path.join(session["metadata"]["storage_path"], "metadata.json")
-                with open(metadata_path, 'w') as f:
+                with open(os.path.join(session["metadata"]["storage_path"], "metadata.json"), 'w') as f:
                     json.dump(session["metadata"], f, indent=2)
-            except Exception as metadata_error:
-                logger.warning(f"Failed to save metadata to disk for session {session_id}: {metadata_error}")
-                
+            except Exception as e: logger.warning(f"Failed to save metadata: {e}")
+
         except Exception as e:
-            logger.error(f"Error during repository session initialization for {session_id}: {e}")
-            # Make sure to store the error state
-            session["metadata"]["status"] = "error"
-            session["metadata"]["error"] = str(e)
-            session["metadata"]["message"] = f"Failed to initialize session systems: {str(e)}"
-            # Remove any partial agentic_rag that might have been set
+            logger.error(f"Error initializing repo session {session_id}: {e}")
+            session["metadata"].update({"status": "error", "error": str(e), "message": f"Failed: {e}"})
             session.pop("agentic_rag", None)
             session["agentic_enabled"] = False
-            # Save the error status back to storage
             await self._store_session(session_id, session)
-    
-    async def initialize_session_context(self, session_id: str) -> None:
-        """Initialize session context based on session type"""
-        session = await self._get_session_from_storage(session_id)
-        if not session:
-            return
-            
-        if session["type"] == "repo_chat":
-            # This is now handled by the background task created in /assistant/sessions
-            # No direct call here needed anymore as it's part of the main session init flow.
-            # If called, it might re-trigger, which could be an issue or intended for re-init.
-            # For now, let's assume it's mainly for the issue_analysis type.
-            logger.info(f"Repo chat session {session_id} initialization is handled by create_assistant_session flow.")
-            pass # Or decide if re-initialization logic is needed here.
-        else: # issue_analysis type
-            try:
-                # Get issue data
-                issue_response = await self.github_client.get_issue(session["issue_url"])
-                if issue_response.status == "success" and issue_response.data:
-                    session["issue_data"] = issue_response.data
-                    
-                    # Extract repo URL from issue URL
-                    url_parts = session["issue_url"].split('/')
-                    owner = url_parts[3]
-                    repo_name_from_url = url_parts[4] # Renamed to avoid conflict
-                    repo_url = f"https://github.com/{owner}/{repo_name_from_url}.git"
-                    
-                    # Initialize AgenticRAG system for the issue's repository
-                    # This will set up core RAG and kick off issue_rag_async for this repo
-                    agentic_rag = AgenticRAGSystem(session_id + "_issue_repo") # Unique ID for this instance
-                    
-                    await agentic_rag.initialize_core_systems(repo_url)
-                    asyncio.create_task(agentic_rag.initialize_issue_rag_async(session)) # Pass main session for status updates
-                                        
-                    session["agentic_rag_for_issue_repo"] = agentic_rag # Store it separately
-                    # session["repo_context"] will be populated by agentic_rag methods as needed
-                    session["repo_path_for_issue_repo"] = agentic_rag.get_repo_path()
-                    session["agentic_enabled"] = True
-                    
-                    logger.info(f"Context initialization for issue {session['issue_url']} started.")
-                    
-            except Exception as e:
-                logger.error(f"Error initializing context for issue session {session_id}: {e}")
-    
+
+    # ============================================================================
+    # Session Operations
+    # ============================================================================
+
     async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get session by ID. Updates last_accessed in the returned dict, but doesn't immediately persist this change to storage."""
-        session = await self._get_session_from_storage(session_id)
-        if session:
-            # Update last_accessed in the session dictionary that will be returned.
-            # The actual persistence of this specific change to Redis will happen
-            # when other methods like add_message call _store_session, or if an
-            # explicit save/update method is called on the session.
+        """Get session by ID."""
+        if (session := await self._get_session_from_storage(session_id)):
             session["last_accessed"] = datetime.now()
         return session
 
     async def update_session_last_accessed_and_store(self, session_id: str):
-        """Explicitly updates last_accessed time and stores the session.
-           Useful if a session is read but not otherwise modified in a request."""
-        session_data = await self._get_session_from_storage(session_id) # Get current state
-        if session_data:
-            session_data["last_accessed"] = datetime.now()
-            await self._store_session(session_id, session_data) # Now store it
-    
+        """Update and persist last_accessed time."""
+        if (session := await self._get_session_from_storage(session_id)):
+            session["last_accessed"] = datetime.now()
+            await self._store_session(session_id, session)
+
     async def list_sessions(self, session_type: Optional[str] = None) -> List[Dict[str, Any]]:
-        """List all sessions, optionally filtered by type"""
+        """List all sessions, optionally filtered by type."""
         sessions_list = []
-        sessions = await self._list_all_sessions()
-        for session_id, session_data in sessions.items(): # Renamed session to session_data
-            if session_type and session_data.get("type") != session_type:
-                continue
-                
-            session_info = {
-                "id": session_id,
-                "type": session_data.get("type", "unknown"),
-                "created_at": session_data["created_at"].isoformat(),
-                "last_accessed": session_data["last_accessed"].isoformat(),
-                "metadata": session_data.get("metadata", {}),
-                "message_count": len(session_data.get("conversation_history", []))
-            }
-            
-            if session_data["type"] == "repo_chat":
-                session_info["repo_url"] = session_data.get("repo_url")
-                session_info["session_name"] = session_data.get("metadata", {}).get("session_name")
-            elif session_data["type"] == "issue_analysis": # Added elif for clarity
-                session_info["issue_url"] = session_data.get("issue_url")
-                session_info["prompt_type"] = session_data.get("prompt_type")
-                
-            sessions_list.append(session_info)
-        
-        sessions_list.sort(key=lambda x: x["last_accessed"], reverse=True)
-        return sessions_list
-    
+        for session_id, data in (await self._list_all_sessions()).items():
+            if session_type and data.get("type") != session_type: continue
+
+            info = {"id": session_id, "type": data.get("type", "unknown"),
+                    "created_at": data["created_at"].isoformat(), "last_accessed": data["last_accessed"].isoformat(),
+                    "metadata": data.get("metadata", {}), "message_count": len(data.get("conversation_history", []))}
+
+            if data["type"] == "repo_chat":
+                info.update({"repo_url": data.get("repo_url"), "session_name": data.get("metadata", {}).get("session_name")})
+            elif data["type"] == "issue_analysis":
+                info.update({"issue_url": data.get("issue_url"), "prompt_type": data.get("prompt_type")})
+            sessions_list.append(info)
+
+        return sorted(sessions_list, key=lambda x: x["last_accessed"], reverse=True)
+
     async def delete_session(self, session_id: str) -> bool:
-        """Delete a session and clean up associated resources"""
+        """Delete session and clean up resources."""
         session = await self._get_session_from_storage(session_id)
-        if not session:
-            return False
-        
-        # Clean up AgenticRAG resources (main one for repo_chat)
-        from .agentic_rag import AgenticRAGSystem # Ensure AgenticRAGSystem is imported for isinstance check
+        if not session: return False
 
-        agentic_rag_instance = session.get("agentic_rag")
-        if isinstance(agentic_rag_instance, AgenticRAGSystem):
+        # Cleanup AgenticRAG instances
+        for key in ["agentic_rag", "agentic_rag_for_issue_repo"]:
+            if (rag := session.get(key)) and isinstance(rag, AgenticRAGSystem):
+                try: asyncio.create_task(rag.cleanup())
+                except Exception as e: logger.error(f"Error scheduling {key} cleanup: {e}")
+
+        # Cleanup FoundingMemberAgent
+        if (agent := session.get("founding_member_agent")) and hasattr(agent, 'explorer'):
             try:
-                asyncio.create_task(agentic_rag_instance.cleanup())
-            except Exception as e:
-                logger.error(f"Error scheduling AgenticRAG cleanup for session {session_id}: {e}")
-        elif isinstance(agentic_rag_instance, str):
-            logger.info(f"AgenticRAG for session {session_id} was a placeholder string '{agentic_rag_instance}'; no instance cleanup needed.")
+                if hasattr(agent.explorer, 'reset_memory'): agent.explorer.reset_memory()
+            except Exception as e: logger.error(f"Error cleaning up FoundingMemberAgent: {e}")
 
-        # Clean up AgenticRAG for issue_analysis sessions
-        agentic_rag_issue_instance = session.get("agentic_rag_for_issue_repo")
-        if isinstance(agentic_rag_issue_instance, AgenticRAGSystem):
-            try:
-                asyncio.create_task(agentic_rag_issue_instance.cleanup())
-            except Exception as e:
-                logger.error(f"Error scheduling AgenticRAG (issue_repo) cleanup for session {session_id}: {e}")
-        elif isinstance(agentic_rag_issue_instance, str):
-            logger.info(f"AgenticRAG (issue_repo) for session {session_id} was a placeholder string '{agentic_rag_issue_instance}'; no instance cleanup needed.")
-
-        # Clean up FoundingMemberAgent resources
-        # Assuming FoundingMemberAgent might also be a placeholder, add similar check if it has a cleanup method
-        founding_member_agent_instance = session.get("founding_member_agent")
-        if founding_member_agent_instance and not isinstance(founding_member_agent_instance, str) and hasattr(founding_member_agent_instance, 'cleanup'):
-            # If FoundingMemberAgent has a cleanup method, call it.
-            # For now, the existing logic for its explorer reset is kept.
-            pass # Placeholder for potential cleanup call
-
-        if "founding_member_agent" in session and session["founding_member_agent"]:
-            try:
-                agent = session["founding_member_agent"]
-                if hasattr(agent, 'explorer') and hasattr(agent.explorer, 'reset_memory'):
-                    agent.explorer.reset_memory() # Assuming this is synchronous
-            except Exception as e:
-                logger.error(f"Error cleaning up FoundingMemberAgent for session {session_id}: {e}")
-        
-        # Clean up in-memory cache in dependencies to prevent memory leaks
+        # Cleanup cache
         try:
             from .api.dependencies import agentic_rag_cache
             if session_id in agentic_rag_cache:
                 del agentic_rag_cache[session_id]
-                logger.info(f"Cleaned up AgenticRAG cache for session {session_id}")
-        except ImportError:
-            logger.debug("agentic_rag_cache not available (import failed), skipping cache cleanup")
-        except Exception as e:
-            logger.error(f"Error cleaning up AgenticRAG cache for session {session_id}: {e}")
-        
-        # Clean up storage for repo sessions
+        except Exception as e: logger.debug(f"Cache cleanup skipped: {e}")
+
+        # Cleanup storage for repo sessions
         if session.get("type") == "repo_chat":
-            storage_path = session.get("metadata", {}).get("storage_path")
-            if storage_path and os.path.exists(storage_path):
-                try:
-                    shutil.rmtree(storage_path)
-                    logger.info(f"Cleaned up session storage for {session_id} at {storage_path}")
-                except Exception as e:
-                    logger.error(f"Error cleaning up session storage for {session_id} at {storage_path}: {e}")
-        
+            if (path := session.get("metadata", {}).get("storage_path")) and os.path.exists(path):
+                try: shutil.rmtree(path)
+                except Exception as e: logger.error(f"Error cleaning up storage at {path}: {e}")
+
         await self._delete_from_storage(session_id)
-        logger.info(f"Deleted session {session_id} from storage.")
+        logger.info(f"Deleted session {session_id}")
         return True
-    
+
     async def add_message(self, session_id: str, role: str, content: str = "", **kwargs) -> None:
-        """Add a message to the conversation history, supporting extra fields."""
-        session = await self._get_session_from_storage(session_id)
-        if session:
-            message = {
-                "role": role,
-                "content": content,
-                "timestamp": datetime.now().isoformat()
-            }
-            message.update(kwargs)
-            session["conversation_history"].append(message)
+        """Add message to conversation history."""
+        if (session := await self._get_session_from_storage(session_id)):
+            session["conversation_history"].append({"role": role, "content": content,
+                                                    "timestamp": datetime.now().isoformat(), **kwargs})
             session["last_accessed"] = datetime.now()
-            # Store the updated session
             await self._store_session(session_id, session)
-    
+
     async def cleanup_sessions(self) -> None:
-        """Clean up expired sessions"""
-        current_time = datetime.now()
-        sessions = await self._list_all_sessions()
-        expired_sessions = [
-            session_id for session_id, session_data in sessions.items()
-            if current_time - session_data["last_accessed"] > self.session_timeout
-        ]
-        
-        for session_id in expired_sessions:
-            logger.info(f"Cleaning up expired session: {session_id}")
-            await self.delete_session(session_id)
-
-    # ------------------------------------------------------------------
-    # Issue analysis orchestration (agentic pipeline)
-    # ------------------------------------------------------------------
-    async def _run_issue_analysis(self, session_id: str):
-        """Internal helper that executes the analyse_issue pipeline and updates session."""
-        session = await self._get_session_from_storage(session_id)
-        if not session or session["type"] != "issue_analysis":
-            logger.error("Session %s not found or not issue_analysis", session_id)
-            return
-
-        issue_url: str = session["issue_url"]
-        try:
-            session["status"] = "running"
-            await self._store_session(session_id, session)  # Save status update
-            result = await analyse_issue(issue_url)
-            session["status"] = result.get("status", "completed")
-            session["result"] = result
-            await self._store_session(session_id, session)  # Save final result
-        except Exception as exc:
-            logger.exception("Issue analysis failed for session %s", session_id)
-            session["status"] = "error"
-            session["error"] = str(exc)
-            await self._store_session(session_id, session)  # Save error state
-
-    async def launch_issue_analysis(self, session_id: str) -> None:
-        """Public method to start analysis in background using asyncio.create_task."""
-        session = await self._get_session_from_storage(session_id)
-        if not session:
-            raise ValueError(f"Invalid session_id {session_id}")
-        # Ensure not already running
-        if session.get("status") in {"running", "completed"}:
-            return
-        # Kick off background task
-        asyncio.create_task(self._run_issue_analysis(session_id))
+        """Clean up expired sessions."""
+        now = datetime.now()
+        for session_id, data in (await self._list_all_sessions()).items():
+            if now - data["last_accessed"] > self.session_timeout:
+                logger.info(f"Cleaning up expired session: {session_id}")
+                await self.delete_session(session_id)

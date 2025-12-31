@@ -5,7 +5,7 @@ from ..dependencies import (
     session_manager, llm_client, conversation_memory, 
     get_session, get_agentic_rag, logger, settings
 )
-from ...cache_manager import response_cache
+from ...cache.redis_cache_manager import response_cache
 import re
 import os
 import json
