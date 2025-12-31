@@ -1,0 +1,24 @@
+{
+  "name": "triage-flow-agents",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "mastra dev",
+    "build": "mastra build"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^1.3.0",
+    "@ai-sdk/anthropic": "^1.2.0",
+    "@mastra/core": "^0.24.9",
+    "@mastra/memory": "^0.15.13",
+    "@mastra/libsql": "^0.16.4",
+    "@mastra/loggers": "^0.10.19",
+    "dotenv": "^16.4.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0",
+    "@types/node": "^20.17.0",
+    "mastra": "^0.18.9"
+  }
+}

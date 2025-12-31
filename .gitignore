@@ -212,3 +212,7 @@ CLAUDE.md
 *.md
 
 .node_modules/
+
+# Mastra build artifacts
+mastra/.mastra/
+mastra/pnpm-lock.yaml
