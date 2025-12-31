@@ -197,10 +197,12 @@ htmlcov/
 # Embedding cache
 .embedding_cache/
 
-# Index files/folders
-index*
-index_*
+# Index files/folders (RAG index caches, not TypeScript barrel exports)
+index/
+index_*/
 .index_cache/
+# Allow TypeScript barrel exports
+!**/index.ts
 
 
 # cursor rules 
