@@ -299,10 +299,15 @@ export class CodebaseRag {
       filePatterns.push(...globMatch.map((p) => `**/${p}`));
     }
 
-    // Extract extension patterns
+    // Extract extension patterns (e.g., ".ts" in "find .ts files")
     const extMatch = query.match(/\.(\w+)\b/g);
-    if (extMatch && !isFileQuery) {
-      // Only use as filter if not explicitly a file query
+    if (extMatch) {
+      // Add extension patterns as glob patterns
+      for (const ext of extMatch) {
+        if (!filePatterns.some((p) => p.includes(ext))) {
+          filePatterns.push(`**/*${ext}`);
+        }
+      }
     }
 
     // Extract keywords

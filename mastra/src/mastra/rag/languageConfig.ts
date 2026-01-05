@@ -269,6 +269,20 @@ export const LANGUAGE_CONFIG: Record<string, LanguageConfigEntry> = {
     displayName: "Svelte",
     description: "A radical new approach to building user interfaces.",
   },
+  groovy: {
+    extensions: [".groovy", ".gradle"],
+    docPattern: "/\\*\\*.*?\\*/|//.*?$",
+    importPattern: "^import\\s+([\\w\\.]+)",
+    displayName: "Groovy",
+    description: "A powerful, optionally typed dynamic language for the JVM.",
+  },
+  csharp: {
+    extensions: [".cs"],
+    docPattern: "///.*?$|/\\*\\*.*?\\*/",
+    importPattern: "^using\\s+([\\w\\.]+)",
+    displayName: "C#",
+    description: "A modern, object-oriented programming language developed by Microsoft.",
+  },
 };
 
 // Extension to language lookup map (built once)

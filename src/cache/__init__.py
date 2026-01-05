@@ -1,30 +1,20 @@
-# Cache package for Triage.Flow
-from .redis_cache_manager import (
-    redis_manager,
-    rag_cache,
-    response_cache, 
-    folder_cache,
-    issue_cache,
-    issue_analysis_cache,
-    cache_rag_result,
-    cache_response,
-    cleanup_caches_periodically,
-    initialize_redis_cache,
-    CacheLayer,
-    EnhancedCacheManager
-)
+"""
+DEPRECATED: This module has been replaced by TypeScript in mastra/src/mastra/context/
 
-__all__ = [
-    "redis_manager",
-    "rag_cache", 
-    "response_cache",
-    "folder_cache",
-    "issue_cache",
-    "issue_analysis_cache",
-    "cache_rag_result",
-    "cache_response",
-    "cleanup_caches_periodically",
-    "initialize_redis_cache",
-    "CacheLayer",
-    "EnhancedCacheManager"
-] 
+These are stub exports to prevent import errors during migration.
+Actual implementation is in: mastra/src/mastra/context/contextCache.ts
+"""
+
+from typing import Any, Optional
+
+
+# Stub cache for issue analysis
+issue_analysis_cache: Optional[Any] = None
+
+
+def get_redis_client(*args, **kwargs):
+    """DEPRECATED: Redis has been replaced by TTL cache in TypeScript."""
+    raise NotImplementedError(
+        "Redis cache has been migrated to TypeScript. "
+        "Use ContextCache from mastra/src/mastra/context/ instead."
+    )

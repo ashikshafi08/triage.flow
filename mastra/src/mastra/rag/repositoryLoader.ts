@@ -11,11 +11,7 @@ import * as path from "path";
 import * as os from "os";
 import { simpleGit, SimpleGit } from "simple-git";
 import { glob } from "glob";
-import {
-  getAllExtensions,
-  getLanguageMetadata,
-  isSupportedExtension,
-} from "./languageConfig";
+import { getAllExtensions, getLanguageMetadata } from "./languageConfig";
 import type { RepoInfo, LoadedFile, LoadOptions } from "./types";
 
 // Default patterns to exclude
