@@ -219,3 +219,11 @@ index_*/
 # Mastra build artifacts
 mastra/.mastra/
 mastra/pnpm-lock.yaml
+
+# Agent-generated reference files (internal docs, not for repo)
+*_AGENT*.md
+*_REPORT.md
+*_SUMMARY*.md
+RAG_CONSOLIDATION_COMPLETE.md
+.git-commit-msg.txt
+scripts/update_rag_imports.py
