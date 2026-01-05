@@ -5,7 +5,8 @@ import logging
 from typing import Optional
 from .api.middleware import setup_cors
 from .api.dependencies import session_manager
-from .cache import cleanup_caches_periodically, initialize_redis_cache
+# DEPRECATED: cache has been migrated to TypeScript in mastra/src/mastra/context/
+# from .cache import cleanup_caches_periodically, initialize_redis_cache
 from .chunk_store import ChunkStoreFactory
 
 # Import routers
@@ -44,12 +45,11 @@ async def cleanup_sessions_periodically():
 
 @app.on_event("startup")
 async def startup_event():
-    # Initialize Redis cache system
-    await initialize_redis_cache()
+    # NOTE: Redis cache has been migrated to TypeScript
+    # Cache initialization now handled by Mastra ContextCache
     
     # Start background tasks
     asyncio.create_task(cleanup_sessions_periodically())
-    asyncio.create_task(cleanup_caches_periodically())
     
     # Initialize chunk store
     ChunkStoreFactory.get_instance()
@@ -58,38 +58,11 @@ async def startup_event():
 async def root():
     return {"message": "GH Issue Prompt API"}
 
-@app.get("/cache-stats")
-async def get_cache_statistics():
-    """Get enhanced cache statistics for monitoring performance"""
-    from .cache import rag_cache, response_cache, folder_cache, issue_cache
-    from .config import settings
-    
-    return {
-        "rag_cache": rag_cache.get_stats(),
-        "response_cache": response_cache.get_stats(),
-        "folder_cache": folder_cache.get_stats(),
-        "issue_cache": issue_cache.get_stats(),
-        "cache_enabled": settings.CACHE_ENABLED,
-        "redis_url": settings.REDIS_URL,
-        "feature_flags": {
-            "rag_caching": settings.ENABLE_RAG_CACHING,
-            "response_caching": settings.ENABLE_RESPONSE_CACHING,
-            "smart_sizing": settings.ENABLE_SMART_SIZING,
-            "repo_summaries": settings.ENABLE_REPO_SUMMARIES,
-            "prompt_caching": settings.ENABLE_PROMPT_CACHING
-        },
-        "prompt_caching": {
-            "enabled": settings.ENABLE_PROMPT_CACHING,
-            "min_tokens": settings.PROMPT_CACHE_MIN_TOKENS,
-            "provider": settings.llm_provider
-        }
-    }
-
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Cleanup Redis connections on shutdown"""
-    from .cache import redis_manager
-    await redis_manager.close()
+    """Cleanup on shutdown"""
+    # NOTE: Redis cleanup removed - TypeScript handles cleanup now
+    pass
 
 if __name__ == "__main__":
     import uvicorn
