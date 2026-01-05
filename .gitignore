@@ -155,6 +155,7 @@ venv.bak/
 .faiss_commits*
 .faiss_index_*
 storage/
+!mastra/src/mastra/storage/
 
 node_modules/
 

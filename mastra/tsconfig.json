@@ -8,7 +8,21 @@
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "outDir": "dist"
+    "outDir": "dist",
+    "baseUrl": ".",
+    "paths": {
+      "@/rag/*": ["src/mastra/rag/*"],
+      "@/context/*": ["src/mastra/context/*"],
+      "@/storage/*": ["src/mastra/storage/*"],
+      "@/agents/*": ["src/mastra/agents/*"],
+      "@/tools/*": ["src/mastra/tools/*"],
+      "@/workflows/*": ["src/mastra/workflows/*"],
+      "@/memory/*": ["src/mastra/memory/*"],
+      "@/server/*": ["src/mastra/server/*"],
+      "@/types/*": ["src/mastra/types/*"]
+    },
+    "resolveJsonModule": true
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", ".mastra"]
 }
