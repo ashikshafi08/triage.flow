@@ -1,22 +1,8 @@
-/**
- * Execution Tracker
- *
- * Tracks tool executions and their relationships.
- *
- * @module context/executionTracker
- */
+// Tracks tool executions and their relationships.
 
-import type {
-  ToolExecution,
-  FileMetadata,
-  Conflict,
-  ConflictResolution,
-} from "./types";
-import {
-  TOOL_RELATIONSHIPS,
-  normalizeParameters,
-  areToolsRelated,
-} from "./toolRelationships";
+import type { ToolExecution, FileMetadata, Conflict, ConflictResolution } from "./types";
+import { TOOL_RELATIONSHIPS, normalizeParameters, areToolsRelated } from "./toolRelationships";
+import { inferLanguage } from "../utils/language";
 
 /**
  * Summary of tracked executions.
@@ -63,10 +49,7 @@ export class ExecutionTracker {
     const allFiles = [...filesFromParams, ...filesFromResult];
 
     // Find related executions
-    const relatedExecutions = this.findRelatedExecutions(
-      toolName,
-      normalizedParams
-    );
+    const relatedExecutions = this.findRelatedExecutions(toolName, normalizedParams);
 
     // Extract decisions from result
     const decisionsMade = this.extractDecisions(toolName, result);
@@ -91,7 +74,7 @@ export class ExecutionTracker {
       if (!this.filesAccessed.has(file)) {
         this.filesAccessed.set(file, {
           path: file,
-          language: this.inferLanguage(file),
+          language: inferLanguage(file),
           discoveredBy: toolName,
           discoveredAt: new Date(),
         });
@@ -109,10 +92,7 @@ export class ExecutionTracker {
   /**
    * Find related executions for a tool call.
    */
-  findRelatedExecutions(
-    toolName: string,
-    parameters: Record<string, unknown>
-  ): ToolExecution[] {
+  findRelatedExecutions(toolName: string, parameters: Record<string, unknown>): ToolExecution[] {
     const related: ToolExecution[] = [];
 
     for (const execution of this.executions) {
@@ -172,10 +152,7 @@ export class ExecutionTracker {
     const relatedTools = TOOL_RELATIONSHIPS[toolName] || [];
 
     for (const execution of this.executions) {
-      if (
-        execution.toolName === toolName ||
-        relatedTools.includes(execution.toolName)
-      ) {
+      if (execution.toolName === toolName || relatedTools.includes(execution.toolName)) {
         for (const [key, value] of Object.entries(execution.decisionsMade)) {
           relevant[key] = value;
         }
@@ -201,10 +178,7 @@ export class ExecutionTracker {
         // Check for conflicting decisions
         for (const [key, newValue] of Object.entries(newDecisions)) {
           const prevValue = execution.decisionsMade[key];
-          if (
-            prevValue !== undefined &&
-            JSON.stringify(prevValue) !== JSON.stringify(newValue)
-          ) {
+          if (prevValue !== undefined && JSON.stringify(prevValue) !== JSON.stringify(newValue)) {
             conflicts.push({
               type: "decision",
               key,
@@ -238,10 +212,7 @@ export class ExecutionTracker {
           break;
         case "merge":
           // For merge, try to combine values if they're arrays or objects
-          if (
-            Array.isArray(conflict.previousValue) &&
-            Array.isArray(conflict.newValue)
-          ) {
+          if (Array.isArray(conflict.previousValue) && Array.isArray(conflict.newValue)) {
             resolved[conflict.key] = [
               ...new Set([...conflict.previousValue, ...conflict.newValue]),
             ];
@@ -321,8 +292,7 @@ export class ExecutionTracker {
     const uniqueFiles = new Set<string>();
 
     for (const execution of this.executions) {
-      toolCounts[execution.toolName] =
-        (toolCounts[execution.toolName] || 0) + 1;
+      toolCounts[execution.toolName] = (toolCounts[execution.toolName] || 0) + 1;
       totalDuration += execution.executionTime;
       for (const file of execution.filesAccessed) {
         uniqueFiles.add(file);
@@ -351,9 +321,7 @@ export class ExecutionTracker {
   /**
    * Extract file paths from parameters.
    */
-  private extractFilesFromParams(
-    parameters: Record<string, unknown>
-  ): string[] {
+  private extractFilesFromParams(parameters: Record<string, unknown>): string[] {
     const files: string[] = [];
     const fileKeys = ["filePath", "path", "file", "directoryPath", "directory"];
 
@@ -416,10 +384,7 @@ export class ExecutionTracker {
   /**
    * Extract decisions from result.
    */
-  private extractDecisions(
-    toolName: string,
-    result: unknown
-  ): Record<string, unknown> {
+  private extractDecisions(toolName: string, result: unknown): Record<string, unknown> {
     const decisions: Record<string, unknown> = {};
 
     if (typeof result !== "object" || result === null) {
@@ -429,13 +394,7 @@ export class ExecutionTracker {
     const resultObj = result as Record<string, unknown>;
 
     // Look for decision-related fields
-    const decisionFields = [
-      "decision",
-      "decisions",
-      "recommendation",
-      "analysis",
-      "conclusion",
-    ];
+    const decisionFields = ["decision", "decisions", "recommendation", "analysis", "conclusion"];
 
     for (const field of decisionFields) {
       if (resultObj[field] !== undefined) {
@@ -463,25 +422,5 @@ export class ExecutionTracker {
     }
 
     return false;
-  }
-
-  /**
-   * Infer language from file path.
-   */
-  private inferLanguage(filePath: string): string {
-    const ext = filePath.split(".").pop()?.toLowerCase();
-    const langMap: Record<string, string> = {
-      ts: "typescript",
-      tsx: "typescript",
-      js: "javascript",
-      jsx: "javascript",
-      py: "python",
-      go: "go",
-      rs: "rust",
-      java: "java",
-      rb: "ruby",
-      md: "markdown",
-    };
-    return langMap[ext || ""] || "unknown";
   }
 }

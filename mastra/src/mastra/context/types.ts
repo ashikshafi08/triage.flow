@@ -1,13 +1,6 @@
-/**
- * Context Types
- *
- * TypeScript interfaces for context management.
- *
- * @module context/types
- */
+// TypeScript interfaces for context management.
 
-/**
- * Record of a single tool execution.
+/** Record of a single tool execution.
  */
 export interface ToolExecution {
   id: string;

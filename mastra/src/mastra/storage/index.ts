@@ -1,11 +1,4 @@
-/**
- * Storage Module
- *
- * LibSQL storage utilities for sessions, embeddings, and caching.
- * Replaces Python enhanced_persistence.py and redis_cache_manager.py.
- *
- * @module storage
- */
+// Storage: LibSQL utilities for sessions, embeddings, and caching.
 
 // Configuration
 export {

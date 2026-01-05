@@ -1,11 +1,6 @@
-/**
- * Storage Configuration
- *
- * Environment-based configuration for LibSQL storage and vector operations.
- * Replaces Python config.py storage sections.
- *
- * @module storage/config
- */
+// Environment-based configuration for LibSQL storage and vector operations.
+
+import { createSingleton } from "../utils/singleton";
 
 export interface StorageConfig {
   // Database URLs
@@ -53,21 +48,11 @@ export function loadStorageConfig(): StorageConfig {
 
     // Vector search
     vectorTopKDefault: parseInt(process.env.VECTOR_TOP_K_DEFAULT || "10"),
-    vectorMinScoreDefault: parseFloat(
-      process.env.VECTOR_MIN_SCORE_DEFAULT || "0.3"
-    ),
+    vectorMinScoreDefault: parseFloat(process.env.VECTOR_MIN_SCORE_DEFAULT || "0.3"),
   };
 }
 
-// Singleton config instance
-let _config: StorageConfig | null = null;
-
-export function getStorageConfig(): StorageConfig {
-  if (!_config) {
-    _config = loadStorageConfig();
-  }
-  return _config;
-}
+export const getStorageConfig = createSingleton(loadStorageConfig);
 
 // Vector index names used across the application
 export const VECTOR_INDEXES = {
@@ -76,5 +61,4 @@ export const VECTOR_INDEXES = {
   DOC_EMBEDDINGS: "doc_embeddings",
 } as const;
 
-export type VectorIndexName =
-  (typeof VECTOR_INDEXES)[keyof typeof VECTOR_INDEXES];
+export type VectorIndexName = (typeof VECTOR_INDEXES)[keyof typeof VECTOR_INDEXES];

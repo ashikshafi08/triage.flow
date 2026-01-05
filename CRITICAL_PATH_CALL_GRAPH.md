@@ -387,14 +387,14 @@ Total: ~1,335 LOC
 # Tier 1: Frontend-facing modules
 session_manager.py
     ├── from .github_client import GitHubIssueClient
-    ├── from .agentic_rag import AgenticRAGSystem
+    ├── from .unified_rag import AgenticRAGSystem
     ├── from .config import settings
     └── from .cache.redis_cache_manager import EnhancedCacheManager
 
-agentic_rag.py
-    ├── from .new_rag import LocalRepoContextExtractor
+unified_rag.py (consolidated from new_rag.py, issue_rag.py, agentic_rag.py)
+    ├── from .local_repo_loader import clone_repo_to_temp_persistent
     ├── from .agent_tools import AgenticCodebaseExplorer
-    ├── from .issue_rag import IssueAwareRAG
+    ├── from .github_client import GitHubIssueClient
     └── from .commit_index import CommitIndexManager
 
 agent_tools/core.py (AgenticCodebaseExplorer)

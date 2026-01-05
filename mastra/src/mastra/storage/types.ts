@@ -1,11 +1,4 @@
-/**
- * Storage Types
- *
- * TypeScript interfaces for storage operations.
- * Extends the shared types with storage-specific interfaces.
- *
- * @module storage/types
- */
+// TypeScript interfaces for storage operations.
 
 import type { Session, SearchResult } from "../types";
 
@@ -86,8 +79,7 @@ export const CACHE_NAMESPACES = {
   EMBEDDING: "embedding",
 } as const;
 
-export type CacheNamespace =
-  (typeof CACHE_NAMESPACES)[keyof typeof CACHE_NAMESPACES];
+export type CacheNamespace = (typeof CACHE_NAMESPACES)[keyof typeof CACHE_NAMESPACES];
 
 /**
  * Vector embedding metadata stored alongside vectors.

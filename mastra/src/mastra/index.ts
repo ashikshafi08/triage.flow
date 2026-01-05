@@ -1,14 +1,10 @@
-import "dotenv/config"; // Explicit dotenv load (per audit recommendation)
+import "dotenv/config";
 
 import { Mastra } from "@mastra/core/mastra";
 import { PinoLogger } from "@mastra/loggers";
 import { LibSQLStore } from "@mastra/libsql";
 
-import {
-  codeAnalysisAgent,
-  issueResolutionAgent,
-  orchestratorAgent,
-} from "./agents";
+import { codeAnalysisAgent, issueResolutionAgent, orchestratorAgent } from "./agents";
 
 export const mastra = new Mastra({
   agents: {

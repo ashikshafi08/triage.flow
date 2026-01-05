@@ -1,6 +1,6 @@
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
-import { fetchWithTimeout, PYTHON_API } from "./httpClient";
+import { fetchWithTimeout, PYTHON_API, assertResponseOk } from "./httpClient";
 
 export const analyzeIssue = createTool({
   id: "analyze-issue",
@@ -9,10 +9,7 @@ export const analyzeIssue = createTool({
   inputSchema: z.object({
     issueUrl: z
       .string()
-      .describe(
-        "Full GitHub issue URL (e.g., https://github.com/owner/repo/issues/123)"
-      ),
-    // NOTE: repoUrl removed - Python API extracts it from issue URL
+      .describe("Full GitHub issue URL (e.g., https://github.com/owner/repo/issues/123)"),
   }),
   outputSchema: z.object({
     sessionId: z.string().optional(),
@@ -42,11 +39,7 @@ export const analyzeIssue = createTool({
       60000 // 60s timeout for analysis
     );
 
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => response.statusText);
-      throw new Error(`Analysis failed: ${errorText}`);
-    }
-
+    await assertResponseOk(response, "Analysis");
     return response.json();
   },
 });

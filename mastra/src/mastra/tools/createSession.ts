@@ -1,6 +1,6 @@
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
-import { fetchWithTimeout, PYTHON_API } from "./httpClient";
+import { fetchWithTimeout, PYTHON_API, assertResponseOk } from "./httpClient";
 
 export const createSession = createTool({
   id: "create-session",
@@ -9,9 +9,7 @@ export const createSession = createTool({
   inputSchema: z.object({
     repoUrl: z
       .string()
-      .describe(
-        "Full GitHub repository URL (e.g., https://github.com/owner/repo)"
-      ),
+      .describe("Full GitHub repository URL (e.g., https://github.com/owner/repo)"),
   }),
   outputSchema: z.object({
     sessionId: z.string(),
@@ -20,20 +18,13 @@ export const createSession = createTool({
   }),
   execute: async ({ context }) => {
     const { repoUrl } = context;
-    const response = await fetchWithTimeout(
-      `${PYTHON_API}/assistant/sessions`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repo_url: repoUrl }),
-      }
-    );
+    const response = await fetchWithTimeout(`${PYTHON_API}/assistant/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repo_url: repoUrl }),
+    });
 
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => response.statusText);
-      throw new Error(`Session creation failed: ${errorText}`);
-    }
-
+    await assertResponseOk(response, "Session creation");
     const data = await response.json();
     return {
       sessionId: data.session_id,

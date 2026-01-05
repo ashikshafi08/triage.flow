@@ -1,6 +1,6 @@
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
-import { fetchWithTimeout, PYTHON_API } from "./httpClient";
+import { fetchWithTimeout, PYTHON_API, assertResponseOk } from "./httpClient";
 
 export const getSessionStatus = createTool({
   id: "get-session-status",
@@ -16,15 +16,9 @@ export const getSessionStatus = createTool({
   }),
   execute: async ({ context }) => {
     const { sessionId } = context;
-    const response = await fetchWithTimeout(
-      `${PYTHON_API}/assistant/sessions/${sessionId}/status`
-    );
+    const response = await fetchWithTimeout(`${PYTHON_API}/assistant/sessions/${sessionId}/status`);
 
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => response.statusText);
-      throw new Error(`Status check failed: ${errorText}`);
-    }
-
+    await assertResponseOk(response, "Status check");
     const data = await response.json();
     return {
       sessionId: data.session_id,

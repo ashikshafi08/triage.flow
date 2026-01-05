@@ -1,13 +1,7 @@
-/**
- * Session Storage
- *
- * LibSQL-based session management, file checksums, and caching.
- * Replaces Python enhanced_persistence.py and redis_cache_manager.py.
- *
- * @module storage/sessionStorage
- */
+// LibSQL-based session management, file checksums, and caching.
 
 import { createClient, type Client } from "@libsql/client";
+import { createSingleton } from "../utils/singleton";
 import { getStorageConfig } from "./config";
 import type {
   Session,
@@ -199,10 +193,7 @@ export class SessionStorage {
   /**
    * Update session fields.
    */
-  async updateSession(
-    sessionId: string,
-    updates: UpdateSessionParams
-  ): Promise<Session | null> {
+  async updateSession(sessionId: string, updates: UpdateSessionParams): Promise<Session | null> {
     await this.init();
 
     const now = new Date().toISOString();
@@ -291,14 +282,7 @@ export class SessionStorage {
         (session_id, file_path, file_size, file_mtime, checksum, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
       `,
-      args: [
-        sessionId,
-        cs.filePath,
-        cs.fileSize,
-        cs.fileMtime,
-        cs.checksum,
-        now,
-      ],
+      args: [sessionId, cs.filePath, cs.fileSize, cs.fileMtime, cs.checksum, now],
     }));
 
     await this.client.batch(statements);
@@ -331,10 +315,7 @@ export class SessionStorage {
   /**
    * Detect file changes by comparing current files to stored checksums.
    */
-  async detectChanges(
-    sessionId: string,
-    currentFiles: FileInfo[]
-  ): Promise<ChangeSet> {
+  async detectChanges(sessionId: string, currentFiles: FileInfo[]): Promise<ChangeSet> {
     const storedChecksums = await this.getFileChecksums(sessionId);
     const storedMap = new Map(storedChecksums.map((c) => [c.filePath, c]));
     const currentPaths = new Set(currentFiles.map((f) => f.path));
@@ -348,10 +329,7 @@ export class SessionStorage {
       const stored = storedMap.get(file.path);
       if (!stored) {
         added.push(file.path);
-      } else if (
-        stored.fileSize !== file.size ||
-        stored.fileMtime !== file.mtime
-      ) {
+      } else if (stored.fileSize !== file.size || stored.fileMtime !== file.mtime) {
         modified.push(file.path);
       } else {
         unchanged.push(file.path);
@@ -370,10 +348,7 @@ export class SessionStorage {
   /**
    * Delete checksums for specific files.
    */
-  async deleteFileChecksums(
-    sessionId: string,
-    filePaths: string[]
-  ): Promise<void> {
+  async deleteFileChecksums(sessionId: string, filePaths: string[]): Promise<void> {
     await this.init();
 
     if (filePaths.length === 0) return;
@@ -534,12 +509,4 @@ export class SessionStorage {
   }
 }
 
-// Singleton instance
-let _sessionStorage: SessionStorage | null = null;
-
-export function getSessionStorage(): SessionStorage {
-  if (!_sessionStorage) {
-    _sessionStorage = new SessionStorage();
-  }
-  return _sessionStorage;
-}
+export const getSessionStorage = createSingleton(() => new SessionStorage());

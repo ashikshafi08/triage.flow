@@ -1,10 +1,4 @@
-/**
- * Shared TypeScript Types
- *
- * Common interfaces and type definitions used across modules.
- *
- * @module types
- */
+// Common interfaces and type definitions used across modules.
 
 // Session types
 export interface Session {

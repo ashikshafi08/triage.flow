@@ -1,10 +1,4 @@
-/**
- * Context Cache
- *
- * TTL-based caching with LRU eviction for tool results.
- *
- * @module context/contextCache
- */
+// TTL-based caching with LRU eviction for tool results.
 
 import type { CacheEntry, CacheStats } from "./types";
 
@@ -65,10 +59,7 @@ export class ContextCache {
   /**
    * Get a cached value for a tool call.
    */
-  getForTool(
-    toolName: string,
-    parameters: Record<string, unknown>
-  ): unknown | undefined {
+  getForTool(toolName: string, parameters: Record<string, unknown>): unknown | undefined {
     const key = this.generateKey(toolName, parameters);
     return this.get(key);
   }
@@ -142,10 +133,7 @@ export class ContextCache {
   /**
    * Check if a tool call is cached.
    */
-  hasForTool(
-    toolName: string,
-    parameters: Record<string, unknown>
-  ): boolean {
+  hasForTool(toolName: string, parameters: Record<string, unknown>): boolean {
     const key = this.generateKey(toolName, parameters);
     return this.has(key);
   }
@@ -160,10 +148,7 @@ export class ContextCache {
   /**
    * Delete a cached tool call.
    */
-  deleteForTool(
-    toolName: string,
-    parameters: Record<string, unknown>
-  ): boolean {
+  deleteForTool(toolName: string, parameters: Record<string, unknown>): boolean {
     const key = this.generateKey(toolName, parameters);
     return this.cache.delete(key);
   }
@@ -244,10 +229,7 @@ export class ContextCache {
   /**
    * Generate a cache key from tool name and parameters.
    */
-  private generateKey(
-    toolName: string,
-    parameters: Record<string, unknown>
-  ): string {
+  private generateKey(toolName: string, parameters: Record<string, unknown>): string {
     // Sort keys for consistent hashing
     const sortedParams = Object.keys(parameters)
       .sort()

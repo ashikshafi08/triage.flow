@@ -1,10 +1,4 @@
-/**
- * RAG Types
- *
- * TypeScript interfaces for the RAG module.
- *
- * @module rag/types
- */
+// TypeScript interfaces for the RAG module.
 
 import type { VectorIndexName } from "../storage";
 

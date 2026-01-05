@@ -1,19 +1,14 @@
-/**
- * Code Chunker
- *
- * Language-aware document chunking using Mastra RAG.
- *
- * @module rag/codeChunker
- */
+// Language-aware document chunking using Mastra RAG.
 
 import { MDocument } from "@mastra/rag";
+import type { ChunkParams, RecursiveChunkOptions } from "@mastra/rag";
 import type { LoadedFile, DocumentChunk, ChunkOptions } from "./types";
 
 // Default chunk settings
 const DEFAULT_MAX_SIZE = 1500;
 const DEFAULT_OVERLAP = 200;
 
-// Valid chunking strategies
+// Chunking strategies supported by Mastra RAG
 type ChunkStrategy = "recursive" | "markdown" | "html" | "json" | "character";
 
 /**
@@ -39,30 +34,14 @@ function getChunkingStrategy(language: string): {
     case "typescript":
       return {
         strategy: "recursive",
-        separators: [
-          "\nfunction ",
-          "\nconst ",
-          "\nexport ",
-          "\nclass ",
-          "\n\n",
-          "\n",
-          " ",
-        ],
+        separators: ["\nfunction ", "\nconst ", "\nexport ", "\nclass ", "\n\n", "\n", " "],
       };
     case "java":
     case "kotlin":
     case "scala":
       return {
         strategy: "recursive",
-        separators: [
-          "\npublic ",
-          "\nprivate ",
-          "\nprotected ",
-          "\nclass ",
-          "\n\n",
-          "\n",
-          " ",
-        ],
+        separators: ["\npublic ", "\nprivate ", "\nprotected ", "\nclass ", "\n\n", "\n", " "],
       };
     case "go":
       return {
@@ -113,18 +92,25 @@ export async function chunkFile(
   // Use the strategy from options or fallback
   const selectedStrategy = options.strategy || strategy;
 
-  // Build chunk options - use type assertion for strategy union compatibility
-  const chunkOptions = {
-    strategy: selectedStrategy,
-    maxSize,
-    overlap,
-    ...(separators && { separators }),
-    addStartIndex: true,
-  };
+  // Build typed chunk params based on strategy
+  const chunkParams: ChunkParams =
+    selectedStrategy === "recursive"
+      ? ({
+          strategy: "recursive",
+          maxSize,
+          overlap,
+          separators,
+          addStartIndex: true,
+        } satisfies { strategy: "recursive" } & RecursiveChunkOptions)
+      : selectedStrategy === "markdown"
+        ? { strategy: "markdown", maxSize, overlap, addStartIndex: true }
+        : selectedStrategy === "html"
+          ? { strategy: "html", maxSize, overlap, addStartIndex: true, headers: [] }
+          : selectedStrategy === "json"
+            ? { strategy: "json", maxSize, overlap, addStartIndex: true }
+            : { strategy: "character", maxSize, overlap, addStartIndex: true };
 
-  // Chunk the document - returns array of Document objects
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const chunkedDocs = await doc.chunk(chunkOptions as any);
+  const chunkedDocs = await doc.chunk(chunkParams);
 
   // Convert to DocumentChunk format
   const chunks: DocumentChunk[] = chunkedDocs.map(
@@ -175,16 +161,9 @@ export async function chunkFiles(
   return allChunks;
 }
 
-/**
- * Estimate the number of chunks a file will produce.
- */
-export function estimateChunkCount(
-  content: string,
-  maxSize: number = DEFAULT_MAX_SIZE
-): number {
-  // Simple estimation based on content length
-  return Math.max(1, Math.ceil(content.length / maxSize));
-}
+/** Estimate the number of chunks a file will produce. */
+export const estimateChunkCount = (content: string, maxSize = DEFAULT_MAX_SIZE) =>
+  Math.max(1, Math.ceil(content.length / maxSize));
 
 /**
  * Get chunk statistics for a set of files.

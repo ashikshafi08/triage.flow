@@ -1,11 +1,4 @@
-/**
- * Context Management Module
- *
- * Handles tool execution tracking, context sharing between agents,
- * and cache invalidation. Replaces Python context_manager.py.
- *
- * @module context
- */
+// Context: Tool execution tracking, context sharing, and cache invalidation.
 
 // Types
 export type {

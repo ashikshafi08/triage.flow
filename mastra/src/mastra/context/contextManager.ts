@@ -1,13 +1,7 @@
-/**
- * Context Manager
- *
- * Main class for managing execution context across tool calls.
- * Replaces Python context_manager.py.
- *
- * @module context/contextManager
- */
+// Main class for managing execution context across tool calls.
 
 import { ExecutionTracker, type TrackerSummary } from "./executionTracker";
+import { inferLanguage } from "../utils/language";
 import { ContextCache } from "./contextCache";
 import type {
   ExecutionContext,
@@ -119,24 +113,15 @@ export class ContextManager {
   /**
    * Get context relevant to a tool before execution.
    */
-  getContextForTool(
-    toolName: string,
-    parameters: Record<string, unknown>
-  ): ContextForTool {
+  getContextForTool(toolName: string, parameters: Record<string, unknown>): ContextForTool {
     // Check cache first
     const cachedResult = this.cache.getForTool(toolName, parameters);
 
     // Get related executions
-    const relatedExecutions = this.executionTracker.findRelatedExecutions(
-      toolName,
-      parameters
-    );
+    const relatedExecutions = this.executionTracker.findRelatedExecutions(toolName, parameters);
 
     // Get relevant files
-    const relevantFiles = this.executionTracker.getRelevantFiles(
-      toolName,
-      parameters
-    );
+    const relevantFiles = this.executionTracker.getRelevantFiles(toolName, parameters);
 
     // Merge with discovered files from current context
     if (this.currentContext) {
@@ -148,16 +133,10 @@ export class ContextManager {
     }
 
     // Get relevant decisions
-    const relevantDecisions = this.executionTracker.getRelevantDecisions(
-      toolName
-    );
+    const relevantDecisions = this.executionTracker.getRelevantDecisions(toolName);
 
     // Check for potential conflicts
-    const hasConflicts = this.checkForPotentialConflicts(
-      toolName,
-      parameters,
-      relatedExecutions
-    );
+    const hasConflicts = this.checkForPotentialConflicts(toolName, parameters, relatedExecutions);
 
     return {
       sessionId: this.sessionId,
@@ -190,11 +169,7 @@ export class ContextManager {
     );
 
     // Update cache
-    this.cache.setForTool(
-      options.toolName,
-      options.parameters,
-      options.result
-    );
+    this.cache.setForTool(options.toolName, options.parameters, options.result);
 
     // Update current context
     this.updateContextFromExecution(execution);
@@ -241,9 +216,7 @@ export class ContextManager {
       query: this.currentContext?.query || "",
       totalExecutions: trackerSummary.totalExecutions,
       totalDuration: trackerSummary.totalDuration,
-      filesDiscovered:
-        this.currentContext?.discoveredFiles.size ||
-        trackerSummary.uniqueFiles,
+      filesDiscovered: this.currentContext?.discoveredFiles.size || trackerSummary.uniqueFiles,
       componentsAnalyzed: this.currentContext?.analyzedComponents.size || 0,
       decisionsMade: this.currentContext?.decisionsMade.size || 0,
       conflictsResolved: this.currentContext?.conflictResolutions.length || 0,
@@ -297,11 +270,7 @@ export class ContextManager {
   /**
    * Detect conflicts for a potential execution.
    */
-  detectConflicts(
-    toolName: string,
-    parameters: Record<string, unknown>,
-    result: unknown
-  ) {
+  detectConflicts(toolName: string, parameters: Record<string, unknown>, result: unknown) {
     return this.executionTracker.detectConflicts(toolName, parameters, result);
   }
 
@@ -323,11 +292,7 @@ export class ContextManager {
 
     if (conflicts.length === 0) return null;
 
-    const resolution = this.executionTracker.resolveConflicts(
-      executionId,
-      conflicts,
-      strategy
-    );
+    const resolution = this.executionTracker.resolveConflicts(executionId, conflicts, strategy);
 
     // Add to context
     if (this.currentContext) {
@@ -351,10 +316,7 @@ export class ContextManager {
   ): boolean {
     // Check if any related execution made decisions that might conflict
     for (const execution of relatedExecutions) {
-      if (
-        execution.toolName === toolName &&
-        Object.keys(execution.decisionsMade).length > 0
-      ) {
+      if (execution.toolName === toolName && Object.keys(execution.decisionsMade).length > 0) {
         return true;
       }
     }
@@ -375,7 +337,7 @@ export class ContextManager {
       if (!this.currentContext.discoveredFiles.has(filePath)) {
         this.currentContext.discoveredFiles.set(filePath, {
           path: filePath,
-          language: this.inferLanguage(filePath),
+          language: inferLanguage(filePath),
           discoveredBy: execution.toolName,
           discoveredAt: execution.timestamp,
         });
@@ -387,31 +349,9 @@ export class ContextManager {
       this.currentContext.decisionsMade.set(key, value);
     }
   }
-
-  /**
-   * Infer language from file path.
-   */
-  private inferLanguage(filePath: string): string {
-    const ext = filePath.split(".").pop()?.toLowerCase();
-    const langMap: Record<string, string> = {
-      ts: "typescript",
-      tsx: "typescript",
-      js: "javascript",
-      jsx: "javascript",
-      py: "python",
-      go: "go",
-      rs: "rust",
-      java: "java",
-      rb: "ruby",
-      md: "markdown",
-    };
-    return langMap[ext || ""] || "unknown";
-  }
 }
 
 // Factory function
-export function createContextManager(
-  options: ContextManagerOptions
-): ContextManager {
+export function createContextManager(options: ContextManagerOptions): ContextManager {
   return new ContextManager(options);
 }

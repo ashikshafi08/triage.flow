@@ -1,24 +1,24 @@
-/**
- * Vector Store
- *
- * LibSQLVector wrapper for embedding storage and similarity search.
- * Replaces Python FAISS-based vector storage.
- *
- * @module storage/vectorStore
- */
+// LibSQLVector wrapper for embedding storage and similarity search.
 
 import { LibSQLVector } from "@mastra/libsql";
-import {
-  getStorageConfig,
-  VECTOR_INDEXES,
-  type VectorIndexName,
-} from "./config";
+import { createSingleton } from "../utils/singleton";
+import { getStorageConfig, VECTOR_INDEXES, type VectorIndexName } from "./config";
 import type {
   EmbeddingMetadata,
   VectorSearchParams,
   VectorSearchResult,
   VectorIndexStats,
 } from "./types";
+
+// Extract LibSQLVector's filter type from its query method
+type LibSQLVectorFilter = Parameters<LibSQLVector["query"]>[0]["filter"];
+
+/** Result of a batch delete operation */
+export interface BatchDeleteResult {
+  deletedCount: number;
+  failedCount: number;
+  failedIds: string[];
+}
 
 /**
  * Vector store manager for embedding operations.
@@ -43,10 +43,7 @@ export class VectorStore {
   /**
    * Ensure an index exists with the correct configuration.
    */
-  async ensureIndex(
-    indexName: VectorIndexName,
-    dimension?: number
-  ): Promise<void> {
+  async ensureIndex(indexName: VectorIndexName, dimension?: number): Promise<void> {
     if (this.initializedIndexes.has(indexName)) return;
 
     const config = getStorageConfig();
@@ -59,11 +56,28 @@ export class VectorStore {
         metric: "cosine",
       });
     } catch (error) {
-      // Index might already exist - check if it's the right dimension
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      
+      // Only treat "already exists" as non-fatal
+      const isAlreadyExistsError =
+        errorMessage.includes("already exists") ||
+        errorMessage.includes("duplicate") ||
+        errorMessage.includes("SQLITE_CONSTRAINT");
+
+      if (!isAlreadyExistsError) {
+        throw new Error(`Failed to create index "${indexName}": ${errorMessage}`);
+      }
+
+      // Verify existing index has correct dimension
       const stats = await this.describeIndex(indexName);
       if (stats && stats.dimension !== dim) {
         throw new Error(
           `Index ${indexName} exists with dimension ${stats.dimension}, expected ${dim}`
+        );
+      }
+      if (!stats) {
+        throw new Error(
+          `Index "${indexName}" creation reported conflict but index doesn't exist. Check database connectivity.`
         );
       }
     }
@@ -121,8 +135,7 @@ export class VectorStore {
       throw new Error("Vectors and metadata arrays must have equal length");
     }
 
-    const generatedIds =
-      ids || vectors.map(() => crypto.randomUUID());
+    const generatedIds = ids || vectors.map(() => crypto.randomUUID());
 
     // Batch in chunks of 100 for memory efficiency
     const BATCH_SIZE = 100;
@@ -145,28 +158,14 @@ export class VectorStore {
   async search(params: VectorSearchParams): Promise<VectorSearchResult[]> {
     const config = getStorageConfig();
 
-    const queryOptions: {
-      indexName: string;
-      queryVector: number[];
-      topK: number;
-      includeVector: boolean;
-      minScore: number;
-      filter?: Record<string, unknown>;
-    } = {
+    const results = await this.store.query({
       indexName: params.indexName,
       queryVector: params.queryVector,
-      topK: params.topK || config.vectorTopKDefault,
-      includeVector: params.includeVector || false,
-      minScore: params.minScore || config.vectorMinScoreDefault,
-    };
-
-    // Only add filter if provided
-    if (params.filter) {
-      queryOptions.filter = params.filter;
-    }
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const results = await this.store.query(queryOptions as any);
+      topK: params.topK ?? config.vectorTopKDefault,
+      includeVector: params.includeVector ?? false,
+      minScore: params.minScore ?? config.vectorMinScoreDefault,
+      filter: params.filter as LibSQLVectorFilter,
+    });
 
     return results.map((r) => ({
       id: r.id,
@@ -195,26 +194,22 @@ export class VectorStore {
 
   /**
    * Delete all embeddings for a session.
+   * Returns details about what was deleted for debugging.
    */
   async deleteBySession(
     indexName: VectorIndexName,
     sessionId: string
-  ): Promise<void> {
+  ): Promise<BatchDeleteResult> {
     // LibSQLVector doesn't have direct bulk delete by filter
-    // We need to query first, then delete individually
+    // Query first, then delete in parallel batches with error tracking
     const results = await this.store.query({
       indexName,
       queryVector: new Array(getStorageConfig().embeddingDimension).fill(0),
-      topK: 10000, // Get all matching
-      filter: { sessionId },
+      topK: 10000,
+      filter: { sessionId } as LibSQLVectorFilter,
     });
 
-    for (const result of results) {
-      await this.store.deleteVector({
-        indexName,
-        id: result.id,
-      });
-    }
+    return this.batchDelete(indexName, results.map((r) => r.id));
   }
 
   /**
@@ -224,36 +219,86 @@ export class VectorStore {
     indexName: VectorIndexName,
     sessionId: string,
     filePaths: string[]
-  ): Promise<void> {
-    if (filePaths.length === 0) return;
+  ): Promise<BatchDeleteResult> {
+    if (filePaths.length === 0) {
+      return { deletedCount: 0, failedCount: 0, failedIds: [] };
+    }
 
-    // Query for each file path and delete
+    // Collect all IDs to delete
+    const idsToDelete: string[] = [];
+
     for (const filePath of filePaths) {
       const results = await this.store.query({
         indexName,
         queryVector: new Array(getStorageConfig().embeddingDimension).fill(0),
         topK: 1000,
-        filter: { sessionId, filePath },
+        filter: { sessionId, filePath } as LibSQLVectorFilter,
       });
+      idsToDelete.push(...results.map((r) => r.id));
+    }
 
-      for (const result of results) {
-        await this.store.deleteVector({
-          indexName,
-          id: result.id,
-        });
+    return this.batchDelete(indexName, idsToDelete);
+  }
+
+  /**
+   * Batch delete with error tracking using Promise.allSettled.
+   * Continues on individual failures and reports results.
+   */
+  private async batchDelete(
+    indexName: VectorIndexName,
+    ids: string[]
+  ): Promise<BatchDeleteResult> {
+    let deletedCount = 0;
+    const failedIds: string[] = [];
+
+    const BATCH_SIZE = 50;
+    for (let i = 0; i < ids.length; i += BATCH_SIZE) {
+      const batch = ids.slice(i, i + BATCH_SIZE);
+      const settlements = await Promise.allSettled(
+        batch.map((id) => this.store.deleteVector({ indexName, id }))
+      );
+
+      for (let j = 0; j < settlements.length; j++) {
+        if (settlements[j].status === "fulfilled") {
+          deletedCount++;
+        } else {
+          failedIds.push(batch[j]);
+        }
       }
     }
+
+    if (failedIds.length > 0) {
+      console.error(
+        `[VectorStore] Partial deletion failure: ${deletedCount} succeeded, ${failedIds.length} failed`,
+        { failedIds: failedIds.slice(0, 10) } // Log first 10 for debugging
+      );
+    }
+
+    return { deletedCount, failedCount: failedIds.length, failedIds };
   }
 
   /**
    * Get index statistics.
+   * Returns null only if the index doesn't exist; throws on other errors.
    */
   async describeIndex(indexName: string): Promise<VectorIndexStats | null> {
     try {
       const stats = await this.store.describeIndex({ indexName });
       return stats as VectorIndexStats;
-    } catch {
-      return null;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      
+      // Only return null for "index not found" errors
+      if (
+        errorMessage.includes("not found") ||
+        errorMessage.includes("does not exist") ||
+        errorMessage.includes("no such")
+      ) {
+        return null;
+      }
+      
+      // All other errors should propagate
+      throw new Error(`Failed to describe index "${indexName}": ${errorMessage}`);
     }
   }
 
@@ -287,12 +332,4 @@ export class VectorStore {
   }
 }
 
-// Singleton instance
-let _vectorStore: VectorStore | null = null;
-
-export function getVectorStore(): VectorStore {
-  if (!_vectorStore) {
-    _vectorStore = new VectorStore();
-  }
-  return _vectorStore;
-}
+export const getVectorStore = createSingleton(() => new VectorStore());

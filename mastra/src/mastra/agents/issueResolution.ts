@@ -1,12 +1,6 @@
 import { Agent } from "@mastra/core/agent";
 import { openai } from "@ai-sdk/openai";
-import {
-  createSession,
-  getSessionStatus,
-  searchCodebase,
-  readFile,
-  analyzeIssue,
-} from "../tools";
+import { createSession, getSessionStatus, searchCodebase, readFile, analyzeIssue } from "../tools";
 
 export const issueResolutionAgent = new Agent({
   name: "Issue Resolution Specialist",

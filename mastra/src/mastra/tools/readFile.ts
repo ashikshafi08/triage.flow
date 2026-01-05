@@ -1,15 +1,13 @@
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
-import { fetchWithTimeout, PYTHON_API } from "./httpClient";
+import { fetchWithTimeout, PYTHON_API, assertResponseOk } from "./httpClient";
 
 export const readFile = createTool({
   id: "read-file",
   description: "Read the contents of a specific file from the repository",
   inputSchema: z.object({
     sessionId: z.string().describe("The session ID for the repository"),
-    filePath: z
-      .string()
-      .describe("Path to the file relative to repository root"),
+    filePath: z.string().describe("Path to the file relative to repository root"),
   }),
   outputSchema: z.object({
     content: z.string(),
@@ -23,15 +21,9 @@ export const readFile = createTool({
       session_id: sessionId,
       file_path: filePath,
     });
-    const response = await fetchWithTimeout(
-      `${PYTHON_API}/api/file-content?${params}`
-    );
+    const response = await fetchWithTimeout(`${PYTHON_API}/api/file-content?${params}`);
 
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => response.statusText);
-      throw new Error(`Read failed: ${errorText}`);
-    }
-
+    await assertResponseOk(response, "Read");
     return response.json();
   },
 });

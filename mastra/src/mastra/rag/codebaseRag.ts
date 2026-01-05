@@ -1,11 +1,4 @@
-/**
- * CodebaseRag
- *
- * Main RAG class for codebase indexing and semantic search.
- * Replaces Python LocalRepoContextExtractor from unified_rag.py.
- *
- * @module rag/codebaseRag
- */
+// Main RAG class for codebase indexing and semantic search.
 
 import { openai } from "@ai-sdk/openai";
 import { embedMany, embed } from "ai";
@@ -16,11 +9,7 @@ import {
   type VectorIndexName,
   type EmbeddingMetadata,
 } from "../storage";
-import {
-  cloneRepository,
-  loadFiles,
-  searchFiles,
-} from "./repositoryLoader";
+import { cloneRepository, loadFiles, searchFiles } from "./repositoryLoader";
 import { chunkFiles, getChunkStats } from "./codeChunker";
 import { getLanguageMetadata } from "./languageConfig";
 import type {
@@ -134,13 +123,14 @@ export class CodebaseRag {
       const allVectors: number[][] = [];
       const allMetadata: EmbeddingMetadata[] = [];
 
+      const embeddingModel = openai.embedding("text-embedding-3-small");
+
       for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
         const batch = chunks.slice(i, i + BATCH_SIZE);
         const texts = batch.map((c) => c.content);
 
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const { embeddings } = await embedMany({
-          model: openai.embedding("text-embedding-3-small") as any,
+          model: embeddingModel,
           values: texts,
         });
 
@@ -159,11 +149,7 @@ export class CodebaseRag {
       }
 
       // Store in vector database
-      await vectorStore.storeEmbeddings(
-        this.config.indexName,
-        allVectors,
-        allMetadata
-      );
+      await vectorStore.storeEmbeddings(this.config.indexName, allVectors, allMetadata);
 
       // Update session with stats
       const stats = getChunkStats(chunks);
@@ -185,10 +171,7 @@ export class CodebaseRag {
   /**
    * Get relevant context for a query.
    */
-  async getRelevantContext(
-    query: string,
-    options: SearchOptions = {}
-  ): Promise<ContextResult> {
+  async getRelevantContext(query: string, options: SearchOptions = {}): Promise<ContextResult> {
     if (!this.repoInfo || !this.sessionId) {
       throw new Error("Repository not loaded. Call loadRepository first.");
     }
@@ -204,15 +187,11 @@ export class CodebaseRag {
     if (classification.isFileQuery) {
       // File-oriented search
       searchType = "file_oriented";
-      const filePatterns = classification.filePatterns.length > 0
-        ? classification.filePatterns
-        : ["**/*"];
+      const filePatterns =
+        classification.filePatterns.length > 0 ? classification.filePatterns : ["**/*"];
 
       for (const pattern of filePatterns) {
-        const matchedFiles = await searchFiles(
-          this.repoInfo.repoPath,
-          pattern
-        );
+        const matchedFiles = await searchFiles(this.repoInfo.repoPath, pattern);
 
         for (const filePath of matchedFiles.slice(0, 10)) {
           const metadata = getLanguageMetadata(filePath);
@@ -227,9 +206,8 @@ export class CodebaseRag {
       }
     } else {
       // Semantic vector search
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { embedding } = await embed({
-        model: openai.embedding("text-embedding-3-small") as any,
+        model: openai.embedding("text-embedding-3-small"),
         value: query,
       });
 
@@ -246,9 +224,7 @@ export class CodebaseRag {
       // Filter by restrictFiles if specified
       const filteredResults = options.restrictFiles
         ? results.filter((r) =>
-            options.restrictFiles!.some((pattern) =>
-              r.metadata.filePath.includes(pattern)
-            )
+            options.restrictFiles!.some((pattern) => r.metadata.filePath.includes(pattern))
           )
         : results;
 
@@ -288,9 +264,7 @@ export class CodebaseRag {
    * Classify a query to determine search strategy.
    */
   private classifyQuery(query: string): QueryClassification {
-    const isFileQuery = FILE_QUERY_PATTERNS.some((pattern) =>
-      pattern.test(query)
-    );
+    const isFileQuery = FILE_QUERY_PATTERNS.some((pattern) => pattern.test(query));
 
     // Extract file patterns (glob-like)
     const filePatterns: string[] = [];
@@ -317,10 +291,7 @@ export class CodebaseRag {
       .filter((w) => w.length > 3 && !["what", "where", "which", "find", "show"].includes(w));
 
     // Calculate complexity (simple heuristic)
-    const complexity = Math.min(
-      1.0,
-      (keywords.length * 0.1 + (isFileQuery ? 0.2 : 0.5))
-    );
+    const complexity = Math.min(1.0, keywords.length * 0.1 + (isFileQuery ? 0.2 : 0.5));
 
     return {
       isFileQuery,

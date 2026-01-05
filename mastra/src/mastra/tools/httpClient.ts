@@ -1,4 +1,5 @@
-// Shared HTTP client with timeout handling and HTTP 202 support
+// HTTP client with timeout handling and HTTP 202 support.
+
 const PYTHON_API = process.env.PYTHON_API_URL || "http://localhost:8000";
 const DEFAULT_TIMEOUT = 30000; // 30 seconds
 
@@ -36,3 +37,10 @@ export async function fetchWithTimeout(
 }
 
 export { PYTHON_API };
+
+export async function assertResponseOk(response: Response, operation: string): Promise<void> {
+  if (!response.ok) {
+    const detail = await response.text().catch(() => response.statusText);
+    throw new Error(`${operation} failed: ${detail}`);
+  }
+}

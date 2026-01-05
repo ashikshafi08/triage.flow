@@ -1,11 +1,4 @@
-/**
- * RAG (Retrieval-Augmented Generation) Module
- *
- * Provides codebase indexing and semantic search capabilities.
- * Replaces Python unified_rag.py with native Mastra implementation.
- *
- * @module rag
- */
+// RAG: Codebase indexing and semantic search capabilities.
 
 // Types
 export type {
@@ -47,12 +40,7 @@ export {
 } from "./repositoryLoader";
 
 // Code chunking
-export {
-  chunkFile,
-  chunkFiles,
-  estimateChunkCount,
-  getChunkStats,
-} from "./codeChunker";
+export { chunkFile, chunkFiles, estimateChunkCount, getChunkStats } from "./codeChunker";
 
 // Main RAG class
 export { CodebaseRag, createCodebaseRag } from "./codebaseRag";

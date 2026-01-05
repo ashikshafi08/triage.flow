@@ -1,11 +1,4 @@
-/**
- * Language Configuration
- *
- * Language-specific configurations for the RAG system.
- * Port of Python language_config.py.
- *
- * @module rag/languageConfig
- */
+// Language-specific configurations for the RAG system.
 
 import * as path from "path";
 import type { LanguageConfigEntry, LanguageMetadata } from "./types";
@@ -17,7 +10,7 @@ import type { LanguageConfigEntry, LanguageMetadata } from "./types";
 export const LANGUAGE_CONFIG: Record<string, LanguageConfigEntry> = {
   python: {
     extensions: [".py", ".pyw", ".pyi"],
-    docPattern: '""".*?"""|\'\'\'.*?\'\'\'|#.*?$',
+    docPattern: "\"\"\".*?\"\"\"|'''.*?'''|#.*?$",
     importPattern: "^(?:from|import)\\s+([\\w\\.]+)",
     displayName: "Python",
     description:
@@ -35,8 +28,7 @@ export const LANGUAGE_CONFIG: Record<string, LanguageConfigEntry> = {
     docPattern: "/\\*\\*.*?\\*/|//.*?$",
     importPattern: "^(?:import|require)\\s*\\(?['\"]([^'\"]+)['\"]\\)?",
     displayName: "TypeScript",
-    description:
-      "A typed superset of JavaScript that compiles to plain JavaScript.",
+    description: "A typed superset of JavaScript that compiles to plain JavaScript.",
   },
   java: {
     extensions: [".java"],
@@ -72,8 +64,7 @@ export const LANGUAGE_CONFIG: Record<string, LanguageConfigEntry> = {
     docPattern: "//!.*?$|//.*?$",
     importPattern: "^use\\s+([\\w:]+)",
     displayName: "Rust",
-    description:
-      "A systems programming language focused on safety and performance.",
+    description: "A systems programming language focused on safety and performance.",
   },
   ruby: {
     extensions: [".rb", ".rake"],
@@ -88,8 +79,7 @@ export const LANGUAGE_CONFIG: Record<string, LanguageConfigEntry> = {
     docPattern: "/\\*\\*.*?\\*/|//.*?$",
     importPattern: "^(?:require|include)\\s*['\"]([^'\"]+)['\"]",
     displayName: "PHP",
-    description:
-      "A server-side scripting language designed for web development.",
+    description: "A server-side scripting language designed for web development.",
   },
   swift: {
     extensions: [".swift"],
@@ -104,8 +94,7 @@ export const LANGUAGE_CONFIG: Record<string, LanguageConfigEntry> = {
     docPattern: "/\\*\\*.*?\\*/|//.*?$",
     importPattern: "^import\\s+([\\w\\.]+)",
     displayName: "Kotlin",
-    description:
-      "A modern programming language that makes developers happier.",
+    description: "A modern programming language that makes developers happier.",
   },
   scala: {
     extensions: [".scala", ".sc"],
@@ -120,24 +109,21 @@ export const LANGUAGE_CONFIG: Record<string, LanguageConfigEntry> = {
     docPattern: "/\\*\\*.*?\\*/|//.*?$",
     importPattern: "^import\\s+['\"]([^'\"]+)['\"]",
     displayName: "Dart",
-    description:
-      "A client-optimized language for fast apps on any platform.",
+    description: "A client-optimized language for fast apps on any platform.",
   },
   haskell: {
     extensions: [".hs", ".lhs"],
     docPattern: "--.*?$",
     importPattern: "^import\\s+([\\w\\.]+)",
     displayName: "Haskell",
-    description:
-      "A purely functional programming language with strong static typing.",
+    description: "A purely functional programming language with strong static typing.",
   },
   elixir: {
     extensions: [".ex", ".exs"],
     docPattern: "#.*?$",
     importPattern: "^import\\s+([\\w\\.]+)",
     displayName: "Elixir",
-    description:
-      "A dynamic, functional language designed for building scalable applications.",
+    description: "A dynamic, functional language designed for building scalable applications.",
   },
   clojure: {
     extensions: [".clj", ".cljs", ".cljc", ".edn"],
@@ -152,8 +138,7 @@ export const LANGUAGE_CONFIG: Record<string, LanguageConfigEntry> = {
     docPattern: "%.*?$",
     importPattern: "^-import\\(([\\w\\.]+)\\)",
     displayName: "Erlang",
-    description:
-      "A general-purpose, concurrent, functional programming language.",
+    description: "A general-purpose, concurrent, functional programming language.",
   },
   lua: {
     extensions: [".lua"],
@@ -182,8 +167,7 @@ export const LANGUAGE_CONFIG: Record<string, LanguageConfigEntry> = {
   html: {
     extensions: [".html", ".htm"],
     docPattern: "<!--.*?-->",
-    importPattern:
-      '<script\\s+src=["\']([^"\']+)["\']|<link\\s+href=["\']([^"\']+)["\']',
+    importPattern: "<script\\s+src=[\"']([^\"']+)[\"']|<link\\s+href=[\"']([^\"']+)[\"']",
     displayName: "HTML",
     description:
       "The standard markup language for documents designed to be displayed in a web browser.",
@@ -222,8 +206,7 @@ export const LANGUAGE_CONFIG: Record<string, LanguageConfigEntry> = {
     docPattern: null,
     importPattern: null,
     displayName: "JSON",
-    description:
-      "JavaScript Object Notation, a lightweight data interchange format.",
+    description: "JavaScript Object Notation, a lightweight data interchange format.",
   },
   xml: {
     extensions: [".xml", ".xsl", ".xslt"],
@@ -237,16 +220,14 @@ export const LANGUAGE_CONFIG: Record<string, LanguageConfigEntry> = {
     docPattern: "#.*?$",
     importPattern: null,
     displayName: "TOML",
-    description:
-      "Tom's Obvious, Minimal Language for configuration files.",
+    description: "Tom's Obvious, Minimal Language for configuration files.",
   },
   sql: {
     extensions: [".sql"],
     docPattern: "--.*?$|/\\*.*?\\*/",
     importPattern: null,
     displayName: "SQL",
-    description:
-      "Structured Query Language for managing and querying relational databases.",
+    description: "Structured Query Language for managing and querying relational databases.",
   },
   graphql: {
     extensions: [".graphql", ".gql"],
@@ -285,13 +266,12 @@ export const LANGUAGE_CONFIG: Record<string, LanguageConfigEntry> = {
   },
 };
 
-// Extension to language lookup map (built once)
-const extensionToLanguage = new Map<string, string>();
-for (const [lang, config] of Object.entries(LANGUAGE_CONFIG)) {
-  for (const ext of config.extensions) {
-    extensionToLanguage.set(ext.toLowerCase(), lang);
-  }
-}
+// Extension to language lookup map (built once via flatMap)
+const extensionToLanguage = new Map(
+  Object.entries(LANGUAGE_CONFIG).flatMap(([lang, { extensions }]) =>
+    extensions.map((ext) => [ext.toLowerCase(), lang] as const)
+  )
+);
 
 // Special filename handlers
 const specialFilenames = new Map<string, string>([
@@ -306,16 +286,8 @@ const specialFilenames = new Map<string, string>([
   ["jenkinsfile", "groovy"],
 ]);
 
-/**
- * Get all supported file extensions.
- */
-export function getAllExtensions(): string[] {
-  const extensions: string[] = [];
-  for (const config of Object.values(LANGUAGE_CONFIG)) {
-    extensions.push(...config.extensions);
-  }
-  return extensions;
-}
+/** Get all supported file extensions. */
+export const getAllExtensions = () => Object.values(LANGUAGE_CONFIG).flatMap((c) => c.extensions);
 
 /**
  * Get language metadata for a given file path.
@@ -362,23 +334,13 @@ export function getLanguageMetadata(filePath: string): LanguageMetadata {
   };
 }
 
-/**
- * Check if a file extension is supported.
- */
-export function isSupportedExtension(ext: string): boolean {
-  return extensionToLanguage.has(ext.toLowerCase());
-}
+/** Check if a file extension is supported. */
+export const isSupportedExtension = (ext: string) => extensionToLanguage.has(ext.toLowerCase());
 
-/**
- * Get language by extension.
- */
-export function getLanguageByExtension(ext: string): string | null {
-  return extensionToLanguage.get(ext.toLowerCase()) ?? null;
-}
+/** Get language by extension. */
+export const getLanguageByExtension = (ext: string) =>
+  extensionToLanguage.get(ext.toLowerCase()) ?? null;
 
-/**
- * Get extensions for a specific language.
- */
-export function getExtensionsForLanguage(language: string): string[] {
-  return LANGUAGE_CONFIG[language]?.extensions ?? [];
-}
+/** Get extensions for a specific language. */
+export const getExtensionsForLanguage = (language: string) =>
+  LANGUAGE_CONFIG[language]?.extensions ?? [];

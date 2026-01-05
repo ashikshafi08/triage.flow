@@ -1,6 +1,6 @@
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
-import { fetchWithTimeout, PYTHON_API } from "./httpClient";
+import { fetchWithTimeout, PYTHON_API, assertResponseOk } from "./httpClient";
 
 export const searchCodebase = createTool({
   id: "search-codebase",
@@ -8,9 +8,7 @@ export const searchCodebase = createTool({
     "Search the indexed codebase for code patterns, functions, classes, or concepts using semantic search",
   inputSchema: z.object({
     sessionId: z.string().describe("The session ID for the repository"),
-    query: z
-      .string()
-      .describe("Search query - can be natural language or code pattern"),
+    query: z.string().describe("Search query - can be natural language or code pattern"),
     topK: z.number().default(10).describe("Number of results to return"),
   }),
   outputSchema: z.object({
@@ -34,11 +32,7 @@ export const searchCodebase = createTool({
       60000 // 60s timeout for search (can be slow)
     );
 
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => response.statusText);
-      throw new Error(`Search failed: ${errorText}`);
-    }
-
+    await assertResponseOk(response, "Search");
     return response.json();
   },
 });

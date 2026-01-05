@@ -1,10 +1,4 @@
-/**
- * Repository Loader
- *
- * Git operations and file loading for codebase indexing.
- *
- * @module rag/repositoryLoader
- */
+// Git operations and file loading for codebase indexing.
 
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -59,13 +53,8 @@ export function parseRepoUrl(repoUrl: string): { owner: string; repo: string } {
   throw new Error(`Invalid GitHub URL: ${repoUrl}`);
 }
 
-/**
- * Get or create a persistent directory for cloned repositories.
- */
-export function getRepoStorageDir(): string {
-  const storageDir = path.join(os.tmpdir(), "triage-flow-repos");
-  return storageDir;
-}
+/** Get or create a persistent directory for cloned repositories. */
+export const getRepoStorageDir = () => path.join(os.tmpdir(), "triage-flow-repos");
 
 /**
  * Clone a repository to a persistent temp directory.
