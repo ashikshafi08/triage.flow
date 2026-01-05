@@ -31,7 +31,7 @@ from .llm_config import get_llm_instance
 from .tool_registry import create_all_tools
 from .context_manager import ContextManager
 from .context_aware_tools import ContextAwareToolFactory
-from ..agentic_rag import QueryComplexity
+from ..unified_rag import QueryComplexity
 from .llamaindex_comprehensive_workflow import run_comprehensive_analysis
 
 logger = logging.getLogger(__name__)

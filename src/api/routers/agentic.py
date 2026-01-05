@@ -4,7 +4,7 @@ from ...models import ChatMessage
 from ..dependencies import (
     session_manager, get_session, get_agentic_rag, get_chunk_store, logger, settings
 )
-from ...agentic_rag import AgenticRAGSystem # Import AgenticRAGSystem for isinstance check
+from ...unified_rag import AgenticRAGSystem # Import AgenticRAGSystem for isinstance check
 from ...chunk_store import RedisChunkStore
 import json
 import asyncio
@@ -655,7 +655,7 @@ async def index_repository_issues(
         owner, repo = parse_repo_url(repo_url)
         
         # Initialize RAG with new parameters
-        from ...issue_rag import IssueAwareRAG
+        from ...unified_rag import IssueAwareRAG
         rag = IssueAwareRAG(owner, repo)
         await rag.initialize(
             force_rebuild=force_rebuild,

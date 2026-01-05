@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 
 from .github_client import GitHubIssueClient
-from .agentic_rag import AgenticRAGSystem
+from .unified_rag import AgenticRAGSystem
 from .config import settings
 
 logger = logging.getLogger(__name__)

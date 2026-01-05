@@ -31,7 +31,7 @@ if not os.getenv("OPENAI_API_KEY"):
 # GITHUB_TOKEN is checked within the components, but good to be aware.
 
 # pylint: disable=wrong-import-position
-from src.issue_rag import IssueAwareRAG
+from src.unified_rag import IssueAwareRAG
 # pylint: enable=wrong-import-position
 
 # Configuration

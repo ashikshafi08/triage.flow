@@ -1,8 +1,8 @@
 import json
 from typing import Optional, List, Dict, Any
 from .agent_tools import AgenticCodebaseExplorer, FunctionTool
-from .issue_rag import IssueAwareRAG
-from .new_rag import LocalRepoContextExtractor
+from .unified_rag import IssueAwareRAG
+from .unified_rag import LocalRepoContextExtractor
 from llama_index.core.agent import ReActAgent
 from .chunk_store import ChunkStoreFactory
 from .config import settings

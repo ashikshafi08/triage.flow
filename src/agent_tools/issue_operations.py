@@ -9,7 +9,7 @@ from pathlib import Path
 import concurrent.futures
 
 if TYPE_CHECKING:
-    from ..issue_rag import IssueAwareRAG, IssueContext # Assuming IssueContext is defined there
+    from ..unified_rag import IssueAwareRAG, IssueContext # Assuming IssueContext is defined there
     from ..git_tools import IssueClosingTools
     from .search_operations import SearchOperations # For find_issue_related_files
     from .pr_operations import PROperations # For check_issue_status_and_linked_pr

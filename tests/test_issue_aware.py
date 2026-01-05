@@ -28,7 +28,7 @@ async def test_issue_aware_system():
     
     try:
         # Import our issue-aware components
-        from src.issue_rag import IssueAwareRAG
+        from src.unified_rag import IssueAwareRAG
         
         # Initialize the system
         print("📡 Initializing Issue-Aware RAG...")
@@ -167,8 +167,8 @@ async def test_integration_with_session():
     print("-" * 40)
     
     try:
-        from src.agentic_rag import AgenticRAGSystem
-        from src.issue_rag import IssueAwareRAG
+        from src.unified_rag import AgenticRAGSystem
+        from src.unified_rag import IssueAwareRAG
         
         # Create a test session
         session_id = "test_issue_aware_session"

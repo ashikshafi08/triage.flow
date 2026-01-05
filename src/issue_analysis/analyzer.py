@@ -18,7 +18,7 @@ import logging
 from typing import Dict, Any
 
 from ..github_client import GitHubIssueClient
-from ..agentic_rag import AgenticRAGSystem
+from ..unified_rag import AgenticRAGSystem
 from ..llm_client import format_rag_context_for_llm
 
 from .pr_checker import PRChecker

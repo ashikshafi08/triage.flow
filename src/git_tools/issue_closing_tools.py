@@ -12,7 +12,7 @@ from typing import Dict, Any, Optional, List, TYPE_CHECKING
 from pathlib import Path
 
 if TYPE_CHECKING:
-    from ..issue_rag import IssueAwareRAG
+    from ..unified_rag import IssueAwareRAG
 
 logger = logging.getLogger(__name__)
 

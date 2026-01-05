@@ -1,5 +1,5 @@
 import asyncio, aiohttp, json, os
-from src.issue_rag import IssueAwareRAG   # assumes your src path
+from src.unified_rag import IssueAwareRAG   # assumes your src path
 CSV = "smolagents_eval_queries.csv"
 OWNER, REPO = "huggingface", "smolagents"
 

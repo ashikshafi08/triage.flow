@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from .config import settings
 from .models import Issue, IssueResponse, IssueComment, PullRequestInfo, PullRequestUser, EnhancedPullRequestInfo, PullRequestReview, PullRequestReviewer, PullRequestStatusCheck
+from .utils.decorators import cached, retry, safe_op
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +39,6 @@ class GitHubIssueClient:
     def __init__(self):
         if not settings.github_token: raise ValueError("GITHUB_TOKEN required")
         self.token = settings.github_token
-        self.cache: Dict[str, Dict[str, Any]] = {}
-        self.cache_duration = timedelta(minutes=30)
-        self.max_retries, self.backoff = 3, 2
         self.headers = {"Authorization": f"token {self.token}", "Accept": "application/vnd.github.v3+json"}
 
     def _parse_url(self, url: str) -> Optional[Tuple[str, str, int]]:
@@ -48,35 +46,28 @@ class GitHubIssueClient:
             return m.group(1), m.group(2), int(m.group(3))
         return None
 
+    @retry(attempts=3, delay=1.0, backoff=2.0)
     async def _api_get(self, session: aiohttp.ClientSession, url: str) -> Optional[Dict]:
-        for attempt in range(self.max_retries):
-            try:
-                async with session.get(url, headers=self.headers) as r:
-                    if r.status == 404: return None
-                    if r.status == 403 and r.headers.get("X-RateLimit-Remaining") == "0":
-                        reset = int(r.headers.get("X-RateLimit-Reset", time.time() + 60))
-                        await asyncio.sleep(max(0, reset - time.time()) + 1)
-                        continue
-                    if r.status != 200:
-                        if attempt < self.max_retries - 1: await asyncio.sleep(self.backoff ** attempt); continue
-                        return None
-                    return await r.json()
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                if attempt < self.max_retries - 1: await asyncio.sleep(self.backoff ** attempt)
-        return None
+        async with session.get(url, headers=self.headers) as r:
+            if r.status == 404: return None
+            if r.status == 403 and r.headers.get("X-RateLimit-Remaining") == "0":
+                reset = int(r.headers.get("X-RateLimit-Reset", time.time() + 60))
+                await asyncio.sleep(max(0, reset - time.time()) + 1)
+                return await self._api_get(session, url)  # Retry after rate limit
+            if r.status != 200: return None
+            return await r.json()
 
     async def _api_post(self, session: aiohttp.ClientSession, url: str, payload: Dict) -> Optional[Dict]:
         async with session.post(url, headers=self.headers, json=payload) as r:
             if r.status in [200, 201]: return await r.json()
             return None
 
+    @retry(attempts=3, delay=1.0, backoff=2.0)
     async def _gql(self, session: aiohttp.ClientSession, query: str, variables: Dict) -> Optional[Dict]:
-        try:
-            async with session.post("https://api.github.com/graphql", json={"query": query, "variables": variables}, headers=self.headers) as r:
-                if r.status != 200: return None
-                data = await r.json()
-                return None if "errors" in data else data
-        except: return None
+        async with session.post("https://api.github.com/graphql", json={"query": query, "variables": variables}, headers=self.headers) as r:
+            if r.status != 200: return None
+            data = await r.json()
+            return None if "errors" in data else data
 
     async def _fetch_comments(self, session: aiohttp.ClientSession, owner: str, repo: str, num: int) -> List[IssueComment]:
         data = await self._api_get(session, f"https://api.github.com/repos/{owner}/{repo}/issues/{num}/comments")
@@ -85,9 +76,6 @@ class GitHubIssueClient:
                             created_at=datetime.fromisoformat(c["created_at"].replace('Z', '+00:00'))) for c in data]
 
     async def get_issue(self, issue_url: str) -> IssueResponse:
-        if issue_url in self.cache and datetime.now() - self.cache[issue_url]['timestamp'] < self.cache_duration:
-            return IssueResponse(status="success", data=Issue(**self.cache[issue_url]['data']))
-
         info = self._parse_url(issue_url)
         if not info: return IssueResponse(status="error", error="Invalid GitHub issue URL")
         owner, repo, num = info
@@ -104,7 +92,6 @@ class GitHubIssueClient:
                          url=issue_url, labels=[l['name'] for l in data.get('labels', [])],
                          assignees=[a['login'] for a in data.get('assignees', [])], comments=comments)
 
-            self.cache[issue_url] = {'data': issue.model_dump(), 'timestamp': datetime.now()}
             return IssueResponse(status="success", data=issue)
 
     def get_issue_data(self, issue_url: str) -> Dict[str, Any]:

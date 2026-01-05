@@ -79,7 +79,7 @@ async def get_agentic_rag(session_id: str, session: Dict[str, Any] = Depends(get
     logger.info(f"[RECREATE] Creating new AgenticRAG instance for {repo_key}")
     
     try:
-        from ..agentic_rag import AgenticRAGSystem
+        from ..unified_rag import AgenticRAGSystem
         
         # Create new instance using repo_key for consistent caching
         recreated_agentic_rag = AgenticRAGSystem(repo_key)
@@ -87,7 +87,7 @@ async def get_agentic_rag(session_id: str, session: Dict[str, Any] = Depends(get
         recreated_agentic_rag.repo_info = {"owner": owner, "repo": repo}
         
         # Initialize the RAG extractor (core RAG component)
-        from ..new_rag import LocalRepoContextExtractor
+        from ..unified_rag import LocalRepoContextExtractor
         rag_extractor = LocalRepoContextExtractor()
         rag_extractor.current_repo_path = session["repo_path"]
         recreated_agentic_rag.rag_extractor = rag_extractor
@@ -118,7 +118,7 @@ async def get_agentic_rag(session_id: str, session: Dict[str, Any] = Depends(get
         try:
             if session.get("metadata", {}).get("issue_rag_ready"):
                 logger.info(f"Restoring issue RAG for {repo_key}")
-                from ..issue_rag import IssueAwareRAG
+                from ..unified_rag import IssueAwareRAG
                 
                 # Create a fresh IssueAwareRAG instance to avoid coroutine reuse issues
                 issue_rag = IssueAwareRAG(owner, repo)

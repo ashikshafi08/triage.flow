@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Query, Depends
 from fastapi.responses import JSONResponse
 from ...models import Issue, IssueContextResponse, PullRequestInfo, IssueContextRequest
 from ..dependencies import github_client, get_session, logger
-from ...issue_rag import IssueAwareRAG
+from ...unified_rag import IssueAwareRAG
 from ...local_repo_loader import get_repo_info
 from ...config import settings
 from typing import List, Optional, Dict, Any

@@ -226,8 +226,8 @@ async def create_founding_session(request: FounderSessionRequest, background_tas
             )
 
         # Create session and initialize in background
-        from ...new_rag import LocalRepoContextExtractor
-        from ...issue_rag import IssueAwareRAG
+        from ...unified_rag import LocalRepoContextExtractor
+        from ...unified_rag import IssueAwareRAG
         from ...founding_member_agent import FoundingMemberAgent
         
         session_id, metadata = await session_manager.create_repo_session(request.repo_url, session_name=request.session_name)

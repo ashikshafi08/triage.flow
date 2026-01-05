@@ -5,17 +5,23 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 if TYPE_CHECKING:
-    from ..issue_rag import IssueAwareRAG
+    from ..unified_rag import IssueAwareRAG
     from ..git_tools import GitHistoryTools
     from llama_index.core.llms import LLM
 
 try:
     from ..config import settings
     from ..cache.redis_cache_manager import RedisCacheManager
+    from ..utils.decorators import log_errors, safe_op
 except ImportError:
     class MockSettings: openrouter_api_key = summarization_model = None
     settings = MockSettings()
     RedisCacheManager = None
+    # Fallback decorators if import fails
+    def log_errors(fn): return fn
+    def safe_op(*args, **kwargs):
+        def decorator(fn): return fn
+        return decorator
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +86,7 @@ class PROperations:
     # Core PR Lookup Methods
     # ============================================================================
 
+    @log_errors
     def get_pr_for_issue(self, issue_identifier: Annotated[str, "Issue identifier (number or #number)"]) -> str:
         """Find PRs that reference or fix a specific issue."""
         issue_num = int(issue_identifier.lstrip('#'))
@@ -105,6 +112,7 @@ class PROperations:
 
         return self._cached(self._cache_key("pr_for_issue", issue_num), _fetch)
 
+    @log_errors
     def get_pr_diff(self, pr_number: Annotated[int, "PR number"]) -> str:
         """Get the diff content for a merged PR."""
         def _fetch():
@@ -120,6 +128,7 @@ class PROperations:
             except Exception as e: return _json_error(f"Error reading diff: {e}")
         return self._cached(self._cache_key("pr_diff", pr_number), _fetch)
 
+    @log_errors
     def get_files_changed_in_pr(self, pr_number: Annotated[int, "PR number"]) -> str:
         """Get list of files changed in a PR."""
         def _fetch():
@@ -130,6 +139,7 @@ class PROperations:
             return json.dumps({"pr_number": pr_number, "files_changed": diff_doc.files_changed})
         return self._cached(self._cache_key("pr_files", pr_number), _fetch)
 
+    @log_errors
     def get_pr_summary(self, pr_number: Annotated[int, "PR number"]) -> str:
         """Get summary of a PR."""
         def _fetch():
@@ -247,6 +257,7 @@ class PROperations:
     # GitHub API Integration
     # ============================================================================
 
+    @log_errors
     def get_pr_details_from_github(self, pr_number: Annotated[int, "PR number"]) -> str:
         """Get PR details from GitHub API."""
         def _fetch():

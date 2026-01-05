@@ -31,7 +31,7 @@ from .query_processor import QueryProcessor
 from .agent_pool import AgentPool
 
 if TYPE_CHECKING:
-    from ..issue_rag import IssueAwareRAG
+    from ..unified_rag import IssueAwareRAG
 
 logger = logging.getLogger(__name__)
 
