@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 # For standalone utilities if needed
 from .utilities import get_repo_url_from_path as get_repo_url_from_path_util
+from ..utils.decorators import safe_op
 
 logger = logging.getLogger(__name__)
 
@@ -598,19 +599,15 @@ class IssueOperations:
             logger.error(f"Error in related_issues: {e}")
             return json.dumps({"error": str(e)}, indent=2)
 
+    @safe_op(default=json.dumps({"error": "Failed to get issue closing info"}))
     def get_issue_closing_info(self, issue_number: Annotated[int, "Issue number"]) -> str:
-        try:
-            result = self.issue_closing_tools.get_issue_closing_info(issue_number)
-            return json.dumps(result, indent=2) 
-        except Exception as e: 
-            return json.dumps({"error": str(e)})
+        result = self.issue_closing_tools.get_issue_closing_info(issue_number)
+        return json.dumps(result, indent=2)
 
+    @safe_op(default=json.dumps({"error": "Failed to get related issues"}))
     def get_open_issues_related_to_commit(self, commit_sha: Annotated[str, "Commit SHA"]) -> str:
-        try:
-            result = self.issue_closing_tools.get_open_issues_related_to_commit(commit_sha)
-            return json.dumps(result, indent=2)
-        except Exception as e: 
-            return json.dumps({"error": str(e)})
+        result = self.issue_closing_tools.get_open_issues_related_to_commit(commit_sha)
+        return json.dumps(result, indent=2)
 
     def find_issues_related_to_file(self, file_path: Annotated[str, "File path"]) -> str:
         try:
